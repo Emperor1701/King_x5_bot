@@ -1,28 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Telegram Quiz Bot — Owner ReplyKeyboard + Back/Home
+Telegram Quiz Bot — ReplyKeyboard Owner Panel + Quiz Polls (Auto-close on expiry)
+
 Features:
-- Owner panel as ReplyKeyboard (always visible)
-- Back/Home buttons
-- Quizzes & Questions CRUD with pagination
-- Per-question attachments (up to 5)
-- Shared media bundles (reusable; unlimited questions per bundle)
-- Publish all questions ordered and robust
-- Answers via popups (no edit to question message)
-- Stickers/animations (.env) after each answer (optional)
-- Final result posted with participant name
-- Time limit per publish: 12h / 24h / custom / none
-- Bulk import via CSV
-- NEW: Merge two quizzes into a NEW quiz (deep copy with bundles & attachments)
-- NEW: Export quiz to JSON file for backup
+- Owner panel (ReplyKeyboard) ثابتة.
+- أسئلة/خيارات CRUD + مرفقات للسؤال + "حزم مرفقات" مشتركة.
+- نشر كـ Telegram Quiz Polls (type="quiz") غير مجهولة (is_anonymous=False).
+- حتى 10 خيارات لكل سؤال (حد تيليجرام).
+- إرسال المرفقات قبل الاستفتاء (Polls لا تدعم وسائط مدمجة).
+- إغلاق تلقائي لكل الاستفتاءات عند انتهاء الوقت المحدد.
+- دمج اختبارين في اختبار جديد.
+- تصدير اختبار كامل إلى JSON قابل للحفظ.
+- لوحة نتائج.
 """
 
 import asyncio
 import os
 import sqlite3
-import csv
-from io import StringIO, BytesIO
+import json
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple, Dict, List
@@ -35,7 +32,7 @@ from aiogram.types import (
     Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
-    FSInputFile
+    FSInputFile, PollAnswer
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.filters import Command
@@ -184,6 +181,19 @@ def _ensure_schema():
                 position INTEGER NOT NULL
             )
         """)
+        # Map poll_id -> question + message_id + closed flag
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS sent_polls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                quiz_id INTEGER NOT NULL,
+                question_id INTEGER NOT NULL,
+                poll_id TEXT NOT NULL,
+                message_id INTEGER,
+                expires_at TEXT,
+                is_closed INTEGER NOT NULL DEFAULT 0
+            )
+        """)
         # legacy columns to migrate
         if not col_exists(conn, "questions", "photo"):
             try: c.execute("ALTER TABLE questions ADD COLUMN photo TEXT")
@@ -196,6 +206,13 @@ def _ensure_schema():
             except: pass
         if not col_exists(conn, "sent_msgs", "expires_at"):
             try: c.execute("ALTER TABLE sent_msgs ADD COLUMN expires_at TEXT")
+            except: pass
+        # add missing columns for sent_polls
+        if not col_exists(conn, "sent_polls", "message_id"):
+            try: c.execute("ALTER TABLE sent_polls ADD COLUMN message_id INTEGER")
+            except: pass
+        if not col_exists(conn, "sent_polls", "is_closed"):
+            try: c.execute("ALTER TABLE sent_polls ADD COLUMN is_closed INTEGER NOT NULL DEFAULT 0")
             except: pass
         conn.commit()
 
@@ -241,7 +258,6 @@ BTN_LISTQ   = "📖 عرض الأسئلة"
 BTN_EDITQUIZ= "🛠️ تعديل اختبار"
 BTN_DELQUIZ = "🗑️ حذف اختبار"
 BTN_BUNDLES = "📎 مرفقات مشتركة"
-BTN_BULK_IMPORT = "🧾 استيراد دفعة"
 BTN_MERGE   = "🔗 دمج الاختبارات"
 BTN_EXPORT  = "📤 تصدير اختبار"
 BTN_PUBLISH = "🚀 نشر اختبار"
@@ -305,10 +321,6 @@ class PublishStates(StatesGroup):
     waiting_duration_choice = State()
     waiting_custom_hours = State()
 
-class BulkStates(StatesGroup):
-    waiting_pick_quiz = State()
-    waiting_csv = State()
-
 class MergeStates(StatesGroup):
     waiting_pick_src = State()
     waiting_pick_dst = State()
@@ -316,14 +328,7 @@ class MergeStates(StatesGroup):
 class ExportStates(StatesGroup):
     waiting_pick_quiz = State()
 
-pending_names: Dict[Tuple[int,int,int], bool] = {}
-
-# ---------------------- Numbering helper (up to 10 options) ----------------------
-CIRCLED = ["①","②","③","④","⑤","⑥","⑦","⑧","⑨","⑩"]
-def circ_num(idx: int) -> str:
-    return CIRCLED[idx] if 0 <= idx < len(CIRCLED) else f"{idx+1})"
-
-# ---------------------- Keyboards ----------------------
+# ---------------------- Helpers ----------------------
 def owner_panel_reply_kb() -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(text=BTN_BACK_HOME), KeyboardButton(text=BTN_BACK_STEP)],
@@ -334,7 +339,6 @@ def owner_panel_reply_kb() -> ReplyKeyboardMarkup:
         [KeyboardButton(text=BTN_EDITQUIZ)],
         [KeyboardButton(text=BTN_DELQUIZ)],
         [KeyboardButton(text=BTN_BUNDLES)],
-        [KeyboardButton(text=BTN_BULK_IMPORT)],
         [KeyboardButton(text=BTN_MERGE), KeyboardButton(text=BTN_EXPORT)],
         [KeyboardButton(text=BTN_PUBLISH)],
         [KeyboardButton(text=BTN_WIPE_ALL)],
@@ -403,7 +407,6 @@ def publish_duration_kb() -> InlineKeyboardMarkup:
     kb.adjust(2)
     return kb.as_markup()
 
-# ---------------------- Helpers ----------------------
 def get_quiz_question_ids(quiz_id: int) -> List[int]:
     with db() as conn:
         rows = conn.execute("SELECT id FROM questions WHERE quiz_id=? ORDER BY id", (quiz_id,)).fetchall()
@@ -414,15 +417,6 @@ def options_for_question(question_id:int) -> List[sqlite3.Row]:
         rows = conn.execute("SELECT option_index, text, is_correct FROM options WHERE question_id=? ORDER BY option_index", (question_id,)).fetchall()
     return rows
 
-def build_options_kb(question_id:int, target_user_id:int) -> InlineKeyboardMarkup:
-    rows = options_for_question(question_id)
-    kb = InlineKeyboardBuilder()
-    for r in rows:
-        idx = int(r['option_index']); text = r['text']; circ = circ_num(idx)
-        kb.button(text=f"{circ} {text}", callback_data=f"ans:{question_id}:{idx}:{target_user_id}")
-    kb.adjust(1)
-    return kb.as_markup()
-
 def get_question_atts(question_id:int) -> List[sqlite3.Row]:
     with db() as conn:
         rows = conn.execute("SELECT kind, file_id, position FROM question_attachments WHERE question_id=? ORDER BY position",(question_id,)).fetchall()
@@ -430,24 +424,8 @@ def get_question_atts(question_id:int) -> List[sqlite3.Row]:
 
 def get_bundle_atts(bundle_id:int) -> List[sqlite3.Row]:
     with db() as conn:
-        rows = conn.execute(
-            "SELECT kind, file_id, position FROM media_bundle_attachments WHERE bundle_id=? ORDER BY position",
-            (bundle_id,)  # tuple!
-        ).fetchall()
+        rows = conn.execute("SELECT kind, file_id, position FROM media_bundle_attachments WHERE bundle_id=? ORDER BY position",(bundle_id,)).fetchall()
     return rows
-
-def question_card_text(qrow:sqlite3.Row) -> str:
-    opts = options_for_question(qrow["id"])
-    lines = [f"Q{qrow['id']}: <b>{qrow['text']}</b>"]
-    if opts:
-        lines.append("الخيارات:")
-        for r in opts:
-            circ = circ_num(int(r["option_index"]))
-            mark = " ✅" if int(r["is_correct"])==1 else ""
-            lines.append(f"{circ} {r['text']}{mark}")
-    else:
-        lines.append("— لا يوجد خيارات —")
-    return "\n".join(lines)
 
 def hlink_user(name:str, user_id:int) -> str:
     safe = name.replace("<","&lt;").replace(">","&gt;")
@@ -455,166 +433,16 @@ def hlink_user(name:str, user_id:int) -> str:
 
 def _now_utc() -> datetime: return datetime.now(timezone.utc)
 
-def _quiz_expired(chat_id:int, quiz_id:int) -> Optional[bool]:
-    with db() as conn:
-        row = conn.execute("""SELECT expires_at FROM sent_msgs
-                              WHERE chat_id=? AND quiz_id=? AND expires_at IS NOT NULL
-                              ORDER BY id DESC LIMIT 1""", (chat_id, quiz_id)).fetchone()
-    if not row or not row["expires_at"]: return None
-    try: exp = datetime.fromisoformat(row["expires_at"])
-    except: return None
-    return _now_utc() > exp
-
-# ---------------------- Bulk import helpers ----------------------
-def parse_attachments_field(field: str) -> List[Tuple[str,str]]:
-    out: List[Tuple[str,str]] = []
-    field = (field or "").strip()
-    if not field:
-        return out
-    parts = [p.strip() for p in field.split("|") if p.strip()]
-    for p in parts:
-        if ":" not in p: continue
-        kind, fid = p.split(":", 1)
-        kind = kind.strip().lower(); fid = fid.strip()
-        if kind in ("photo","voice","audio") and fid:
-            out.append((kind, fid))
-    return out[:5]
-
-def parse_bulk_csv(text: str) -> List[dict]:
-    sio = StringIO(text)
-    reader = csv.DictReader(sio)
-    rows = []
-    ln = 1
-    for row in reader:
-        ln += 1
-        q = (row.get("question") or "").strip()
-        opts_raw = (row.get("options") or "").strip()
-        correct_raw = (row.get("correct") or "").strip()
-        atts_raw = (row.get("attachments") or "").strip()
-        if not q or not opts_raw or not correct_raw:
-            rows.append({"_error": f"سطر {ln}: حقول ناقصة (question/options/correct)."}); continue
-        options = [o.strip() for o in opts_raw.split("|") if o.strip()]
-        if not (2 <= len(options) <= 10):
-            rows.append({"_error": f"سطر {ln}: عدد الخيارات {len(options)} (المسموح 2..10)."}); continue
-        try: correct = int(correct_raw)
-        except: rows.append({"_error": f"سطر {ln}: قيمة correct ليست رقم."}); continue
-        if not (1 <= correct <= len(options)):
-            rows.append({"_error": f"سطر {ln}: correct خارج النطاق (1..{len(options)})."}); continue
-        attachments = parse_attachments_field(atts_raw)
-        rows.append({"question": q, "options": options, "correct_index0": correct - 1, "attachments": attachments})
-    return rows
-
-def insert_question_with_data(quiz_id:int, q_text:str, options:List[str], correct_index0:int, attachments:List[Tuple[str,str]]) -> int:
-    with db() as conn:
-        cur = conn.execute("INSERT INTO questions(quiz_id, text, created_at) VALUES (?,?,?)",
-                           (quiz_id, q_text, datetime.now(timezone.utc).isoformat()))
-        qid = cur.lastrowid
-        for i, opt_text in enumerate(options):
-            conn.execute("INSERT INTO options(question_id, option_index, text, is_correct) VALUES (?,?,?,?)",
-                         (qid, i, opt_text, 1 if i == correct_index0 else 0))
-        for pos, (kind, fid) in enumerate(attachments[:5]):
-            conn.execute("INSERT INTO question_attachments(question_id, kind, file_id, position) VALUES (?,?,?,?)",
-                         (qid, kind, fid, pos))
-        conn.commit()
-        return qid
-
-# ---------------------- Merge helpers ----------------------
-def _copy_bundle(quiz_dst:int, bundle_id:int, bundle_map:Dict[int,int]) -> int:
-    """Copy a media bundle to quiz_dst; return new bundle id; memoized in bundle_map."""
-    if bundle_id in bundle_map: return bundle_map[bundle_id]
-    with db() as conn:
-        cur = conn.execute("INSERT INTO media_bundles(quiz_id, created_at) VALUES (?,?)",
-                           (quiz_dst, datetime.now(timezone.utc).isoformat()))
-        new_b = cur.lastrowid
-        atts = conn.execute("SELECT kind, file_id, position FROM media_bundle_attachments WHERE bundle_id=? ORDER BY position",
-                            (bundle_id,)).fetchall()
-        for a in atts:
-            conn.execute("INSERT INTO media_bundle_attachments(bundle_id, kind, file_id, position) VALUES (?,?,?,?)",
-                         (new_b, a["kind"], a["file_id"], a["position"]))
-        conn.commit()
-    bundle_map[bundle_id] = new_b
-    return new_b
-
-def _copy_question_to_quiz(qrow:sqlite3.Row, quiz_dst:int, bundle_map:Dict[int,int]) -> int:
-    """Deep copy a question (text, options, own attachments, bundle link) into quiz_dst."""
-    with db() as conn:
-        new_bundle_id = None
-        if qrow["media_bundle_id"]:
-            new_bundle_id = _copy_bundle(quiz_dst, int(qrow["media_bundle_id"]), bundle_map)
-        cur = conn.execute("INSERT INTO questions(quiz_id, text, created_at, media_bundle_id) VALUES (?,?,?,?)",
-                           (quiz_dst, qrow["text"], datetime.now(timezone.utc).isoformat(), new_bundle_id))
-        new_qid = cur.lastrowid
-        # options
-        opts = conn.execute("SELECT option_index, text, is_correct FROM options WHERE question_id=? ORDER BY option_index",
-                            (qrow["id"],)).fetchall()
-        for o in opts:
-            conn.execute("INSERT INTO options(question_id, option_index, text, is_correct) VALUES (?,?,?,?)",
-                         (new_qid, o["option_index"], o["text"], o["is_correct"]))
-        # attachments
-        atts = conn.execute("SELECT kind, file_id, position FROM question_attachments WHERE question_id=? ORDER BY position",
-                            (qrow["id"],)).fetchall()
-        for a in atts:
-            conn.execute("INSERT INTO question_attachments(question_id, kind, file_id, position) VALUES (?,?,?,?)",
-                         (new_qid, a["kind"], a["file_id"], a["position"]))
-        conn.commit()
-        return new_qid
-
-def merge_quizzes_create_new(src_id:int, dst_id:int) -> int:
-    """Create a NEW quiz that contains questions of src_id then dst_id (order preserved by original IDs)."""
-    with db() as conn:
-        src = conn.execute("SELECT * FROM quizzes WHERE id=?", (src_id,)).fetchone()
-        dst = conn.execute("SELECT * FROM quizzes WHERE id=?", (dst_id,)).fetchone()
-        title = f"دمج: {src['title']} + {dst['title']}"
-        cur = conn.execute("INSERT INTO quizzes(title, created_by, created_at) VALUES (?,?,?)",
-                           (title, OWNER_ID, datetime.now(timezone.utc).isoformat()))
-        new_quiz_id = cur.lastrowid
-        conn.commit()
-
-    bundle_map: Dict[int,int] = {}
-    # copy src questions then dst questions
-    for qz in (src_id, dst_id):
-        with db() as conn:
-            questions = conn.execute("SELECT * FROM questions WHERE quiz_id=? ORDER BY id", (qz,)).fetchall()
-        for q in questions:
-            _copy_question_to_quiz(q, new_quiz_id, bundle_map)
-
-    return new_quiz_id
-
-# ---------------------- Export helpers ----------------------
-def export_quiz_json(quiz_id:int) -> dict:
-    with db() as conn:
-        quiz = conn.execute("SELECT * FROM quizzes WHERE id=?", (quiz_id,)).fetchone()
-        questions = conn.execute("SELECT * FROM questions WHERE quiz_id=? ORDER BY id", (quiz_id,)).fetchall()
-        # collect bundle ids used
-        bundle_ids = sorted({int(q["media_bundle_id"]) for q in questions if q["media_bundle_id"] is not None})
-        bundles = []
-        for bid in bundle_ids:
-            atts = conn.execute("SELECT kind, file_id, position FROM media_bundle_attachments WHERE bundle_id=? ORDER BY position",
-                                (bid,)).fetchall()
-            bundles.append({
-                "id": bid,
-                "attachments": [{"kind": a["kind"], "file_id": a["file_id"], "position": a["position"]} for a in atts]
-            })
-        qs_out = []
-        for q in questions:
-            opts = conn.execute("SELECT option_index, text, is_correct FROM options WHERE question_id=? ORDER BY option_index",
-                                (q["id"],)).fetchall()
-            atts = conn.execute("SELECT kind, file_id, position FROM question_attachments WHERE question_id=? ORDER BY position",
-                                (q["id"],)).fetchall()
-            qs_out.append({
-                "id": q["id"],
-                "text": q["text"],
-                "created_at": q["created_at"],
-                "media_bundle_id": q["media_bundle_id"],
-                "options": [{"option_index": o["option_index"], "text": o["text"], "is_correct": int(o["is_correct"])} for o in opts],
-                "attachments": [{"kind": a["kind"], "file_id": a["file_id"], "position": a["position"]} for a in atts]
-            })
-        return {
-            "exported_at": datetime.now(timezone.utc).isoformat(),
-            "quiz": {"id": quiz["id"], "title": quiz["title"], "created_by": quiz["created_by"], "created_at": quiz["created_at"]},
-            "media_bundles": bundles,
-            "questions": qs_out
-        }
+def _display_name(u) -> str:
+    parts = []
+    if getattr(u, "first_name", None): parts.append(u.first_name)
+    if getattr(u, "last_name", None): parts.append(u.last_name)
+    nm = " ".join([p for p in parts if p]).strip()
+    if not nm and getattr(u, "username", None):
+        nm = f"@{u.username}"
+    if not nm:
+        nm = f"UID {u.id}"
+    return nm
 
 # ---------------------- Start & ReplyKeyboard ----------------------
 @dp.message(Command("start"))
@@ -622,9 +450,8 @@ async def cmd_start(msg: Message):
     if is_owner(msg.from_user.id):
         await msg.answer("لوحة التحكم جاهزة — اختر من الأزرار:", reply_markup=owner_panel_reply_kb())
     else:
-        await msg.answer("أهلاً! هذا بوت اختبارات بإدارة المعلم.\nالإجابات تظهر كمنبثقات داخل المجموعة مع خصوصية كاملة.")
+        await msg.answer("أهلاً! هذا بوت اختبارات بإدارة المعلم.\nالإجابات تتم عبر استفتاءات Quiz داخل المجموعة.")
 
-# Back/Home buttons
 @dp.message(F.text == BTN_BACK_HOME)
 async def btn_back_home(msg:Message, state:FSMContext):
     await state.clear()
@@ -632,7 +459,6 @@ async def btn_back_home(msg:Message, state:FSMContext):
 
 @dp.message(F.text == BTN_BACK_STEP)
 async def btn_back_step(msg:Message, state:FSMContext):
-    _ = await state.get_state()
     await state.clear()
     await msg.answer("رجعناك للبداية.", reply_markup=owner_panel_reply_kb())
 
@@ -677,12 +503,6 @@ async def btn_bundles(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
     await state.set_state(BundleStates.waiting_pick_quiz_for_bundle)
     await msg.answer("اختر الاختبار لإنشاء/عرض المرفقات المشتركة:", reply_markup=paged_quizzes_kb(0,"bund_pickq"))
-
-@dp.message(F.text == BTN_BULK_IMPORT)
-async def btn_bulk_import(msg: Message, state: FSMContext):
-    if not await ensure_owner(msg): return
-    await state.set_state(BulkStates.waiting_pick_quiz)
-    await msg.answer("اختر الاختبار لاستيراد الأسئلة إليه:", reply_markup=paged_quizzes_kb(0, "bulk_pickq"))
 
 @dp.message(F.text == BTN_MERGE)
 async def btn_merge(msg: Message, state:FSMContext):
@@ -853,13 +673,14 @@ async def receive_attachment(msg: Message, state: FSMContext):
     elif msg.audio: kind, file_id = "audio", msg.audio.file_id
     else: return await msg.reply("نوع مرفق غير مدعوم.")
     with db() as conn:
-        conn.execute("""INSERT INTO question_attachments(question_id, kind, file_id, position)
-                        VALUES (?,?,?,?)""", (build_session.tmp_question_id, kind, file_id, build_session.att_count))
+        conn.execute("""
+            INSERT INTO question_attachments(question_id, kind, file_id, position)
+            VALUES (?,?,?,?)
+        """, (build_session.tmp_question_id, kind, file_id, build_session.att_count))
         conn.commit()
     build_session.att_count += 1
     await msg.reply(f"تم حفظ المرفق ({build_session.att_count}/5). أرسلي المزيد أو اكتبي <b>تم</b>.")
 
-# options for new question
 @dp.message(BuildStates.waiting_options_count, F.text)
 async def receive_options_count(msg: Message, state: FSMContext):
     if not await ensure_owner(msg): await state.clear(); return
@@ -904,7 +725,7 @@ async def receive_correct_index(msg: Message, state: FSMContext):
     await state.clear()
     await msg.answer("✅ تم حفظ السؤال والخيارات.", reply_markup=owner_panel_reply_kb())
 
-# ---------------------- List / Manage Questions ----------------------
+# ---------------------- Manage Questions ----------------------
 @dp.callback_query(F.data.startswith("listq_pickq_page:"), BuildStates.waiting_pick_quiz_generic)
 async def cb_list_questions_page(cb: CallbackQuery, state:FSMContext):
     _, page = cb.data.split(":",1)
@@ -928,7 +749,13 @@ async def cb_manageq_open(cb:CallbackQuery, state:FSMContext):
     quiz_id = int(quiz_id); qid = int(qid); page = int(page)
     with db() as conn:
         qrow = conn.execute("SELECT * FROM questions WHERE id=?", (qid,)).fetchone()
-    txt = question_card_text(qrow)
+        opts = conn.execute("SELECT option_index, text, is_correct FROM options WHERE question_id=? ORDER BY option_index", (qid,)).fetchall()
+    lines = [f"<b>{qrow['text']}</b>",""]
+    for o in opts:
+        circ = chr(0x2776 + int(o["option_index"])) if o["option_index"]<10 else f"{o['option_index']+1})"
+        mark = " ✅" if int(o["is_correct"])==1 else ""
+        lines.append(f"{circ} {o['text']}{mark}")
+    txt = "\n".join(lines)
     kb = InlineKeyboardBuilder()
     kb.button(text=ACT_EDIT_TEXT,  callback_data=f"m_edit_text:{quiz_id}:{qid}:{page}")
     kb.button(text=ACT_EDIT_OPTS,  callback_data=f"m_edit_opts:{quiz_id}:{qid}:{page}")
@@ -1048,7 +875,7 @@ async def cb_m_delete(cb:CallbackQuery):
         conn.commit()
     await cb.message.edit_text("🗑️ تم حذف السؤال.", reply_markup=paged_questions_kb(int(quiz_id), int(page), tag="manageq"))
 
-# ---------------------- Edit/Delete Quiz & List ----------------------
+# ---------------------- Quizzes list / Rename / Delete ----------------------
 @dp.callback_query(F.data.startswith("overview_q_page:"))
 async def cb_list_quizzes_page(cb: CallbackQuery):
     _, page = cb.data.split(":",1)
@@ -1097,7 +924,160 @@ async def cb_del_quiz_do(cb:CallbackQuery, state:FSMContext):
     await state.clear()
     await cb.message.edit_text("🗑️ تم حذف الاختبار وما يتبعه.")
 
-# ---------------------- Publish (with time limit) ----------------------
+# ---------------------- Merge Quizzes ----------------------
+def _copy_bundle(quiz_dst:int, bundle_id:int, bundle_map:Dict[int,int]) -> int:
+    if bundle_id in bundle_map: return bundle_map[bundle_id]
+    with db() as conn:
+        cur = conn.execute("INSERT INTO media_bundles(quiz_id, created_at) VALUES (?,?)",
+                           (quiz_dst, datetime.now(timezone.utc).isoformat()))
+        new_b = cur.lastrowid
+        atts = conn.execute("SELECT kind, file_id, position FROM media_bundle_attachments WHERE bundle_id=? ORDER BY position",
+                            (bundle_id,)).fetchall()
+        for a in atts:
+            conn.execute("INSERT INTO media_bundle_attachments(bundle_id, kind, file_id, position) VALUES (?,?,?,?)",
+                         (new_b, a["kind"], a["file_id"], a["position"]))
+        conn.commit()
+    bundle_map[bundle_id] = new_b
+    return new_b
+
+def _copy_question_to_quiz(qrow:sqlite3.Row, quiz_dst:int, bundle_map:Dict[int,int]) -> int:
+    with db() as conn:
+        new_bundle_id = None
+        if qrow["media_bundle_id"]:
+            new_bundle_id = _copy_bundle(quiz_dst, int(qrow["media_bundle_id"]), bundle_map)
+        cur = conn.execute("INSERT INTO questions(quiz_id, text, created_at, media_bundle_id) VALUES (?,?,?,?)",
+                           (quiz_dst, qrow["text"], datetime.now(timezone.utc).isoformat(), new_bundle_id))
+        new_qid = cur.lastrowid
+        opts = conn.execute("SELECT option_index, text, is_correct FROM options WHERE question_id=? ORDER BY option_index",
+                            (qrow["id"],)).fetchall()
+        for o in opts:
+            conn.execute("INSERT INTO options(question_id, option_index, text, is_correct) VALUES (?,?,?,?)",
+                         (new_qid, o["option_index"], o["text"], o["is_correct"]))
+        atts = conn.execute("SELECT kind, file_id, position FROM question_attachments WHERE question_id=? ORDER BY position",
+                            (qrow["id"],)).fetchall()
+        for a in atts:
+            conn.execute("INSERT INTO question_attachments(question_id, kind, file_id, position) VALUES (?,?,?,?)",
+                         (new_qid, a["kind"], a["file_id"], a["position"]))
+        conn.commit()
+        return new_qid
+
+def merge_quizzes_create_new(src_id:int, dst_id:int) -> int:
+    with db() as conn:
+        src = conn.execute("SELECT * FROM quizzes WHERE id=?", (src_id,)).fetchone()
+        dst = conn.execute("SELECT * FROM quizzes WHERE id=?", (dst_id,)).fetchone()
+        title = f"دمج: {src['title']} + {dst['title']}"
+        cur = conn.execute("INSERT INTO quizzes(title, created_by, created_at) VALUES (?,?,?)",
+                           (title, OWNER_ID, datetime.now(timezone.utc).isoformat()))
+        new_quiz_id = cur.lastrowid
+        conn.commit()
+    bundle_map: Dict[int,int] = {}
+    for qz in (src_id, dst_id):
+        with db() as conn:
+            questions = conn.execute("SELECT * FROM questions WHERE quiz_id=? ORDER BY id", (qz,)).fetchall()
+        for q in questions:
+            _copy_question_to_quiz(q, new_quiz_id, bundle_map)
+    return new_quiz_id
+
+@dp.callback_query(F.data.startswith("merge_src_page:"), MergeStates.waiting_pick_src)
+async def cb_merge_src_page(cb:CallbackQuery, state:FSMContext):
+    _, page = cb.data.split(":",1)
+    await cb.message.edit_reply_markup(reply_markup=paged_quizzes_kb(int(page), "merge_src"))
+
+@dp.callback_query(F.data.startswith("merge_src:"), MergeStates.waiting_pick_src)
+async def cb_merge_pick_src(cb:CallbackQuery, state:FSMContext):
+    _, src_id = cb.data.split(":",1)
+    await state.update_data(src=int(src_id))
+    await state.set_state(MergeStates.waiting_pick_dst)
+    await cb.message.edit_text("اختاري الاختبار الثاني (المصدر 2):", reply_markup=paged_quizzes_kb(0, "merge_dst"))
+
+@dp.callback_query(F.data.startswith("merge_dst_page:"), MergeStates.waiting_pick_dst)
+async def cb_merge_dst_page(cb:CallbackQuery, state:FSMContext):
+    _, page = cb.data.split(":",1)
+    await cb.message.edit_reply_markup(reply_markup=paged_quizzes_kb(int(page), "merge_dst"))
+
+@dp.callback_query(F.data.startswith("merge_dst:"), MergeStates.waiting_pick_dst)
+async def cb_merge_do(cb:CallbackQuery, state:FSMContext):
+    _, dst_id = cb.data.split(":",1)
+    data = await state.get_data()
+    new_id = merge_quizzes_create_new(int(data["src"]), int(dst_id))
+    await state.clear()
+    await cb.message.edit_text(f"✅ تم إنشاء اختبار دمج جديد (ID <code>{new_id}</code>).", reply_markup=owner_panel_reply_kb())
+
+# ---------------------- Export Quiz ----------------------
+def export_quiz_json(quiz_id:int) -> dict:
+    with db() as conn:
+        quiz = conn.execute("SELECT * FROM quizzes WHERE id=?", (quiz_id,)).fetchone()
+        questions = conn.execute("SELECT * FROM questions WHERE quiz_id=? ORDER BY id", (quiz_id,)).fetchall()
+        bundle_ids = sorted({int(q["media_bundle_id"]) for q in questions if q["media_bundle_id"] is not None})
+        bundles = []
+        for bid in bundle_ids:
+            atts = conn.execute("SELECT kind, file_id, position FROM media_bundle_attachments WHERE bundle_id=? ORDER BY position",
+                                (bid,)).fetchall()
+            bundles.append({
+                "id": bid,
+                "attachments": [{"kind": a["kind"], "file_id": a["file_id"], "position": a["position"]} for a in atts]
+            })
+        qs_out = []
+        for q in questions:
+            opts = conn.execute("SELECT option_index, text, is_correct FROM options WHERE question_id=? ORDER BY option_index",
+                                (q["id"],)).fetchall()
+            atts = conn.execute("SELECT kind, file_id, position FROM question_attachments WHERE question_id=? ORDER BY position",
+                                (q["id"],)).fetchall()
+            qs_out.append({
+                "id": q["id"],
+                "text": q["text"],
+                "created_at": q["created_at"],
+                "media_bundle_id": q["media_bundle_id"],
+                "options": [{"option_index": o["option_index"], "text": o["text"], "is_correct": int(o["is_correct"])} for o in opts],
+                "attachments": [{"kind": a["kind"], "file_id": a["file_id"], "position": a["position"]} for a in atts]
+            })
+        return {
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "quiz": {"id": quiz["id"], "title": quiz["title"], "created_by": quiz["created_by"], "created_at": quiz["created_at"]},
+            "media_bundles": bundles,
+            "questions": qs_out
+        }
+
+@dp.callback_query(F.data.startswith("export_pick_page:"), ExportStates.waiting_pick_quiz)
+async def cb_export_page(cb:CallbackQuery, state:FSMContext):
+    _, page = cb.data.split(":",1)
+    await cb.message.edit_reply_markup(reply_markup=paged_quizzes_kb(int(page), "export_pick"))
+
+@dp.callback_query(F.data.startswith("export_pick:"), ExportStates.waiting_pick_quiz)
+async def cb_export_pick(cb:CallbackQuery, state:FSMContext):
+    _, quiz_id = cb.data.split(":",1)
+    data = export_quiz_json(int(quiz_id))
+    safe_title = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in data["quiz"]["title"]) or f"quiz_{quiz_id}"
+    fname = f"{safe_title}_ID{quiz_id}_{int(time.time())}.json"
+    with open(fname, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    await state.clear()
+    await cb.message.answer_document(document=FSInputFile(fname), caption="📤 تصدير JSON للاختبار")
+    try:
+        os.remove(fname)
+    except Exception:
+        pass
+
+# ---------------------- Publish as QUIZ POLLS ----------------------
+RATE_LIMIT_SECONDS = 0.05
+
+async def _safe_send(op, *args, **kwargs):
+    try:
+        msg = await op(*args, **kwargs)
+        await asyncio.sleep(RATE_LIMIT_SECONDS)
+        return msg
+    except TelegramRetryAfter as e:
+        wait = getattr(e, "retry_after", 1) or 1
+        await asyncio.sleep(wait)
+        try:
+            msg = await op(*args, **kwargs)
+            await asyncio.sleep(RATE_LIMIT_SECONDS)
+            return msg
+        except Exception:
+            return None
+    except Exception:
+        return None
+
 @dp.callback_query(F.data.startswith("pub_pickq_page:"), PublishStates.waiting_pick_quiz)
 async def cb_pub_page(cb:CallbackQuery, state:FSMContext):
     _, page = cb.data.split(":",1)
@@ -1122,7 +1102,7 @@ async def cb_pub_duration_selected(cb:CallbackQuery, state:FSMContext):
     else:
         hours = 12 if sel == "12" else 24
         expires_at = (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
-    await _do_publish(cb, quiz_id, expires_at); await state.clear()
+    await _do_publish_polls(cb, quiz_id, expires_at); await state.clear()
 
 @dp.message(PublishStates.waiting_custom_hours, F.text)
 async def cb_pub_custom_hours(msg:Message, state:FSMContext):
@@ -1136,30 +1116,9 @@ async def cb_pub_custom_hours(msg:Message, state:FSMContext):
     expires_at = (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
     class Dummy: pass
     dummy = Dummy(); dummy.message = msg; dummy.from_user = msg.from_user
-    await _do_publish(dummy, quiz_id, expires_at); await state.clear()
+    await _do_publish_polls(dummy, quiz_id, expires_at); await state.clear()
 
-# ---- Robust publish ----
-RATE_LIMIT_SECONDS = 0.05
-
-async def _safe_send(op, *args, **kwargs):
-    try:
-        msg = await op(*args, **kwargs)
-        await asyncio.sleep(RATE_LIMIT_SECONDS)
-        return msg
-    except TelegramRetryAfter as e:
-        wait = getattr(e, "retry_after", 1) or 1
-        await asyncio.sleep(wait)
-        try:
-            msg = await op(*args, **kwargs)
-            await asyncio.sleep(RATE_LIMIT_SECONDS)
-            return msg
-        except Exception:
-            return None
-    except Exception:
-        return None
-
-async def _do_publish(cb_or_msg, quiz_id:int, expires_at: Optional[str]):
-    migrate_legacy_media()
+async def _do_publish_polls(cb_or_msg, quiz_id:int, expires_at: Optional[str]):
     chat_id = cb_or_msg.message.chat.id
     with db() as conn:
         quiz = conn.execute("SELECT * FROM quizzes WHERE id=? AND is_archived=0",(quiz_id,)).fetchone()
@@ -1167,283 +1126,155 @@ async def _do_publish(cb_or_msg, quiz_id:int, expires_at: Optional[str]):
     if not quiz or not qs:
         return await bot.send_message(chat_id, "اختبار غير صالح أو بلا أسئلة.")
     exp_line = "بدون حدّ زمني" if not expires_at else f"حتى: <code>{expires_at}</code> (UTC)"
-    kb_start = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎓 ابدأ الحل", callback_data=f"start:{quiz_id}")]])
-    m_head = await _safe_send(bot.send_message, chat_id, f"📣 اختبار: <b>{quiz['title']}</b>\nالوقت: {exp_line}\nاضغطي زر \"ابدأ الحل\" لكتابة اسمك ثم أجيبي على الأسئلة.", reply_markup=kb_start)
-    if m_head:
-        with db() as conn:
-            conn.execute("INSERT INTO sent_msgs(chat_id, quiz_id, message_id, expires_at) VALUES (?,?,?,?)",
-                         (chat_id, quiz_id, m_head.message_id, expires_at))
-            conn.commit()
+    await _safe_send(bot.send_message, chat_id, f"📣 اختبار: <b>{quiz['title']}</b>\nالوقت: {exp_line}\nأجيبي على الاستفتاءات (Quiz) بالأسفل.")
+
     sent_bundles = set()
     for q in qs:
         qid = q["id"]; qtext = q["text"]; bundle_id = q["media_bundle_id"]
+        # Bundle media (once per bundle)
         if bundle_id and bundle_id not in sent_bundles:
-            atts_bundle = get_bundle_atts(bundle_id)
-            for att in atts_bundle:
+            for att in get_bundle_atts(bundle_id):
                 if att["kind"] == "photo":
-                    m = await _safe_send(bot.send_photo, chat_id, att["file_id"])
+                    await _safe_send(bot.send_photo, chat_id, att["file_id"])
                 elif att["kind"] == "voice":
-                    m = await _safe_send(bot.send_voice, chat_id, att["file_id"])
+                    await _safe_send(bot.send_voice, chat_id, att["file_id"])
                 else:
-                    m = await _safe_send(bot.send_audio, chat_id, att["file_id"])
-                if m:
-                    with db() as conn:
-                        conn.execute("INSERT INTO sent_msgs(chat_id, quiz_id, message_id, expires_at) VALUES (?,?,?,?)",
-                                     (chat_id, quiz_id, m.message_id, expires_at))
-                        conn.commit()
+                    await _safe_send(bot.send_audio, chat_id, att["file_id"])
             sent_bundles.add(bundle_id)
-        kbq = build_options_kb(qid, 0)
-        atts_q = get_question_atts(qid)
-        if atts_q:
-            first = True
-            for att in atts_q:
-                if first:
-                    if att["kind"] == "photo":
-                        m = await _safe_send(bot.send_photo, chat_id, att["file_id"], caption=qtext, reply_markup=kbq)
-                    elif att["kind"] == "voice":
-                        m = await _safe_send(bot.send_voice, chat_id, att["file_id"], caption=qtext, reply_markup=kbq)
-                    else:
-                        m = await _safe_send(bot.send_audio, chat_id, att["file_id"], caption=qtext, reply_markup=kbq)
-                    first = False
-                else:
-                    if att["kind"] == "photo":
-                        m = await _safe_send(bot.send_photo, chat_id, att["file_id"])
-                    elif att["kind"] == "voice":
-                        m = await _safe_send(bot.send_voice, chat_id, att["file_id"])
-                    else:
-                        m = await _safe_send(bot.send_audio, chat_id, att["file_id"])
-                if m:
-                    with db() as conn:
-                        conn.execute("INSERT INTO sent_msgs(chat_id, quiz_id, message_id, expires_at) VALUES (?,?,?,?)",
-                                     (chat_id, quiz_id, m.message_id, expires_at))
-                        conn.commit()
-        else:
-            m = await _safe_send(bot.send_message, chat_id, qtext, reply_markup=kbq)
-            if m:
-                with db() as conn:
-                    conn.execute("INSERT INTO sent_msgs(chat_id, quiz_id, message_id, expires_at) VALUES (?,?,?,?)",
-                                 (chat_id, quiz_id, m.message_id, expires_at))
-                    conn.commit()
-
-# ---------------------- Bulk import flow ----------------------
-@dp.callback_query(F.data.startswith("bulk_pickq_page:"), BulkStates.waiting_pick_quiz)
-async def cb_bulk_pick_page(cb: CallbackQuery, state:FSMContext):
-    _, page = cb.data.split(":",1)
-    await cb.message.edit_reply_markup(reply_markup=paged_quizzes_kb(int(page), "bulk_pickq"))
-
-@dp.callback_query(F.data.startswith("bulk_pickq:"), BulkStates.waiting_pick_quiz)
-async def cb_bulk_pick(cb: CallbackQuery, state:FSMContext):
-    _, quiz_id = cb.data.split(":",1)
-    await state.update_data(quiz_id=int(quiz_id))
-    await state.set_state(BulkStates.waiting_csv)
-    txt = (
-        "أرسل ملف CSV كـ مستند (UTF-8) بالأعمدة:\n"
-        "<code>question,options,correct,attachments</code>\n\n"
-        "• options: افصل الخيارات بـ <code>|</code> (2..10)\n"
-        "• correct: رقم الخيار الصحيح (1..عدد الخيارات)\n"
-        "• attachments (اختياري): حتى 5، بصيغة <code>photo:FILEID|voice:FILEID|audio:FILEID</code>\n"
-        "ملاحظة: للحصول على <code>file_id</code>، أرسل المرفق للبوت (خاص) وسيعرضه لك."
-    )
-    await cb.message.edit_text(txt)
-
-@dp.message(BulkStates.waiting_csv, F.document)
-async def bulk_receive_csv_document(msg: Message, state: FSMContext):
-    if not await ensure_owner(msg): await state.clear(); return
-    file = msg.document
-    if not (file.file_name or "").lower().endswith(".csv"):
-        return await msg.reply("أرسل ملف بصيغة CSV.")
-    try:
-        f = await bot.get_file(file.file_id)
-        content = await bot.download_file(f.file_path)
-        text = content.read().decode("utf-8", errors="replace")
-    except Exception as e:
-        await state.clear()
-        return await msg.reply(f"تعذّر قراءة الملف: {e}")
-    await _consume_bulk_csv_text(msg, state, text)
-
-@dp.message(BulkStates.waiting_csv, F.text)
-async def bulk_receive_csv_text(msg: Message, state:FSMContext):
-    if not await ensure_owner(msg): await state.clear(); return
-    text = msg.text or ""
-    await _consume_bulk_csv_text(msg, state, text)
-
-async def _consume_bulk_csv_text(msg: Message, state:FSMContext, csv_text:str):
-    data = await state.get_data()
-    quiz_id = int(data["quiz_id"])
-    parsed = parse_bulk_csv(csv_text)
-    ok_count = 0; errors = []
-    for idx, item in enumerate(parsed, start=1):
-        if "_error" in item:
-            errors.append(item["_error"]); continue
+        # Question attachments
+        for att in get_question_atts(qid):
+            if att["kind"] == "photo":
+                await _safe_send(bot.send_photo, chat_id, att["file_id"])
+            elif att["kind"] == "voice":
+                await _safe_send(bot.send_voice, chat_id, att["file_id"])
+            else:
+                await _safe_send(bot.send_audio, chat_id, att["file_id"])
+        # Build poll
+        opts = options_for_question(qid)
+        if not (2 <= len(opts) <= 10):
+            await _safe_send(bot.send_message, chat_id, f"⚠️ السؤال Q{qid} لديه {len(opts)} خيار. تلغرام يسمح 2..10.")
+            continue
+        options_texts = [o["text"] for o in opts]
+        correct_row = next((o for o in opts if int(o["is_correct"])==1), None)
+        correct_option_id = int(correct_row["option_index"]) if correct_row is not None else 0
+        # Send poll (quiz)
         try:
-            insert_question_with_data(quiz_id, item["question"], item["options"], item["correct_index0"], item["attachments"])
-            ok_count += 1
-        except Exception as e:
-            errors.append(f"سطر {idx+1}: فشل الإدخال — {e}")
-    await state.clear()
-    report = [f"تم الاستيراد ✅: {ok_count} سؤال."]
-    if errors:
-        report.append(f"أخطاء: {len(errors)} (أول 10):")
-        for e in errors[:10]: report.append(f"- {e}")
-    await msg.reply("\n".join(report), reply_markup=owner_panel_reply_kb())
-
-# ---------------------- Merge flow (NEW) ----------------------
-@dp.callback_query(F.data.startswith("merge_src_page:"), MergeStates.waiting_pick_src)
-async def merge_src_page(cb:CallbackQuery, state:FSMContext):
-    _, page = cb.data.split(":",1)
-    await cb.message.edit_reply_markup(reply_markup=paged_quizzes_kb(int(page), "merge_src"))
-
-@dp.callback_query(F.data.startswith("merge_src:"), MergeStates.waiting_pick_src)
-async def merge_pick_src(cb:CallbackQuery, state:FSMContext):
-    _, src_id = cb.data.split(":",1)
-    await state.update_data(src_id=int(src_id))
-    await state.set_state(MergeStates.waiting_pick_dst)
-    await cb.message.edit_text("اختاري الاختبار الثاني (المصدر 2):", reply_markup=paged_quizzes_kb(0, "merge_dst"))
-
-@dp.callback_query(F.data.startswith("merge_dst_page:"), MergeStates.waiting_pick_dst)
-async def merge_dst_page(cb:CallbackQuery, state:FSMContext):
-    _, page = cb.data.split(":",1)
-    await cb.message.edit_reply_markup(reply_markup=paged_quizzes_kb(int(page), "merge_dst"))
-
-@dp.callback_query(F.data.startswith("merge_dst:"), MergeStates.waiting_pick_dst)
-async def merge_do(cb:CallbackQuery, state:FSMContext):
-    data = await state.get_data()
-    src_id = int(data["src_id"])
-    _, dst_id = cb.data.split(":",1); dst_id = int(dst_id)
-    if src_id == dst_id:
-        return await cb.answer("الاختباران متطابقان. اختاري اختبارًا مختلفًا.", show_alert=True)
-    new_quiz_id = merge_quizzes_create_new(src_id, dst_id)
-    await state.clear()
-    await cb.message.edit_text(f"✅ تم إنشاء اختبار جديد بالدمج (ID: <code>{new_quiz_id}</code>).")
-
-# ---------------------- Export flow (NEW) ----------------------
-@dp.callback_query(F.data.startswith("export_pick_page:"), ExportStates.waiting_pick_quiz)
-async def export_pick_page(cb:CallbackQuery, state:FSMContext):
-    _, page = cb.data.split(":",1)
-    await cb.message.edit_reply_markup(reply_markup=paged_quizzes_kb(int(page), "export_pick"))
-
-@dp.callback_query(F.data.startswith("export_pick:"), ExportStates.waiting_pick_quiz)
-async def export_pick(cb:CallbackQuery, state:FSMContext):
-    _, quiz_id = cb.data.split(":",1)
-    try:
-        data = export_quiz_json(int(quiz_id))
-        import json
-        buf = BytesIO(json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"))
-        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        filename = f"quiz_{quiz_id}_{ts}.json"
-        buf.seek(0)
-        await bot.send_document(cb.message.chat.id, document=FSInputFile(path_or_bytesio=buf, filename=filename),
-                                caption=f"📤 تصدير اختبار ID {quiz_id}")
-        await state.clear()
-        await cb.answer("تم التصدير.")
-    except Exception as e:
-        await state.clear()
-        await cb.message.edit_text(f"فشل التصدير: {e}")
-
-# ---------------------- Name & Answers ----------------------
-@dp.callback_query(F.data.startswith("start:"))
-async def cb_start_quiz(cb:CallbackQuery):
-    try:
-        _, quiz_id = cb.data.split(":",1); quiz_id = int(quiz_id)
-    except Exception:
-        return await cb.answer("خطأ بالمعطيات.", show_alert=True)
-    chat_id = cb.message.chat.id
-    expired = _quiz_expired(chat_id, quiz_id)
-    if expired is True: return await cb.answer("⏰ انتهى وقت الاختبار. لا يمكنك البدء.", show_alert=True)
-    user_id = cb.from_user.id
-    with db() as conn:
-        row = conn.execute(
-            "SELECT 1 FROM participant_names WHERE origin_chat_id=? AND user_id=? AND quiz_id=?",
-            (chat_id, user_id, quiz_id)
-        ).fetchone()
-    if not row:
-        pending_names[(chat_id, user_id, quiz_id)] = True
-        await cb.answer()
-        await bot.send_message(chat_id, f"{hlink_user('الطالبة', user_id)} — من فضلك اكتبي اسمك أولاً:", disable_notification=True)
-        return
-    await cb.answer("بالتوفيق! ابدئي بحل الأسئلة المنشورة.")
-
-@dp.message()
-async def catch_name_in_group(msg: Message):
-    if msg.chat.type not in ("group", "supergroup"):
-        return
-    user_id = msg.from_user.id
-    text = msg.text or ""
-    for (chat_id, uid, quiz_id), _ in list(pending_names.items()):
-        if chat_id == msg.chat.id and uid == user_id:
-            name = text.strip()
-            if not name:
-                return
-            with db() as conn:
-                conn.execute(
-                    "INSERT OR REPLACE INTO participant_names(origin_chat_id,user_id,quiz_id,name) VALUES (?,?,?,?)",
-                    (chat_id, user_id, quiz_id, name),
-                )
-                conn.commit()
-            del pending_names[(chat_id, uid, quiz_id)]
-            await msg.reply(
-                f"تم حفظ الاسم: <b>{name}</b>. يمكنك الآن البدء بالإجابة.",
-                reply_markup=ReplyKeyboardRemove(),
+            poll_msg = await bot.send_poll(
+                chat_id=chat_id,
+                question=qtext[:255],  # Telegram limit for poll question
+                options=options_texts,
+                type="quiz",
+                correct_option_id=correct_option_id,
+                is_anonymous=False,
+                allows_multiple_answers=False
             )
-            return
+            with db() as conn:
+                conn.execute("INSERT INTO sent_polls(chat_id, quiz_id, question_id, poll_id, message_id, expires_at, is_closed) VALUES (?,?,?,?,?,?,0)",
+                             (chat_id, quiz_id, qid, poll_msg.poll.id, poll_msg.message_id, expires_at))
+                conn.execute("INSERT INTO sent_msgs(chat_id, quiz_id, message_id, expires_at) VALUES (?,?,?,?)",
+                             (chat_id, quiz_id, poll_msg.message_id, expires_at))
+                conn.commit()
+            await asyncio.sleep(RATE_LIMIT_SECONDS)
+        except Exception as e:
+            await _safe_send(bot.send_message, chat_id, f"⚠️ تعذّر إرسال استفتاء للسؤال Q{qid}: {e}")
 
-@dp.callback_query(F.data.startswith("ans:"))
-async def on_answer(cb: CallbackQuery):
-    parts = cb.data.split(":", 3)
-    if len(parts) < 4: return await cb.answer("خطأ.")
-    _, question_id_s, option_index_s, target_user_id_s = parts
-    question_id = int(question_id_s); option_index = int(option_index_s); target_user_id = int(target_user_id_s)
-    user_id = cb.from_user.id; chat_id = cb.message.chat.id
-
-    if target_user_id != 0 and user_id != target_user_id:
-        return await cb.answer("هذا السؤال موجّه لمشارك آخر.")
-
+# ---------------------- Auto-close expired polls ----------------------
+async def _close_expired_polls_once():
+    now = _now_utc()
     with db() as conn:
-        qrow = conn.execute("SELECT quiz_id, text FROM questions WHERE id=?", (question_id,)).fetchone()
-        if not qrow: return await cb.answer("سؤال غير موجود.", show_alert=True)
-        quiz_id = qrow["quiz_id"]; q_text = qrow["text"]
+        rows = conn.execute("""
+            SELECT id, chat_id, message_id, expires_at
+            FROM sent_polls
+            WHERE expires_at IS NOT NULL AND is_closed=0
+        """).fetchall()
+    for r in rows:
+        exp_s = r["expires_at"]
+        try:
+            exp_dt = datetime.fromisoformat(exp_s)
+        except Exception:
+            continue
+        if now <= exp_dt:
+            continue
+        chat_id = int(r["chat_id"])
+        message_id = int(r["message_id"] or 0)
+        if not message_id:
+            # لا نستطيع إغلاقه بلا message_id (استفتاءات قديمة)
+            with db() as conn:
+                conn.execute("UPDATE sent_polls SET is_closed=1 WHERE id=?", (r["id"],))
+                conn.commit()
+            continue
+        # حاول إغلاق الاستفتاء
+        try:
+            await bot.stop_poll(chat_id=chat_id, message_id=message_id)
+            with db() as conn:
+                conn.execute("UPDATE sent_polls SET is_closed=1 WHERE id=?", (r["id"],))
+                conn.commit()
+            await asyncio.sleep(RATE_LIMIT_SECONDS)
+        except TelegramRetryAfter as e:
+            wait = getattr(e, "retry_after", 1) or 1
+            await asyncio.sleep(wait)
+        except Exception:
+            # اتركه لمحاولة لاحقة
+            pass
 
-    expired = _quiz_expired(chat_id, quiz_id)
-    if expired is True: return await cb.answer("⏰ انتهى وقت الاختبار. لا يمكنك الإجابة.", show_alert=True)
+async def expiry_watcher():
+    while True:
+        try:
+            await _close_expired_polls_once()
+        except Exception:
+            pass
+        await asyncio.sleep(20)  # افحص كل 20 ثانية
 
+# ---------------------- Poll answers handler ----------------------
+@dp.poll_answer()
+async def handle_poll_answer(pa: PollAnswer):
+    user_id = pa.user.id
+    name = _display_name(pa.user)
+    poll_id = pa.poll_id
+    chosen = (pa.option_ids or [])[0] if pa.option_ids else None
+    if chosen is None:
+        return
     with db() as conn:
-        has_name = conn.execute("SELECT 1 FROM participant_names WHERE origin_chat_id=? AND user_id=? AND quiz_id=?",
-                                (chat_id, user_id, quiz_id)).fetchone()
-    if not has_name:
-        pending_names[(chat_id, user_id, quiz_id)] = True
-        await bot.send_message(chat_id, f"{hlink_user('الطالبة', user_id)} — اكتبي اسمك أولًا ثم أعيدي اختيار الإجابة:")
-        return await cb.answer()
-
+        row = conn.execute("SELECT chat_id, quiz_id, question_id, expires_at, is_closed FROM sent_polls WHERE poll_id=?", (poll_id,)).fetchone()
+    if not row:
+        return
+    chat_id = row["chat_id"]; quiz_id = row["quiz_id"]; question_id = row["question_id"]
+    # ignore if closed or expired
+    expired = False
+    if row["expires_at"]:
+        try:
+            expired = datetime.fromisoformat(row["expires_at"]) < _now_utc()
+        except:
+            expired = False
+    if expired or int(row["is_closed"] or 0) == 1:
+        return
+    # Save name for scoreboard
+    with db() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO participant_names(origin_chat_id,user_id,quiz_id,name) VALUES (?,?,?,?)",
+            (chat_id, user_id, quiz_id, name),
+        )
+        conn.commit()
+    # avoid duplicates
     with db() as conn:
         prev = conn.execute("SELECT 1 FROM responses WHERE chat_id=? AND user_id=? AND question_id=?",
                             (chat_id, user_id, question_id)).fetchone()
-    if prev: return await cb.answer("إجابتك مسجّلة لهذا السؤال.", show_alert=True)
-
+    if prev:
+        return
     with db() as conn:
         opt = conn.execute("SELECT text, is_correct FROM options WHERE question_id=? AND option_index=?",
-                           (question_id, option_index)).fetchone()
-        all_opts = conn.execute("SELECT option_index, text, is_correct FROM options WHERE question_id=? ORDER BY option_index",
-                                (question_id,)).fetchall()
-        is_correct = 1 if opt and int(opt["is_correct"]) == 1 else 0
+                           (question_id, chosen)).fetchone()
+    is_correct = 1 if opt and int(opt["is_correct"])==1 else 0
+    with db() as conn:
         conn.execute("""INSERT INTO responses(chat_id,user_id,question_id,option_index,is_correct,answered_at)
                         VALUES (?,?,?,?,?,?)""",
-                        (chat_id, user_id, question_id, option_index, is_correct, datetime.now(timezone.utc).isoformat()))
+                     (chat_id, user_id, question_id, int(chosen), is_correct, datetime.now(timezone.utc).isoformat()))
         conn.commit()
-
-    your_text = opt["text"] if opt else "—"
-    correct_row = next((r for r in all_opts if int(r["is_correct"])==1), None)
-    correct_text = correct_row["text"] if correct_row else "—"
-
-    brief_q = q_text[:80] + ("…" if len(q_text) > 80 else "")
-    if is_correct:
-        feedback = f"🎉🎊 ✅ إجابة صحيحة!\nالسؤال: {brief_q}\nالصحيحة: {correct_text}\nإجابتك: {your_text}"
-    else:
-        feedback = f"❌✖️💥 إجابة خاطئة!\nالسؤال: {brief_q}\nالصحيحة: {correct_text}\nإجابتك: {your_text}"
-    if len(feedback) > 190: feedback = feedback[:187] + "…"
-    await cb.answer(feedback, show_alert=True)
-    await _celebrate(chat_id, bool(is_correct))
-
-    # check finish
+    try:
+        await _celebrate(chat_id, bool(is_correct))
+    except:
+        pass
+    # final score if finished
     q_ids = get_quiz_question_ids(quiz_id)
     with db() as conn:
         marks = ",".join(["?"] * len(q_ids))
@@ -1453,24 +1284,10 @@ async def on_answer(cb: CallbackQuery):
         with db() as conn:
             sql_score = f"SELECT SUM(is_correct) FROM responses WHERE chat_id=? AND user_id=? AND question_id IN ({marks})"
             total = conn.execute(sql_score, (chat_id, user_id, *q_ids)).fetchone()[0] or 0
-            rowp = conn.execute("""SELECT 1 FROM user_progress WHERE origin_chat_id=? AND user_id=? AND quiz_id=?""",
-                                (chat_id, user_id, quiz_id)).fetchone()
-            if rowp:
-                conn.execute("UPDATE user_progress SET finished_at=? WHERE origin_chat_id=? AND user_id=? AND quiz_id=?",
-                             (datetime.now(timezone.utc).isoformat(), chat_id, user_id, quiz_id))
-            else:
-                conn.execute("""INSERT INTO user_progress(origin_chat_id,user_id,quiz_id,q_pos,started_at,finished_at)
-                                VALUES (?,?,?,?,?,?)""", (chat_id, user_id, quiz_id, 0, datetime.now(timezone.utc).isoformat(), datetime.now(timezone.utc).isoformat()))
-            conn.commit()
-        final_popup = f"🎆🎇 تم الإنهاء — نتيجتك: {total} / {len(q_ids)}"
-        try: await cb.answer(final_popup if len(final_popup)<=190 else final_popup[:187]+"…", show_alert=True)
-        except: pass
-        with db() as conn:
-            row = conn.execute("SELECT name FROM participant_names WHERE origin_chat_id=? AND user_id=? AND quiz_id=?",
-                               (chat_id, user_id, quiz_id)).fetchone()
-        _name = row["name"] if row else "الطالبة"
-        try: await bot.send_message(chat_id, f"🎉 النتيجة النهائية — {hlink_user(_name, user_id)}: <b>{total}</b> / {len(q_ids)}")
-        except TelegramBadRequest: pass
+        try:
+            await bot.send_message(chat_id, f"🎉 النتيجة النهائية — {hlink_user(name, user_id)}: <b>{total}</b> / {len(q_ids)}")
+        except TelegramBadRequest:
+            pass
 
 # ---------------------- Scoreboard ----------------------
 @dp.callback_query(F.data.startswith("score_pickq_page:"))
@@ -1516,6 +1333,7 @@ async def cb_wipe_yes(cb:CallbackQuery):
             DELETE FROM question_attachments;
             DELETE FROM media_bundle_attachments;
             DELETE FROM media_bundles;
+            DELETE FROM sent_polls;
         """); conn.commit()
     await cb.message.edit_text("تم الحذف الشامل ✅")
 
@@ -1550,7 +1368,17 @@ async def show_file_id(msg: Message):
 # ---------------------- Run ----------------------
 async def main():
     print("✅ Bot is running…")
-    await dp.start_polling(bot, allowed_updates=["message","callback_query"])
+    # شغّل ووتشر إغلاق الاستفتاءات
+    asyncio.create_task(expiry_watcher())
+    await dp.start_polling(
+        bot,
+        allowed_updates=[
+            "message",
+            "callback_query",
+            "poll",
+            "poll_answer",
+        ]
+    )
 
 if __name__ == "__main__":
     try:
