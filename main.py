@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Telegram Quiz Bot — ReplyKeyboard Owner Panel + Quiz Polls (Auto-close on expiry)
+Telegram Quiz Bot — Quiz Polls + Auto-close + Auto-numbering + 'Done' button
 
 Features:
-- Owner panel (ReplyKeyboard) ثابتة.
-- أسئلة/خيارات CRUD + مرفقات للسؤال + "حزم مرفقات" مشتركة.
+- Owner panel (ReplyKeyboard) ثابتة للمالك.
+- CRUD أسئلة/خيارات + مرفقات خاصة بالسؤال + حزم مرفقات مشتركة.
 - نشر كـ Telegram Quiz Polls (type="quiz") غير مجهولة (is_anonymous=False).
-- حتى 10 خيارات لكل سؤال (حد تيليجرام).
+- ترقيم تلقائي للأسئلة عند النشر: [1], [2], ...
+- حتى 10 خيارات لكل سؤال.
 - إرسال المرفقات قبل الاستفتاء (Polls لا تدعم وسائط مدمجة).
+- زر Inline "✔️ تم" لإنهاء مرحلة رفع المرفقات (سؤال/حزمة/استبدال).
 - إغلاق تلقائي لكل الاستفتاءات عند انتهاء الوقت المحدد.
 - دمج اختبارين في اختبار جديد.
-- تصدير اختبار كامل إلى JSON قابل للحفظ.
+- تصدير اختبار إلى JSON.
 - لوحة نتائج.
+
+بيئة التشغيل: aiogram v3
 """
 
 import asyncio
@@ -181,7 +185,7 @@ def _ensure_schema():
                 position INTEGER NOT NULL
             )
         """)
-        # Map poll_id -> question + message_id + closed flag
+        # خريطة الاستفتاءات المنشورة
         c.execute("""
             CREATE TABLE IF NOT EXISTS sent_polls (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -194,7 +198,7 @@ def _ensure_schema():
                 is_closed INTEGER NOT NULL DEFAULT 0
             )
         """)
-        # legacy columns to migrate
+        # legacy columns
         if not col_exists(conn, "questions", "photo"):
             try: c.execute("ALTER TABLE questions ADD COLUMN photo TEXT")
             except: pass
@@ -207,7 +211,6 @@ def _ensure_schema():
         if not col_exists(conn, "sent_msgs", "expires_at"):
             try: c.execute("ALTER TABLE sent_msgs ADD COLUMN expires_at TEXT")
             except: pass
-        # add missing columns for sent_polls
         if not col_exists(conn, "sent_polls", "message_id"):
             try: c.execute("ALTER TABLE sent_polls ADD COLUMN message_id INTEGER")
             except: pass
@@ -328,7 +331,7 @@ class MergeStates(StatesGroup):
 class ExportStates(StatesGroup):
     waiting_pick_quiz = State()
 
-# ---------------------- Helpers ----------------------
+# ---------------------- Keyboards ----------------------
 def owner_panel_reply_kb() -> ReplyKeyboardMarkup:
     rows = [
         [KeyboardButton(text=BTN_BACK_HOME), KeyboardButton(text=BTN_BACK_STEP)],
@@ -352,6 +355,12 @@ def attach_mode_kb() -> InlineKeyboardMarkup:
     kb.button(text=BTN_USE_OWN, callback_data="attach_mode:own")
     kb.button(text=BTN_USE_NONE, callback_data="attach_mode:none")
     kb.adjust(1)
+    return kb.as_markup()
+
+def done_button_kb(tag: str) -> InlineKeyboardMarkup:
+    """Inline 'Done' button to finish attachments steps."""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✔️ تم", callback_data=f"done:{tag}")
     return kb.as_markup()
 
 def paged_quizzes_kb(page: int = 0, tag: str = "pickq", per:int=8) -> InlineKeyboardMarkup:
@@ -407,6 +416,7 @@ def publish_duration_kb() -> InlineKeyboardMarkup:
     kb.adjust(2)
     return kb.as_markup()
 
+# ---------------------- Helpers ----------------------
 def get_quiz_question_ids(quiz_id: int) -> List[int]:
     with db() as conn:
         rows = conn.execute("SELECT id FROM questions WHERE quiz_id=? ORDER BY id", (quiz_id,)).fetchall()
@@ -565,22 +575,32 @@ async def bundles_for_quiz(cb:CallbackQuery, state:FSMContext):
         bundle_id = cur.lastrowid; conn.commit()
     await state.update_data(bundle_id=bundle_id)
     await state.set_state(BundleStates.waiting_bundle_files)
-    await cb.message.edit_text(f"أرسل حتى 5 مرفقات للحزمة رقم {bundle_id}. عند الانتهاء اكتب <b>تم</b>.")
+    await cb.message.edit_text(
+        f"أرسلي حتى 5 مرفقات للحزمة رقم {bundle_id}.",
+        reply_markup=done_button_kb("bundle_att")
+    )
 
-@dp.message(BundleStates.waiting_bundle_files, F.text)
-async def bundle_done_if_text(msg:Message, state:FSMContext):
-    if not await ensure_owner(msg): await state.clear(); return
-    if (msg.text or "").strip().lower() == "تم":
+@dp.callback_query(F.data.startswith("done:"))
+async def cb_done(cb: CallbackQuery, state: FSMContext):
+    tag = cb.data.split(":",1)[1]
+    if tag == "q_att":
+        await state.set_state(BuildStates.waiting_options_count)
+        await cb.message.edit_text("كم عدد الخيارات؟ (2-10)")
+    elif tag == "bundle_att":
         await state.clear()
-        await msg.answer("تم حفظ الحزمة. الآن اربطي الأسئلة بها من 'إضافة سؤال' → 'استخدام مرفق مشترك'.", reply_markup=owner_panel_reply_kb())
+        await cb.message.edit_text("تم حفظ الحزمة. الآن اربطي الأسئلة بها من 'إضافة سؤال' → 'استخدام مرفق مشترك'.",
+                                   reply_markup=owner_panel_reply_kb())
+    elif tag == "replace_att":
+        await state.clear()
+        await cb.message.edit_text("تم تحديث المرفقات.", reply_markup=owner_panel_reply_kb())
     else:
-        await msg.reply("أرسل مرفق (صورة/صوت/ملف صوتي) أو اكتب <b>تم</b> للإنهاء.")
+        await cb.answer()
 
 @dp.message(BundleStates.waiting_bundle_files, F.photo | F.voice | F.audio)
 async def bundle_add_file(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): await state.clear(); return
     data = await state.get_data(); pos = int(data.get("bundle_pos",0))
-    if pos >= 5: return await msg.reply("بلغتِ الحد الأقصى (5). اكتبي <b>تم</b> للإنهاء.")
+    if pos >= 5: return await msg.reply("بلغتِ الحد الأقصى (5). اضغطي ✔️ تم أعلى الرسالة.")
     if msg.photo: kind, file_id = "photo", msg.photo[-1].file_id
     elif msg.voice: kind, file_id = "voice", msg.voice.file_id
     elif msg.audio: kind, file_id = "audio", msg.audio.file_id
@@ -634,7 +654,7 @@ async def choose_attach_mode(cb:CallbackQuery, state:FSMContext):
         await cb.message.edit_text("اختر الحزمة:", reply_markup=paged_bundles_kb(build_session.quiz_id,0,"pickbundle_for_q"))
     elif mode == "own":
         await state.set_state(BuildStates.waiting_q_attachments)
-        await cb.message.edit_text("أرسل حتى 5 مرفقات لهذا السؤال. عند الانتهاء اكتب <b>تم</b>.")
+        await cb.message.edit_text("أرسلي حتى 5 مرفقات لهذا السؤال.", reply_markup=done_button_kb("q_att"))
     else:
         await state.set_state(BuildStates.waiting_options_count)
         await cb.message.edit_text("كم عدد الخيارات؟ (2-10)")
@@ -654,20 +674,11 @@ async def picked_bundle_for_q(cb:CallbackQuery, state:FSMContext):
     await state.set_state(BuildStates.waiting_options_count)
     await cb.message.edit_text("تم الربط بالحزمة.\nكم عدد الخيارات؟ (2-10)")
 
-@dp.message(BuildStates.waiting_q_attachments, F.text)
-async def finish_attachments_if_text(msg: Message, state: FSMContext):
-    if not await ensure_owner(msg): await state.clear(); return
-    if (msg.text or "").strip().lower() == "تم":
-        await state.set_state(BuildStates.waiting_options_count)
-        await msg.answer("كم عدد الخيارات؟ (2-10)", reply_markup=owner_panel_reply_kb())
-    else:
-        await msg.reply("أرسل مرفق أو اكتب <b>تم</b> للمتابعة.")
-
 @dp.message(BuildStates.waiting_q_attachments, F.photo | F.voice | F.audio)
 async def receive_attachment(msg: Message, state: FSMContext):
     if not await ensure_owner(msg): await state.clear(); return
     if build_session.att_count >= 5:
-        return await msg.reply("وصلتِ للحد الأقصى (5). أرسلي <b>تم</b> للمتابعة.")
+        return await msg.reply("وصلتِ للحد الأقصى (5). اضغطي ✔️ تم أعلى الرسالة.")
     if msg.photo: kind, file_id = "photo", msg.photo[-1].file_id
     elif msg.voice: kind, file_id = "voice", msg.voice.file_id
     elif msg.audio: kind, file_id = "audio", msg.audio.file_id
@@ -679,7 +690,7 @@ async def receive_attachment(msg: Message, state: FSMContext):
         """, (build_session.tmp_question_id, kind, file_id, build_session.att_count))
         conn.commit()
     build_session.att_count += 1
-    await msg.reply(f"تم حفظ المرفق ({build_session.att_count}/5). أرسلي المزيد أو اكتبي <b>تم</b>.")
+    await msg.reply(f"تم حفظ المرفق ({build_session.att_count}/5).")
 
 @dp.message(BuildStates.waiting_options_count, F.text)
 async def receive_options_count(msg: Message, state: FSMContext):
@@ -834,18 +845,12 @@ async def m_opts_correct(msg:Message, state:FSMContext):
 @dp.callback_query(F.data.startswith("m_edit_media:"))
 async def cb_m_edit_media(cb:CallbackQuery, state:FSMContext):
     _, quiz_id, qid, page = cb.data.split(":",3)
-    await state.update_data(question_id=int(qid))
+    await state.update_data(question_id=int(qid), pos=0)
     await state.set_state(BuildStates.waiting_replace_attachments)
-    await cb.message.edit_text("أرسل حتى 5 مرفقات جديدة (سيتم استبدال القديمة). عند الانتهاء أرسل: <b>تم</b>.")
-
-@dp.message(BuildStates.waiting_replace_attachments, F.text)
-async def ch_media_finish_if_text(msg:Message, state:FSMContext):
-    if not await ensure_owner(msg): await state.clear(); return
-    if (msg.text or '').strip().lower() == "تم":
-        await state.clear()
-        await msg.answer("تم تحديث المرفقات.", reply_markup=owner_panel_reply_kb())
-    else:
-        await msg.reply("أرسل مرفقات أو اكتب <b>تم</b> حين الانتهاء.")
+    await cb.message.edit_text(
+        "أرسل حتى 5 مرفقات جديدة (سيتم استبدال القديمة).",
+        reply_markup=done_button_kb("replace_att")
+    )
 
 @dp.message(BuildStates.waiting_replace_attachments, F.photo | F.voice | F.audio)
 async def ch_media_collect(msg:Message, state:FSMContext):
@@ -855,7 +860,7 @@ async def ch_media_collect(msg:Message, state:FSMContext):
         with db() as conn:
             conn.execute("DELETE FROM question_attachments WHERE question_id=?", (qid,))
             conn.commit()
-    if pos >= 5: return await msg.reply("الحد الأقصى 5. اكتب <b>تم</b> للإنهاء.")
+    if pos >= 5: return await msg.reply("الحد الأقصى 5. اضغطي ✔️ تم أعلى الرسالة.")
     if msg.photo: kind, file_id = "photo", msg.photo[-1].file_id
     elif msg.voice: kind, file_id = "voice", msg.voice.file_id
     elif msg.audio: kind, file_id = "audio", msg.audio.file_id
@@ -1058,7 +1063,7 @@ async def cb_export_pick(cb:CallbackQuery, state:FSMContext):
     except Exception:
         pass
 
-# ---------------------- Publish as QUIZ POLLS ----------------------
+# ---------------------- Publish as QUIZ POLLS (with numbering) ----------------------
 RATE_LIMIT_SECONDS = 0.05
 
 async def _safe_send(op, *args, **kwargs):
@@ -1129,11 +1134,11 @@ async def _do_publish_polls(cb_or_msg, quiz_id:int, expires_at: Optional[str]):
     await _safe_send(bot.send_message, chat_id, f"📣 اختبار: <b>{quiz['title']}</b>\nالوقت: {exp_line}\nأجيبي على الاستفتاءات (Quiz) بالأسفل.")
 
     sent_bundles = set()
-    for q in qs:
+    for idx, q in enumerate(qs, start=1):
         qid = q["id"]; qtext = q["text"]; bundle_id = q["media_bundle_id"]
         # Bundle media (once per bundle)
         if bundle_id and bundle_id not in sent_bundles:
-            for att in get_bundle_atts(bundle_id):
+            for att in get_bundle_atts(int(bundle_id)):
                 if att["kind"] == "photo":
                     await _safe_send(bot.send_photo, chat_id, att["file_id"])
                 elif att["kind"] == "voice":
@@ -1157,11 +1162,13 @@ async def _do_publish_polls(cb_or_msg, quiz_id:int, expires_at: Optional[str]):
         options_texts = [o["text"] for o in opts]
         correct_row = next((o for o in opts if int(o["is_correct"])==1), None)
         correct_option_id = int(correct_row["option_index"]) if correct_row is not None else 0
+        # Auto-numbering
+        qtext_numbered = f"[{idx}] {qtext}"
         # Send poll (quiz)
         try:
             poll_msg = await bot.send_poll(
                 chat_id=chat_id,
-                question=qtext[:255],  # Telegram limit for poll question
+                question=qtext_numbered[:255],  # Telegram limit
                 options=options_texts,
                 type="quiz",
                 correct_option_id=correct_option_id,
@@ -1198,12 +1205,10 @@ async def _close_expired_polls_once():
         chat_id = int(r["chat_id"])
         message_id = int(r["message_id"] or 0)
         if not message_id:
-            # لا نستطيع إغلاقه بلا message_id (استفتاءات قديمة)
             with db() as conn:
                 conn.execute("UPDATE sent_polls SET is_closed=1 WHERE id=?", (r["id"],))
                 conn.commit()
             continue
-        # حاول إغلاق الاستفتاء
         try:
             await bot.stop_poll(chat_id=chat_id, message_id=message_id)
             with db() as conn:
@@ -1214,7 +1219,6 @@ async def _close_expired_polls_once():
             wait = getattr(e, "retry_after", 1) or 1
             await asyncio.sleep(wait)
         except Exception:
-            # اتركه لمحاولة لاحقة
             pass
 
 async def expiry_watcher():
@@ -1239,7 +1243,6 @@ async def handle_poll_answer(pa: PollAnswer):
     if not row:
         return
     chat_id = row["chat_id"]; quiz_id = row["quiz_id"]; question_id = row["question_id"]
-    # ignore if closed or expired
     expired = False
     if row["expires_at"]:
         try:
@@ -1368,7 +1371,7 @@ async def show_file_id(msg: Message):
 # ---------------------- Run ----------------------
 async def main():
     print("✅ Bot is running…")
-    # شغّل ووتشر إغلاق الاستفتاءات
+    # تشغيل ووتشر إغلاق الاستفتاءات
     asyncio.create_task(expiry_watcher())
     await dp.start_polling(
         bot,
