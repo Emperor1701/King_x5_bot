@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Telegram Quiz Bot — Quiz Polls + Auto-close + Auto-numbering + 'Done' button
++ Smart Flood Control
 
 Features:
 - Owner panel (ReplyKeyboard) ثابتة للمالك.
@@ -15,6 +16,7 @@ Features:
 - دمج اختبارين في اختبار جديد.
 - تصدير اختبار إلى JSON.
 - لوحة نتائج.
+- تباطؤ ذكي لتفادي Flood control من تيليجرام.
 
 بيئة التشغيل: aiogram v3
 """
@@ -24,6 +26,7 @@ import os
 import sqlite3
 import json
 import time
+import random
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple, Dict, List
@@ -398,8 +401,8 @@ def paged_bundles_kb(quiz_id:int, page:int=0, tag:str="pickbundle", per:int=8) -
     kb = InlineKeyboardBuilder()
     for r in chunk:
         with db() as c2:
-            att_cnt = c2.execute("SELECT COUNT(*) FROM media_bundle_attachments WHERE bundle_id=?", (r["id"],)).fetchone()[0]
-            q_cnt = c2.execute("SELECT COUNT(*) FROM questions WHERE media_bundle_id=?", (r["id"],)).fetchone()[0]
+            att_cnt = c2.execute("SELECT COUNT(*) FROM media_bundle_attachments WHERE bundle_id=?", (r["id"]),).fetchone()[0]
+            q_cnt = c2.execute("SELECT COUNT(*) FROM questions WHERE media_bundle_id=?", (r["id"]),).fetchone()[0]
         kb.button(text=f"📎 حزمة {r['id']} — ملفات:{att_cnt} / أسئلة:{q_cnt}", callback_data=f"{tag}:{quiz_id}:{r['id']}")
     kb.adjust(1); kb.row()
     if start > 0: kb.button(text="⬅️", callback_data=f"{tag}_page:{quiz_id}:{page-1}")
@@ -959,7 +962,7 @@ def _copy_question_to_quiz(qrow:sqlite3.Row, quiz_dst:int, bundle_map:Dict[int,i
             conn.execute("INSERT INTO options(question_id, option_index, text, is_correct) VALUES (?,?,?,?)",
                          (new_qid, o["option_index"], o["text"], o["is_correct"]))
         atts = conn.execute("SELECT kind, file_id, position FROM question_attachments WHERE question_id=? ORDER BY position",
-                            (qrow["id"],)).fetchall()
+                            (qrow["id"]),).fetchall()
         for a in atts:
             conn.execute("INSERT INTO question_attachments(question_id, kind, file_id, position) VALUES (?,?,?,?)",
                          (new_qid, a["kind"], a["file_id"], a["position"]))
@@ -968,8 +971,8 @@ def _copy_question_to_quiz(qrow:sqlite3.Row, quiz_dst:int, bundle_map:Dict[int,i
 
 def merge_quizzes_create_new(src_id:int, dst_id:int) -> int:
     with db() as conn:
-        src = conn.execute("SELECT * FROM quizzes WHERE id=?", (src_id,)).fetchone()
-        dst = conn.execute("SELECT * FROM quizzes WHERE id=?", (dst_id,)).fetchone()
+        src = conn.execute("SELECT * FROM quizzes WHERE id=?", (src_id,),).fetchone()
+        dst = conn.execute("SELECT * FROM quizzes WHERE id=?", (dst_id,),).fetchone()
         title = f"دمج: {src['title']} + {dst['title']}"
         cur = conn.execute("INSERT INTO quizzes(title, created_by, created_at) VALUES (?,?,?)",
                            (title, OWNER_ID, datetime.now(timezone.utc).isoformat()))
@@ -978,7 +981,7 @@ def merge_quizzes_create_new(src_id:int, dst_id:int) -> int:
     bundle_map: Dict[int,int] = {}
     for qz in (src_id, dst_id):
         with db() as conn:
-            questions = conn.execute("SELECT * FROM questions WHERE quiz_id=? ORDER BY id", (qz,)).fetchall()
+            questions = conn.execute("SELECT * FROM questions WHERE quiz_id=? ORDER BY id", (qz,),).fetchall()
         for q in questions:
             _copy_question_to_quiz(q, new_quiz_id, bundle_map)
     return new_quiz_id
@@ -1011,13 +1014,13 @@ async def cb_merge_do(cb:CallbackQuery, state:FSMContext):
 # ---------------------- Export Quiz ----------------------
 def export_quiz_json(quiz_id:int) -> dict:
     with db() as conn:
-        quiz = conn.execute("SELECT * FROM quizzes WHERE id=?", (quiz_id,)).fetchone()
-        questions = conn.execute("SELECT * FROM questions WHERE quiz_id=? ORDER BY id", (quiz_id,)).fetchall()
+        quiz = conn.execute("SELECT * FROM quizzes WHERE id=?", (quiz_id,),).fetchone()
+        questions = conn.execute("SELECT * FROM questions WHERE quiz_id=? ORDER BY id", (quiz_id,),).fetchall()
         bundle_ids = sorted({int(q["media_bundle_id"]) for q in questions if q["media_bundle_id"] is not None})
         bundles = []
         for bid in bundle_ids:
             atts = conn.execute("SELECT kind, file_id, position FROM media_bundle_attachments WHERE bundle_id=? ORDER BY position",
-                                (bid,)).fetchall()
+                                (bid,),).fetchall()
             bundles.append({
                 "id": bid,
                 "attachments": [{"kind": a["kind"], "file_id": a["file_id"], "position": a["position"]} for a in atts]
@@ -1025,9 +1028,9 @@ def export_quiz_json(quiz_id:int) -> dict:
         qs_out = []
         for q in questions:
             opts = conn.execute("SELECT option_index, text, is_correct FROM options WHERE question_id=? ORDER BY option_index",
-                                (q["id"],)).fetchall()
+                                (q["id"],),).fetchall()
             atts = conn.execute("SELECT kind, file_id, position FROM question_attachments WHERE question_id=? ORDER BY position",
-                                (q["id"],)).fetchall()
+                                (q["id"]),).fetchall()
             qs_out.append({
                 "id": q["id"],
                 "text": q["text"],
@@ -1064,24 +1067,29 @@ async def cb_export_pick(cb:CallbackQuery, state:FSMContext):
         pass
 
 # ---------------------- Publish as QUIZ POLLS (with numbering) ----------------------
-RATE_LIMIT_SECONDS = 0.05
+# تباطؤ عام لكل رسالة (مرفق/استفتاء)
+RATE_LIMIT_SECONDS = 1.2
 
 async def _safe_send(op, *args, **kwargs):
-    try:
-        msg = await op(*args, **kwargs)
-        await asyncio.sleep(RATE_LIMIT_SECONDS)
-        return msg
-    except TelegramRetryAfter as e:
-        wait = getattr(e, "retry_after", 1) or 1
-        await asyncio.sleep(wait)
+    """
+    إرسال مع تباطؤ + إعادة محاولة عند 429 + jitter.
+    يعيد message أو None عند الفشل النهائي.
+    """
+    max_tries = 3
+    for attempt in range(1, max_tries + 1):
         try:
             msg = await op(*args, **kwargs)
             await asyncio.sleep(RATE_LIMIT_SECONDS)
             return msg
+        except TelegramRetryAfter as e:
+            wait = max(getattr(e, "retry_after", 1) or 1, 1)
+            await asyncio.sleep(wait + random.uniform(0.3, 0.8))
         except Exception:
-            return None
-    except Exception:
-        return None
+            if attempt < max_tries:
+                await asyncio.sleep(1.5 + attempt * 0.5)
+            else:
+                return None
+    return None
 
 @dp.callback_query(F.data.startswith("pub_pickq_page:"), PublishStates.waiting_pick_quiz)
 async def cb_pub_page(cb:CallbackQuery, state:FSMContext):
@@ -1126,8 +1134,8 @@ async def cb_pub_custom_hours(msg:Message, state:FSMContext):
 async def _do_publish_polls(cb_or_msg, quiz_id:int, expires_at: Optional[str]):
     chat_id = cb_or_msg.message.chat.id
     with db() as conn:
-        quiz = conn.execute("SELECT * FROM quizzes WHERE id=? AND is_archived=0",(quiz_id,)).fetchone()
-        qs = conn.execute("SELECT id, text, media_bundle_id FROM questions WHERE quiz_id=? ORDER BY id",(quiz_id,)).fetchall()
+        quiz = conn.execute("SELECT * FROM quizzes WHERE id=? AND is_archived=0",(quiz_id,),).fetchone()
+        qs = conn.execute("SELECT id, text, media_bundle_id FROM questions WHERE quiz_id=? ORDER BY id",(quiz_id,),).fetchall()
     if not quiz or not qs:
         return await bot.send_message(chat_id, "اختبار غير صالح أو بلا أسئلة.")
     exp_line = "بدون حدّ زمني" if not expires_at else f"حتى: <code>{expires_at}</code> (UTC)"
@@ -1136,6 +1144,8 @@ async def _do_publish_polls(cb_or_msg, quiz_id:int, expires_at: Optional[str]):
     sent_bundles = set()
     for idx, q in enumerate(qs, start=1):
         qid = q["id"]; qtext = q["text"]; bundle_id = q["media_bundle_id"]
+        messages_for_this_question = 0
+
         # Bundle media (once per bundle)
         if bundle_id and bundle_id not in sent_bundles:
             for att in get_bundle_atts(int(bundle_id)):
@@ -1145,15 +1155,20 @@ async def _do_publish_polls(cb_or_msg, quiz_id:int, expires_at: Optional[str]):
                     await _safe_send(bot.send_voice, chat_id, att["file_id"])
                 else:
                     await _safe_send(bot.send_audio, chat_id, att["file_id"])
+                messages_for_this_question += 1
             sent_bundles.add(bundle_id)
+
         # Question attachments
-        for att in get_question_atts(qid):
+        q_atts = get_question_atts(qid)
+        for att in q_atts:
             if att["kind"] == "photo":
                 await _safe_send(bot.send_photo, chat_id, att["file_id"])
             elif att["kind"] == "voice":
                 await _safe_send(bot.send_voice, chat_id, att["file_id"])
             else:
                 await _safe_send(bot.send_audio, chat_id, att["file_id"])
+            messages_for_this_question += 1
+
         # Build poll
         opts = options_for_question(qid)
         if not (2 <= len(opts) <= 10):
@@ -1162,28 +1177,38 @@ async def _do_publish_polls(cb_or_msg, quiz_id:int, expires_at: Optional[str]):
         options_texts = [o["text"] for o in opts]
         correct_row = next((o for o in opts if int(o["is_correct"])==1), None)
         correct_option_id = int(correct_row["option_index"]) if correct_row is not None else 0
+
         # Auto-numbering
         qtext_numbered = f"[{idx}] {qtext}"
-        # Send poll (quiz)
-        try:
-            poll_msg = await bot.send_poll(
-                chat_id=chat_id,
-                question=qtext_numbered[:255],  # Telegram limit
-                options=options_texts,
-                type="quiz",
-                correct_option_id=correct_option_id,
-                is_anonymous=False,
-                allows_multiple_answers=False
-            )
+
+        # Send poll (quiz) عبر _safe_send
+        poll_msg = await _safe_send(
+            bot.send_poll,
+            chat_id=chat_id,
+            question=qtext_numbered[:255],
+            options=options_texts,
+            type="quiz",
+            correct_option_id=correct_option_id,
+            is_anonymous=False,
+            allows_multiple_answers=False
+        )
+        if poll_msg is None:
+            await _safe_send(bot.send_message, chat_id, f"⚠️ تعذّر إرسال استفتاء للسؤال Q{qid}.")
+        else:
             with db() as conn:
                 conn.execute("INSERT INTO sent_polls(chat_id, quiz_id, question_id, poll_id, message_id, expires_at, is_closed) VALUES (?,?,?,?,?,?,0)",
                              (chat_id, quiz_id, qid, poll_msg.poll.id, poll_msg.message_id, expires_at))
                 conn.execute("INSERT INTO sent_msgs(chat_id, quiz_id, message_id, expires_at) VALUES (?,?,?,?)",
                              (chat_id, quiz_id, poll_msg.message_id, expires_at))
                 conn.commit()
-            await asyncio.sleep(RATE_LIMIT_SECONDS)
-        except Exception as e:
-            await _safe_send(bot.send_message, chat_id, f"⚠️ تعذّر إرسال استفتاء للسؤال Q{qid}: {e}")
+            messages_for_this_question += 1
+
+        # تباطؤ ديناميكي بحسب عدد الرسائل المُرسلة لهذا السؤال
+        await asyncio.sleep(0.8 * max(messages_for_this_question, 1))
+
+        # استراحة كل 8 أسئلة
+        if idx % 8 == 0:
+            await asyncio.sleep(35)
 
 # ---------------------- Auto-close expired polls ----------------------
 async def _close_expired_polls_once():
@@ -1214,10 +1239,10 @@ async def _close_expired_polls_once():
             with db() as conn:
                 conn.execute("UPDATE sent_polls SET is_closed=1 WHERE id=?", (r["id"],))
                 conn.commit()
-            await asyncio.sleep(RATE_LIMIT_SECONDS)
+            await asyncio.sleep(0.2)
         except TelegramRetryAfter as e:
-            wait = getattr(e, "retry_after", 1) or 1
-            await asyncio.sleep(wait)
+            wait = max(getattr(e, "retry_after", 1) or 1, 1)
+            await asyncio.sleep(wait + random.uniform(0.1, 0.3))
         except Exception:
             pass
 
@@ -1239,7 +1264,7 @@ async def handle_poll_answer(pa: PollAnswer):
     if chosen is None:
         return
     with db() as conn:
-        row = conn.execute("SELECT chat_id, quiz_id, question_id, expires_at, is_closed FROM sent_polls WHERE poll_id=?", (poll_id,)).fetchone()
+        row = conn.execute("SELECT chat_id, quiz_id, question_id, expires_at, is_closed FROM sent_polls WHERE poll_id=?", (poll_id,),).fetchone()
     if not row:
         return
     chat_id = row["chat_id"]; quiz_id = row["quiz_id"]; question_id = row["question_id"]
@@ -1371,8 +1396,7 @@ async def show_file_id(msg: Message):
 # ---------------------- Run ----------------------
 async def main():
     print("✅ Bot is running…")
-    # تشغيل ووتشر إغلاق الاستفتاءات
-    asyncio.create_task(expiry_watcher())
+    asyncio.create_task(expiry_watcher())  # تشغيل ووتشر إغلاق الاستفتاءات
     await dp.start_polling(
         bot,
         allowed_updates=[
