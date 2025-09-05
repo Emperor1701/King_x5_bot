@@ -3,21 +3,7 @@
 """
 Telegram Quiz Bot — Quiz Polls + Auto-close + Auto-numbering + 'Done' button
 + Smart Flood Control + Import/Export + Merge + Level Assessment (A1/A2/B1)
-
-Features:
-- Owner panel (ReplyKeyboard) ثابتة للمالك.
-- CRUD أسئلة/خيارات + مرفقات خاصة بالسؤال + حزم مرفقات مشتركة.
-- نشر كـ Telegram Quiz Polls (type="quiz") غير مجهولة (is_anonymous=False).
-- ترقيم تلقائي للأسئلة عند النشر: [1], [2], ...
-- حتى 10 خيارات لكل سؤال.
-- إرسال المرفقات قبل الاستفتاء (Polls لا تدعم وسائط مدمجة).
-- زر Inline "✔️ تم" لإنهاء مرحلة رفع المرفقات (سؤال/حزمة/استبدال).
-- إغلاق تلقائي لكل الاستفتاءات عند انتهاء الوقت المحدد.
-- دمج اختبارين في اختبار جديد.
-- تصدير/استيراد اختبار كملف JSON.
-- لوحة نتائج.
-- تباطؤ ذكي لتفادي Flood control من تيليجرام.
-- 🎯 تقييم مستوى (A1/A2/B1) بناءً على HL/Schreiben/Sprechen.
++ Level flow with student picker list
 
 بيئة التشغيل: aiogram v3
 """
@@ -273,7 +259,7 @@ BTN_WIPE_ALL= "🧹 حذف كل الاختبارات"
 BTN_SCORE   = "🏆 لوحة النتائج"
 BTN_BACK_HOME = "↩️ العودة للبداية"
 BTN_BACK_STEP = "⬅️ رجوع للخلف"
-BTN_LEVEL   = "🎯 تقييم مستوى"  # NEW
+BTN_LEVEL   = "🎯 تقييم مستوى"  # Level flow entry
 
 ACT_EDIT_TEXT  = "✏️ تعديل النص"
 ACT_EDIT_OPTS  = "🧩 تعديل الخيارات"
@@ -340,7 +326,11 @@ class ExportStates(StatesGroup):
 class ImportStates(StatesGroup):
     waiting_json = State()
 
-class LevelStates(StatesGroup):  # NEW
+# Level flow states
+class LevelStates(StatesGroup):
+    waiting_pick_quiz = State()
+    waiting_pick_student = State()
+    waiting_manual_name = State()
     waiting_hl = State()
     waiting_write = State()
     waiting_speak = State()
@@ -359,7 +349,7 @@ def owner_panel_reply_kb() -> ReplyKeyboardMarkup:
         [KeyboardButton(text=BTN_IMPORT), KeyboardButton(text=BTN_EXPORT)],
         [KeyboardButton(text=BTN_MERGE)],
         [KeyboardButton(text=BTN_PUBLISH)],
-        [KeyboardButton(text=BTN_LEVEL)],  # NEW
+        [KeyboardButton(text=BTN_LEVEL)],
         [KeyboardButton(text=BTN_WIPE_ALL)],
         [KeyboardButton(text=BTN_SCORE)],
     ]
@@ -429,6 +419,30 @@ def publish_duration_kb() -> InlineKeyboardMarkup:
     kb.button(text=BTN_DUR_CUSTOM, callback_data="dur:custom")
     kb.button(text=BTN_DUR_NONE, callback_data="dur:none")
     kb.adjust(2)
+    return kb.as_markup()
+
+def paged_participants_kb(origin_chat_id:int, quiz_id:int, page:int=0, tag:str="level_pickstu", per:int=10) -> InlineKeyboardMarkup:
+    with db() as conn:
+        rows = conn.execute("""
+            SELECT user_id, name FROM participant_names
+            WHERE origin_chat_id=? AND quiz_id=?
+            ORDER BY name COLLATE NOCASE
+        """, (origin_chat_id, quiz_id)).fetchall()
+    start = page * per; chunk = rows[start:start+per]
+    kb = InlineKeyboardBuilder()
+    for r in chunk:
+        nm = r["name"]
+        if len(nm) > 40: nm = nm[:40] + "…"
+        kb.button(text=f"👤 {nm}", callback_data=f"{tag}:{quiz_id}:{r['user_id']}:{page}")
+    if not chunk:
+        kb.button(text="(لا يوجد أسماء محفوظة)", callback_data="noop")
+    kb.adjust(1); kb.row()
+    # manual name entry
+    kb.button(text="✍️ إدخال اسم يدوي", callback_data=f"{tag}_manual:{quiz_id}:{page}")
+    kb.row()
+    if start > 0: kb.button(text="⬅️", callback_data=f"{tag}_page:{quiz_id}:{page-1}")
+    kb.button(text=f"صفحة {page+1}", callback_data="noop")
+    if start + per < len(rows): kb.button(text="➡️", callback_data=f"{tag}_page:{quiz_id}:{page+1}")
     return kb.as_markup()
 
 # ---------------------- Helpers ----------------------
@@ -559,24 +573,67 @@ async def btn_publish(msg:Message, state:FSMContext):
     await state.set_state(PublishStates.waiting_pick_quiz)
     await msg.answer("اختر الاختبار لنشره:", reply_markup=paged_quizzes_kb(0,"pub_pickq"))
 
+# === Level entry ===
 @dp.message(F.text == BTN_LEVEL)
 async def btn_level(msg: Message, state: FSMContext):
     if not await ensure_owner(msg): return
+    # يجب التنفيذ داخل المجموعة كي نستخرج أسماء من هذا الكروب
+    if msg.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return await msg.answer("فضلاً شغّلي هذا الإجراء من داخل المجموعة لعرض قائمة الأسماء.", reply_markup=owner_panel_reply_kb())
+    await state.set_state(LevelStates.waiting_pick_quiz)
+    await msg.answer("🎯 اختاري الاختبار لعرض أسماء الطالبات:", reply_markup=paged_quizzes_kb(0, "level_pickq"))
+
+@dp.callback_query(F.data.startswith("level_pickq_page:"), LevelStates.waiting_pick_quiz)
+async def cb_level_pickq_page(cb: CallbackQuery, state: FSMContext):
+    _, page = cb.data.split(":",1)
+    await cb.message.edit_reply_markup(reply_markup=paged_quizzes_kb(int(page), "level_pickq"))
+
+@dp.callback_query(F.data.startswith("level_pickq:"), LevelStates.waiting_pick_quiz)
+async def cb_level_pickq(cb: CallbackQuery, state: FSMContext):
+    _, quiz_id = cb.data.split(":",1)
+    chat_id = cb.message.chat.id
+    await state.update_data(level_quiz_id=int(quiz_id))
+    await state.set_state(LevelStates.waiting_pick_student)
+    await cb.message.edit_text(
+        "اختاري الطالبة من القائمة أو ادخلي اسم يدوي:",
+        reply_markup=paged_participants_kb(chat_id, int(quiz_id), 0, "level_pickstu")
+    )
+
+@dp.callback_query(F.data.startswith("level_pickstu_page:"), LevelStates.waiting_pick_student)
+async def cb_level_pickstu_page(cb: CallbackQuery, state: FSMContext):
+    _, quiz_id, page = cb.data.split(":",2)
+    await cb.message.edit_reply_markup(reply_markup=paged_participants_kb(cb.message.chat.id, int(quiz_id), int(page), "level_pickstu"))
+
+@dp.callback_query(F.data.startswith("level_pickstu_manual:"), LevelStates.waiting_pick_student)
+async def cb_level_manual_name(cb: CallbackQuery, state: FSMContext):
+    _, quiz_id, page = cb.data.split(":",2)
+    await state.update_data(level_quiz_id=int(quiz_id), level_user_id=0)
+    await state.set_state(LevelStates.waiting_manual_name)
+    await cb.message.edit_text("اكتبي اسم الطالبة:")
+
+@dp.message(LevelStates.waiting_manual_name, F.text)
+async def level_manual_name(msg: Message, state: FSMContext):
+    name = msg.text.strip()
+    if not name:
+        return await msg.reply("اكتبي اسمًا صالحًا.")
+    await state.update_data(level_name=name)
     await state.set_state(LevelStates.waiting_hl)
     await msg.answer("أدخل علامة Hören & Lesen (0-45):")
 
-@dp.message(F.text == BTN_WIPE_ALL)
-async def btn_wipe_all(msg:Message):
-    if not await ensure_owner(msg): return
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✅ نعم", callback_data="yes:wipe")
-    kb.button(text="❌ لا", callback_data="no:wipe")
-    await msg.answer("هل تريد حذف كل البيانات؟", reply_markup=kb.as_markup())
-
-@dp.message(F.text == BTN_SCORE)
-async def btn_score(msg:Message):
-    if not await ensure_owner(msg): return
-    await msg.answer("اختر اختبار لعرض النتائج:", reply_markup=paged_quizzes_kb(0,"score_pickq"))
+@dp.callback_query(F.data.startswith("level_pickstu:"), LevelStates.waiting_pick_student)
+async def cb_level_pickstu(cb: CallbackQuery, state: FSMContext):
+    _, quiz_id, user_id, page = cb.data.split(":",3)
+    user_id = int(user_id); quiz_id = int(quiz_id)
+    # اجلب الاسم المخزّن
+    with db() as conn:
+        row = conn.execute("""
+            SELECT name FROM participant_names
+            WHERE origin_chat_id=? AND quiz_id=? AND user_id=?
+        """, (cb.message.chat.id, quiz_id, user_id)).fetchone()
+    name = (row["name"] if row else f"UID {user_id}")
+    await state.update_data(level_quiz_id=quiz_id, level_user_id=user_id, level_name=name)
+    await state.set_state(LevelStates.waiting_hl)
+    await cb.message.edit_text(f"الطالبة: <b>{name}</b>\nأدخل علامة Hören & Lesen (0-45):")
 
 # ---------------------- Create quiz ----------------------
 @dp.message(BuildStates.waiting_title, F.text)
@@ -1438,13 +1495,10 @@ async def cb_scoreboard_show(cb:CallbackQuery):
 
 # ---------------------- Level Assessment (A1/A2/B1) ----------------------
 def calc_level(hl: float, wr: float, sp: float) -> str:
-    # A1
     if 0 <= hl <= 19 and 0 <= wr <= 6 and 0 <= sp <= 34.5:
         return "A1"
-    # A2
     if 20 <= hl <= 32 and 7 <= wr <= 14 and 35 <= sp <= 74.5:
         return "A2"
-    # B1
     if 33 <= hl <= 45 and 15 <= wr <= 20 and 75 <= sp <= 100:
         return "B1"
     return "غير مطابق لأي مستوى"
@@ -1454,7 +1508,7 @@ async def level_hl(msg: Message, state: FSMContext):
     try:
         hl = float(msg.text.strip())
     except:
-        return await msg.reply("أدخل رقم صحيح لـ Hören & Lesen.")
+        return await msg.reply("أدخل رقم صحيح لـ Hören & Lesen (0-45).")
     await state.update_data(hl=hl)
     await state.set_state(LevelStates.waiting_write)
     await msg.answer("أدخل علامة Schreiben (0-20):")
@@ -1464,7 +1518,7 @@ async def level_write(msg: Message, state: FSMContext):
     try:
         wr = float(msg.text.strip())
     except:
-        return await msg.reply("أدخل رقم صحيح لـ Schreiben.")
+        return await msg.reply("أدخل رقم صحيح لـ Schreiben (0-20).")
     await state.update_data(wr=wr)
     await state.set_state(LevelStates.waiting_speak)
     await msg.answer("أدخل علامة Sprechen (0-100):")
@@ -1474,15 +1528,15 @@ async def level_speak(msg: Message, state: FSMContext):
     try:
         sp = float(msg.text.strip())
     except:
-        return await msg.reply("أدخل رقم صحيح لـ Sprechen.")
+        return await msg.reply("أدخل رقم صحيح لـ Sprechen (0-100).")
     data = await state.get_data()
-    hl, wr = data["hl"], data["wr"]
-    level = calc_level(hl, wr, sp)
+    name = data.get("level_name","الطالبة")
+    level = calc_level(float(data["hl"]), float(data["wr"]), sp)
     await state.clear()
     await msg.answer(
-        f"📊 النتيجة:\n"
-        f"Hören & Lesen: {hl}\n"
-        f"Schreiben: {wr}\n"
+        f"📊 النتيجة — <b>{name}</b>:\n"
+        f"Hören & Lesen: {data['hl']}\n"
+        f"Schreiben: {data['wr']}\n"
         f"Sprechen: {sp}\n\n"
         f"🎯 المستوى: <b>{level}</b>",
         reply_markup=owner_panel_reply_kb()
@@ -1538,7 +1592,7 @@ async def show_file_id(msg: Message):
 # ---------------------- Run ----------------------
 async def main():
     print("✅ Bot is running…")
-    asyncio.create_task(expiry_watcher())  # تشغيل ووتشر إغلاق الاستفتاءات
+    asyncio.create_task(expiry_watcher())
     await dp.start_polling(
         bot,
         allowed_updates=[
