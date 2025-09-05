@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Telegram Quiz Bot — Quiz Polls + Auto-close + Auto-numbering + 'Done' button
-+ Smart Flood Control
++ Smart Flood Control + Import/Export + Merge + Level Assessment (A1/A2/B1)
 
 Features:
 - Owner panel (ReplyKeyboard) ثابتة للمالك.
@@ -14,9 +14,10 @@ Features:
 - زر Inline "✔️ تم" لإنهاء مرحلة رفع المرفقات (سؤال/حزمة/استبدال).
 - إغلاق تلقائي لكل الاستفتاءات عند انتهاء الوقت المحدد.
 - دمج اختبارين في اختبار جديد.
-- تصدير اختبار إلى JSON.
+- تصدير/استيراد اختبار كملف JSON.
 - لوحة نتائج.
 - تباطؤ ذكي لتفادي Flood control من تيليجرام.
+- 🎯 تقييم مستوى (A1/A2/B1) بناءً على HL/Schreiben/Sprechen.
 
 بيئة التشغيل: aiogram v3
 """
@@ -201,7 +202,7 @@ def _ensure_schema():
                 is_closed INTEGER NOT NULL DEFAULT 0
             )
         """)
-        # legacy columns
+        # legacy add-ons
         if not col_exists(conn, "questions", "photo"):
             try: c.execute("ALTER TABLE questions ADD COLUMN photo TEXT")
             except: pass
@@ -266,11 +267,13 @@ BTN_DELQUIZ = "🗑️ حذف اختبار"
 BTN_BUNDLES = "📎 مرفقات مشتركة"
 BTN_MERGE   = "🔗 دمج الاختبارات"
 BTN_EXPORT  = "📤 تصدير اختبار"
+BTN_IMPORT  = "📥 استيراد دفعة"
 BTN_PUBLISH = "🚀 نشر اختبار"
 BTN_WIPE_ALL= "🧹 حذف كل الاختبارات"
 BTN_SCORE   = "🏆 لوحة النتائج"
 BTN_BACK_HOME = "↩️ العودة للبداية"
 BTN_BACK_STEP = "⬅️ رجوع للخلف"
+BTN_LEVEL   = "🎯 تقييم مستوى"  # NEW
 
 ACT_EDIT_TEXT  = "✏️ تعديل النص"
 ACT_EDIT_OPTS  = "🧩 تعديل الخيارات"
@@ -334,6 +337,14 @@ class MergeStates(StatesGroup):
 class ExportStates(StatesGroup):
     waiting_pick_quiz = State()
 
+class ImportStates(StatesGroup):
+    waiting_json = State()
+
+class LevelStates(StatesGroup):  # NEW
+    waiting_hl = State()
+    waiting_write = State()
+    waiting_speak = State()
+
 # ---------------------- Keyboards ----------------------
 def owner_panel_reply_kb() -> ReplyKeyboardMarkup:
     rows = [
@@ -345,8 +356,10 @@ def owner_panel_reply_kb() -> ReplyKeyboardMarkup:
         [KeyboardButton(text=BTN_EDITQUIZ)],
         [KeyboardButton(text=BTN_DELQUIZ)],
         [KeyboardButton(text=BTN_BUNDLES)],
-        [KeyboardButton(text=BTN_MERGE), KeyboardButton(text=BTN_EXPORT)],
+        [KeyboardButton(text=BTN_IMPORT), KeyboardButton(text=BTN_EXPORT)],
+        [KeyboardButton(text=BTN_MERGE)],
         [KeyboardButton(text=BTN_PUBLISH)],
+        [KeyboardButton(text=BTN_LEVEL)],  # NEW
         [KeyboardButton(text=BTN_WIPE_ALL)],
         [KeyboardButton(text=BTN_SCORE)],
     ]
@@ -361,7 +374,6 @@ def attach_mode_kb() -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 def done_button_kb(tag: str) -> InlineKeyboardMarkup:
-    """Inline 'Done' button to finish attachments steps."""
     kb = InlineKeyboardBuilder()
     kb.button(text="✔️ تم", callback_data=f"done:{tag}")
     return kb.as_markup()
@@ -529,6 +541,16 @@ async def btn_export(msg: Message, state:FSMContext):
     await state.set_state(ExportStates.waiting_pick_quiz)
     await msg.answer("📤 اختاري الاختبار لتصديره:", reply_markup=paged_quizzes_kb(0, "export_pick"))
 
+@dp.message(F.text == BTN_IMPORT)
+async def btn_import(msg: Message, state: FSMContext):
+    if not await ensure_owner(msg): return
+    await state.set_state(ImportStates.waiting_json)
+    await msg.answer(
+        "📥 ارفعي ملف JSON الذي حصلتي عليه من (📤 تصدير اختبار).\n"
+        "سأقوم بإنشاء اختبار جديد بنفس المحتوى.",
+        reply_markup=owner_panel_reply_kb()
+    )
+
 @dp.message(F.text == BTN_PUBLISH)
 async def btn_publish(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
@@ -536,6 +558,12 @@ async def btn_publish(msg:Message, state:FSMContext):
         return await msg.reply("افتح هذا الخيار داخل المجموعة لنشر الاختبار.", reply_markup=owner_panel_reply_kb())
     await state.set_state(PublishStates.waiting_pick_quiz)
     await msg.answer("اختر الاختبار لنشره:", reply_markup=paged_quizzes_kb(0,"pub_pickq"))
+
+@dp.message(F.text == BTN_LEVEL)
+async def btn_level(msg: Message, state: FSMContext):
+    if not await ensure_owner(msg): return
+    await state.set_state(LevelStates.waiting_hl)
+    await msg.answer("أدخل علامة Hören & Lesen (0-45):")
 
 @dp.message(F.text == BTN_WIPE_ALL)
 async def btn_wipe_all(msg:Message):
@@ -1066,15 +1094,87 @@ async def cb_export_pick(cb:CallbackQuery, state:FSMContext):
     except Exception:
         pass
 
+# ---------------------- Import Quiz (JSON) ----------------------
+def import_quiz_from_json(payload: dict) -> int:
+    quiz_info = payload.get("quiz") or {}
+    title = quiz_info.get("title") or "اختبار مستورد"
+    new_quiz_title = f"مستورد: {title}"
+    with db() as conn:
+        cur = conn.execute(
+            "INSERT INTO quizzes(title, created_by, created_at) VALUES (?,?,?)",
+            (new_quiz_title, OWNER_ID, datetime.now(timezone.utc).isoformat())
+        )
+        new_quiz_id = cur.lastrowid
+        conn.commit()
+
+    old_to_new_bundle: Dict[int, int] = {}
+
+    for b in payload.get("media_bundles", []) or []:
+        old_id = int(b.get("id"))
+        with db() as conn:
+            cur = conn.execute(
+                "INSERT INTO media_bundles(quiz_id, created_at) VALUES (?,?)",
+                (new_quiz_id, datetime.now(timezone.utc).isoformat())
+            )
+            new_bid = cur.lastrowid
+            for a in b.get("attachments", []) or []:
+                conn.execute(
+                    "INSERT INTO media_bundle_attachments(bundle_id, kind, file_id, position) VALUES (?,?,?,?)",
+                    (new_bid, a.get("kind"), a.get("file_id"), int(a.get("position", 0)))
+                )
+            conn.commit()
+        old_to_new_bundle[old_id] = new_bid
+
+    for q in payload.get("questions", []) or []:
+        mb_old = q.get("media_bundle_id")
+        mb_new = old_to_new_bundle.get(int(mb_old)) if mb_old is not None else None
+        with db() as conn:
+            cur = conn.execute(
+                "INSERT INTO questions(quiz_id, text, created_at, media_bundle_id) VALUES (?,?,?,?)",
+                (new_quiz_id, q.get("text") or "", datetime.now(timezone.utc).isoformat(), mb_new)
+            )
+            new_qid = cur.lastrowid
+            for o in q.get("options", []) or []:
+                conn.execute(
+                    "INSERT INTO options(question_id, option_index, text, is_correct) VALUES (?,?,?,?)",
+                    (new_qid, int(o.get("option_index", 0)), o.get("text") or "", int(o.get("is_correct", 0)))
+                )
+            for a in q.get("attachments", []) or []:
+                conn.execute(
+                    "INSERT INTO question_attachments(question_id, kind, file_id, position) VALUES (?,?,?,?)",
+                    (new_qid, a.get("kind"), a.get("file_id"), int(a.get("position", 0)))
+                )
+            conn.commit()
+
+    return new_quiz_id
+
+@dp.message(ImportStates.waiting_json, F.document)
+async def import_receive_json(msg: Message, state: FSMContext):
+    if not await ensure_owner(msg): await state.clear(); return
+    doc = msg.document
+    if not (doc.file_name or "").lower().endswith(".json"):
+        return await msg.reply("الملف يجب أن يكون JSON (من تصدير الاختبار).")
+    file = await bot.get_file(doc.file_id)
+    path = file.file_path
+    b = await bot.download_file(path)
+    raw = b.read().decode("utf-8", errors="replace")
+    try:
+        payload = json.loads(raw)
+    except Exception as e:
+        await state.clear()
+        return await msg.reply(f"تعذّر قراءة JSON: {e}")
+    try:
+        new_id = import_quiz_from_json(payload)
+    except Exception as e:
+        await state.clear()
+        return await msg.reply(f"حدث خطأ أثناء الاستيراد: {e}")
+    await state.clear()
+    await msg.answer(f"✅ تم الاستيراد. رقم الاختبار الجديد: <code>{new_id}</code>", reply_markup=owner_panel_reply_kb())
+
 # ---------------------- Publish as QUIZ POLLS (with numbering) ----------------------
-# تباطؤ عام لكل رسالة (مرفق/استفتاء)
 RATE_LIMIT_SECONDS = 1.2
 
 async def _safe_send(op, *args, **kwargs):
-    """
-    إرسال مع تباطؤ + إعادة محاولة عند 429 + jitter.
-    يعيد message أو None عند الفشل النهائي.
-    """
     max_tries = 3
     for attempt in range(1, max_tries + 1):
         try:
@@ -1146,7 +1246,6 @@ async def _do_publish_polls(cb_or_msg, quiz_id:int, expires_at: Optional[str]):
         qid = q["id"]; qtext = q["text"]; bundle_id = q["media_bundle_id"]
         messages_for_this_question = 0
 
-        # Bundle media (once per bundle)
         if bundle_id and bundle_id not in sent_bundles:
             for att in get_bundle_atts(int(bundle_id)):
                 if att["kind"] == "photo":
@@ -1158,7 +1257,6 @@ async def _do_publish_polls(cb_or_msg, quiz_id:int, expires_at: Optional[str]):
                 messages_for_this_question += 1
             sent_bundles.add(bundle_id)
 
-        # Question attachments
         q_atts = get_question_atts(qid)
         for att in q_atts:
             if att["kind"] == "photo":
@@ -1169,7 +1267,6 @@ async def _do_publish_polls(cb_or_msg, quiz_id:int, expires_at: Optional[str]):
                 await _safe_send(bot.send_audio, chat_id, att["file_id"])
             messages_for_this_question += 1
 
-        # Build poll
         opts = options_for_question(qid)
         if not (2 <= len(opts) <= 10):
             await _safe_send(bot.send_message, chat_id, f"⚠️ السؤال Q{qid} لديه {len(opts)} خيار. تلغرام يسمح 2..10.")
@@ -1178,10 +1275,8 @@ async def _do_publish_polls(cb_or_msg, quiz_id:int, expires_at: Optional[str]):
         correct_row = next((o for o in opts if int(o["is_correct"])==1), None)
         correct_option_id = int(correct_row["option_index"]) if correct_row is not None else 0
 
-        # Auto-numbering
         qtext_numbered = f"[{idx}] {qtext}"
 
-        # Send poll (quiz) عبر _safe_send
         poll_msg = await _safe_send(
             bot.send_poll,
             chat_id=chat_id,
@@ -1203,10 +1298,8 @@ async def _do_publish_polls(cb_or_msg, quiz_id:int, expires_at: Optional[str]):
                 conn.commit()
             messages_for_this_question += 1
 
-        # تباطؤ ديناميكي بحسب عدد الرسائل المُرسلة لهذا السؤال
         await asyncio.sleep(0.8 * max(messages_for_this_question, 1))
 
-        # استراحة كل 8 أسئلة
         if idx % 8 == 0:
             await asyncio.sleep(35)
 
@@ -1252,7 +1345,7 @@ async def expiry_watcher():
             await _close_expired_polls_once()
         except Exception:
             pass
-        await asyncio.sleep(20)  # افحص كل 20 ثانية
+        await asyncio.sleep(20)
 
 # ---------------------- Poll answers handler ----------------------
 @dp.poll_answer()
@@ -1276,14 +1369,12 @@ async def handle_poll_answer(pa: PollAnswer):
             expired = False
     if expired or int(row["is_closed"] or 0) == 1:
         return
-    # Save name for scoreboard
     with db() as conn:
         conn.execute(
             "INSERT OR REPLACE INTO participant_names(origin_chat_id,user_id,quiz_id,name) VALUES (?,?,?,?)",
             (chat_id, user_id, quiz_id, name),
         )
         conn.commit()
-    # avoid duplicates
     with db() as conn:
         prev = conn.execute("SELECT 1 FROM responses WHERE chat_id=? AND user_id=? AND question_id=?",
                             (chat_id, user_id, question_id)).fetchone()
@@ -1291,7 +1382,7 @@ async def handle_poll_answer(pa: PollAnswer):
         return
     with db() as conn:
         opt = conn.execute("SELECT text, is_correct FROM options WHERE question_id=? AND option_index=?",
-                           (question_id, chosen)).fetchone()
+                           (question_id, int(chosen))).fetchone()
     is_correct = 1 if opt and int(opt["is_correct"])==1 else 0
     with db() as conn:
         conn.execute("""INSERT INTO responses(chat_id,user_id,question_id,option_index,is_correct,answered_at)
@@ -1302,7 +1393,6 @@ async def handle_poll_answer(pa: PollAnswer):
         await _celebrate(chat_id, bool(is_correct))
     except:
         pass
-    # final score if finished
     q_ids = get_quiz_question_ids(quiz_id)
     with db() as conn:
         marks = ",".join(["?"] * len(q_ids))
@@ -1345,6 +1435,58 @@ async def cb_scoreboard_show(cb:CallbackQuery):
     for i, r in enumerate(rows, start=1):
         lines.append(f"{i}. UID <code>{r['user_id']}</code> — نقاط: <b>{r['score']}</b> (من {r['answered']})")
     await cb.message.edit_text("\n".join(lines))
+
+# ---------------------- Level Assessment (A1/A2/B1) ----------------------
+def calc_level(hl: float, wr: float, sp: float) -> str:
+    # A1
+    if 0 <= hl <= 19 and 0 <= wr <= 6 and 0 <= sp <= 34.5:
+        return "A1"
+    # A2
+    if 20 <= hl <= 32 and 7 <= wr <= 14 and 35 <= sp <= 74.5:
+        return "A2"
+    # B1
+    if 33 <= hl <= 45 and 15 <= wr <= 20 and 75 <= sp <= 100:
+        return "B1"
+    return "غير مطابق لأي مستوى"
+
+@dp.message(LevelStates.waiting_hl, F.text)
+async def level_hl(msg: Message, state: FSMContext):
+    try:
+        hl = float(msg.text.strip())
+    except:
+        return await msg.reply("أدخل رقم صحيح لـ Hören & Lesen.")
+    await state.update_data(hl=hl)
+    await state.set_state(LevelStates.waiting_write)
+    await msg.answer("أدخل علامة Schreiben (0-20):")
+
+@dp.message(LevelStates.waiting_write, F.text)
+async def level_write(msg: Message, state: FSMContext):
+    try:
+        wr = float(msg.text.strip())
+    except:
+        return await msg.reply("أدخل رقم صحيح لـ Schreiben.")
+    await state.update_data(wr=wr)
+    await state.set_state(LevelStates.waiting_speak)
+    await msg.answer("أدخل علامة Sprechen (0-100):")
+
+@dp.message(LevelStates.waiting_speak, F.text)
+async def level_speak(msg: Message, state: FSMContext):
+    try:
+        sp = float(msg.text.strip())
+    except:
+        return await msg.reply("أدخل رقم صحيح لـ Sprechen.")
+    data = await state.get_data()
+    hl, wr = data["hl"], data["wr"]
+    level = calc_level(hl, wr, sp)
+    await state.clear()
+    await msg.answer(
+        f"📊 النتيجة:\n"
+        f"Hören & Lesen: {hl}\n"
+        f"Schreiben: {wr}\n"
+        f"Sprechen: {sp}\n\n"
+        f"🎯 المستوى: <b>{level}</b>",
+        reply_markup=owner_panel_reply_kb()
+    )
 
 # ---------------------- Danger Zone ----------------------
 @dp.callback_query(F.data == "yes:wipe")
