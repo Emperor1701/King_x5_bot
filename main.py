@@ -1,20 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Telegram Quiz Bot — FULL + UI Enhancements (Railway + PostgreSQL)
-
-ميزات:
-- إدارة اختبارات كاملة (إنشاء/عرض/تعديل/حذف/دمج)
-- أسئلة متعددة الخيارات مع تحديد الصحيح
-- مرفقات لكل سؤال + حزم مرفقات مشتركة (Bundles)
-- تصدير/استيراد JSON
-- نشر كـ Quiz Polls مع زر Inline "✔️ تم" + إغلاق تلقائي (12h/24h/مخصّص/بلا وقت)
-- تتبّع الإجابات وحفظ أسماء المشاركين تلقائيًا
-- لوحة نتائج تُظهر الأسماء
-- Hören & Lesen (B1 DTZ): تعيين اختبار + حساب المستوى تلقائيًا
-- Schreiben (بريف/إيميل): المالك يرسل نص السؤال ثم يختار مدة الاستقبال → إعلان مع عدّاد يتحدّث → الطلاب يرسلون النصوص ويُصحّح تلقائيًا (OpenAI أو بديل)
-- حماية من Flood أثناء النشر
-"""
 
 import asyncio, os, json, html, re
 from datetime import datetime, timezone, timedelta
@@ -23,7 +8,7 @@ from typing import Optional, List, Dict, Tuple
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode, PollType
+from aiogram.enums import ParseMode, PollType, ChatType
 from aiogram.types import (
     Message, CallbackQuery, PollAnswer,
     ReplyKeyboardMarkup, KeyboardButton, FSInputFile
@@ -59,22 +44,25 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 pool = ConnectionPool(conninfo=DATABASE_URL, kwargs={"row_factory": dict_row})
-print("[DB] Connected")
+print("[DB] Connected to Postgres")
 
 def q_exec(sql:str, params:tuple|list|None=None):
     with pool.connection() as conn:
-        with conn.cursor() as cur: cur.execute(sql, params or ())
+        with conn.cursor() as cur:
+            cur.execute(sql, params or ())
         conn.commit()
 
 def q_one(sql:str, params:tuple|list|None=None):
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, params or ()); return cur.fetchone()
+            cur.execute(sql, params or ())
+            return cur.fetchone()
 
 def q_all(sql:str, params:tuple|list|None=None)->List[dict]:
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, params or ()); return cur.fetchall()
+            cur.execute(sql, params or ())
+            return cur.fetchall()
 
 # ---------- Schema ----------
 def ensure_schema():
@@ -154,7 +142,7 @@ def ensure_schema():
     for ddl in ddls: q_exec(ddl)
 ensure_schema()
 
-# ---------- UI نصوص ----------
+# ---------- UI labels ----------
 BTN_NEWQUIZ="🆕 إنشاء اختبار"; BTN_ADDQ="➕ إضافة سؤال"; BTN_LISTQUIZ="📚 عرض الاختبارات"
 BTN_LISTQ="📖 عرض الأسئلة"; BTN_EDITQUIZ="🛠️ تعديل اختبار"; BTN_DELQUIZ="🗑️ حذف اختبار"
 BTN_BUNDLES="📎 مرفقات مشتركة"; BTN_MERGE="🔗 دمج الاختبارات"; BTN_EXPORT="📤 تصدير اختبار"
@@ -202,24 +190,43 @@ if OPENAI_API_KEY and OpenAI:
     try: client=OpenAI(api_key=OPENAI_API_KEY)
     except Exception: client=None
 
-async def ai_grade(text:str)->Tuple[int,str,Dict]:
+async def ai_grade(text: str) -> Tuple[int, str, Dict]:
+    """
+    تقييم كتابة B1 على 0–20. مع OpenAI يرجّع JSON فيه score/feedback.
+    """
     if not client:
-        base=min(20,max(0,len(text)//35)); return base,map_level(base,SCHREIBEN_BANDS),{"note":"heuristic"}
+        base = min(20, max(0, len(text) // 35))
+        return base, map_level(base, SCHREIBEN_BANDS), {"note": "fallback heuristic (no OPENAI_API_KEY)"}
+
     try:
-        resp=client.chat.completions.create(
+        resp = client.chat.completions.create(
             model="gpt-4o-mini",
             temperature=0.3,
             messages=[
-                {"role":"system","content":"You are a certified Goethe/DTZ examiner. Grade B1 Schreiben on a 0–20 scale and return JSON: score, feedback(arabic short)."},
-                {"role":"user","content":text},
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a certified Goethe/DTZ examiner. "
+                        "Grade B1 Schreiben (Brief/E-Mail) on a 0–20 scale "
+                        "(task fulfilment, coherence, range, accuracy, register). "
+                        "Return JSON: {\"score\": <int>, \"feedback\": \"<short Arabic feedback>\"}."
+                    ),
+                },
+                {"role": "user", "content": text},
             ],
-            response_format={"type":"json_object"}
+            response_format={"type": "json_object"},
         )
-        data=json.loads(resp.choices[0].message.content)
-       score = int(max(0, min(20, int(data.get("score", 0)))))
-        return score,map_level(score,SCHREIBEN_BANDS),data
+        raw = resp.choices[0].message.content or "{}"
+        try:
+            data = json.loads(raw)
+        except Exception:
+            data = {}
+        score = int(max(0, min(20, int(data.get("score", 0)))))
+        level = map_level(score, SCHREIBEN_BANDS)
+        return score, level, data
     except Exception as e:
-        base=min(20,max(0,len(text)//40)); return base,map_level(base,SCHREIBEN_BANDS),{"error":str(e)}
+        base = min(20, max(0, len(text) // 40))
+        return base, map_level(base, SCHREIBEN_BANDS), {"error": str(e)}
 
 # ---------- States ----------
 class BuildStates(StatesGroup):
@@ -231,22 +238,25 @@ class BuildStates(StatesGroup):
     waiting_correct_index=State()
     waiting_pick_quiz_generic=State()
     waiting_edit_quiz_title=State()
-class BundleStates(StatesGroup):
-    waiting_pick_quiz_for_bundle=State()
-    waiting_bundle_files=State()
+
 class PublishStates(StatesGroup):
     waiting_pick_quiz=State()
     waiting_duration_choice=State()
     waiting_custom_hours=State()
+
 class MergeStates(StatesGroup):
     waiting_pick_src=State()
     waiting_pick_dst=State()
+
 class ExportStates(StatesGroup):
     waiting_pick_quiz=State()
+
 class ImportStates(StatesGroup):
     waiting_json=State()
+
 class HLStates(StatesGroup):
     waiting_pick_quiz=State()
+
 class BriefStates(StatesGroup):
     waiting_prompt=State()
     waiting_duration=State()
@@ -270,7 +280,7 @@ async def start(msg:Message):
     if is_owner(msg.from_user.id):
         await msg.answer("لوحة التحكم جاهزة — اختر من الأزرار:", reply_markup=owner_kb())
     else:
-        await msg.answer("أهلًا! هذا بوت اختبارات بإدارة المعلم.")
+        await msg.answer("أهلًا! هذا بوت اختبارات بإدارة المعلم.\nأجب عبر استفتاءات Quiz داخل المجموعة.")
 
 @dp.message(Command("dbinfo"))
 async def dbinfo(msg:Message):
@@ -300,13 +310,16 @@ async def edit_quiz(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
     await state.set_state(BuildStates.waiting_pick_quiz_generic)
     await msg.answer("اختر اختبارًا لتعديل العنوان:", reply_markup=paged_quizzes_kb(tag="editq"))
+
 @dp.callback_query(F.data.startswith("editq_page:"))
 async def editq_page(cb:CallbackQuery, state:FSMContext):
     _,p=cb.data.split(":"); await cb.message.edit_text("اختر الاختبار:", reply_markup=paged_quizzes_kb(page=int(p), tag="editq")); await cb.answer()
+
 @dp.callback_query(F.data.startswith("editq:"))
 async def editq_pick(cb:CallbackQuery, state:FSMContext):
     await state.update_data(edit_id=int(cb.data.split(":")[1])); await state.set_state(BuildStates.waiting_edit_quiz_title)
     await cb.message.answer("أرسل العنوان الجديد:"); await cb.answer()
+
 @dp.message(BuildStates.waiting_edit_quiz_title, F.text)
 async def apply_edit(msg:Message, state:FSMContext):
     q_exec("UPDATE quizzes SET title=%s WHERE id=%s",(msg.text.strip(),(await state.get_data())["edit_id"]))
@@ -317,9 +330,11 @@ async def del_quiz(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
     await state.set_state(BuildStates.waiting_pick_quiz_generic)
     await msg.answer("اختر اختبارًا للحذف:", reply_markup=paged_quizzes_kb(tag="delq"))
+
 @dp.callback_query(F.data.startswith("delq_page:"))
 async def delq_page(cb:CallbackQuery, state:FSMContext):
     _,p=cb.data.split(":"); await cb.message.edit_text("اختر الاختبار:", reply_markup=paged_quizzes_kb(page=int(p), tag="delq")); await cb.answer()
+
 @dp.callback_query(F.data.startswith("delq:"))
 async def delq_do(cb:CallbackQuery, state:FSMContext):
     qid=int(cb.data.split(":")[1])
@@ -339,13 +354,16 @@ async def addq_start(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
     await state.set_state(BuildStates.waiting_pick_quiz_for_addq)
     await msg.answer("اختر الاختبار لإضافة سؤال:", reply_markup=paged_quizzes_kb(tag="addq"))
+
 @dp.callback_query(F.data.startswith("addq_page:"))
 async def addq_page(cb:CallbackQuery, state:FSMContext):
     _,p=cb.data.split(":"); await cb.message.edit_text("اختر الاختبار:", reply_markup=paged_quizzes_kb(page=int(p), tag="addq")); await cb.answer()
+
 @dp.callback_query(F.data.startswith("addq:"))
 async def addq_pick(cb:CallbackQuery, state:FSMContext):
     await state.update_data(quiz_id=int(cb.data.split(":")[1])); await state.set_state(BuildStates.waiting_q_text)
     await cb.message.answer("أرسل نص السؤال:"); await cb.answer()
+
 @dp.message(BuildStates.waiting_q_text, F.text)
 async def q_text(msg:Message, state:FSMContext):
     qid=(await state.get_data())["quiz_id"]
@@ -353,10 +371,12 @@ async def q_text(msg:Message, state:FSMContext):
     new=q_one("SELECT id FROM questions WHERE quiz_id=%s ORDER BY id DESC LIMIT 1",(qid,))["id"]
     await state.update_data(question_id=new); await state.set_state(BuildStates.waiting_options_count)
     await msg.answer("كم عدد الخيارات؟ (2..8)")
+
 @dp.message(BuildStates.waiting_options_count, F.text.regexp(r"^[2-8]$"))
 async def q_opts_count(msg:Message, state:FSMContext):
     await state.update_data(opt_count=int(msg.text),opt_collected=0); await state.set_state(BuildStates.waiting_option_text)
     await msg.answer(f"أرسل نص الخيار 1/{int(msg.text)}:")
+
 @dp.message(BuildStates.waiting_option_text, F.text)
 async def q_opt_text(msg:Message, state:FSMContext):
     d=await state.get_data(); qid=d["question_id"]; cnt=d["opt_count"]; k=d["opt_collected"]
@@ -364,6 +384,7 @@ async def q_opt_text(msg:Message, state:FSMContext):
     k+=1; await state.update_data(opt_collected=k)
     if k<cnt: await msg.answer(f"أرسل نص الخيار {k+1}/{cnt}:")
     else: await state.set_state(BuildStates.waiting_correct_index); await msg.answer(f"أرسل رقم الخيار الصحيح (1..{cnt}):")
+
 @dp.message(BuildStates.waiting_correct_index, F.text.regexp(r"^\d+$"))
 async def q_correct(msg:Message, state:FSMContext):
     d=await state.get_data(); qid=d["question_id"]; cnt=d["opt_count"]; i=int(msg.text)-1
@@ -377,16 +398,20 @@ async def merge_start(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
     await state.set_state(MergeStates.waiting_pick_src)
     await msg.answer("اختر الاختبار المصدر:", reply_markup=paged_quizzes_kb(tag="merge_src"))
+
 @dp.callback_query(F.data.startswith("merge_src_page:"))
 async def merge_src_page(cb:CallbackQuery, state:FSMContext):
     _,p=cb.data.split(":"); await cb.message.edit_text("اختر المصدر:", reply_markup=paged_quizzes_kb(page=int(p), tag="merge_src")); await cb.answer()
+
 @dp.callback_query(F.data.startswith("merge_src:"))
 async def merge_src_pick(cb:CallbackQuery, state:FSMContext):
     await state.update_data(src=int(cb.data.split(":")[1])); await state.set_state(MergeStates.waiting_pick_dst)
     await cb.message.answer("اختر الهدف:", reply_markup=paged_quizzes_kb(tag="merge_dst")); await cb.answer()
+
 @dp.callback_query(F.data.startswith("merge_dst_page:"))
 async def merge_dst_page(cb:CallbackQuery, state:FSMContext):
     _,p=cb.data.split(":"); await cb.message.edit_text("اختر الهدف:", reply_markup=paged_quizzes_kb(page=int(p), tag="merge_dst")); await cb.answer()
+
 @dp.callback_query(F.data.startswith("merge_dst:"))
 async def merge_do(cb:CallbackQuery, state:FSMContext):
     d=await state.get_data(); src=int(d["src"]); dst=int(cb.data.split(":")[1])
@@ -423,9 +448,11 @@ def build_export_payload(quiz_id:int)->Dict:
 async def export_btn(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
     await state.set_state(ExportStates.waiting_pick_quiz); await msg.answer("اختر الاختبار للتصدير:", reply_markup=paged_quizzes_kb(tag="exportq"))
+
 @dp.callback_query(F.data.startswith("exportq_page:"))
 async def export_page(cb:CallbackQuery, state:FSMContext):
     _,p=cb.data.split(":"); await cb.message.edit_text("اختر الاختبار:", reply_markup=paged_quizzes_kb(page=int(p), tag="exportq")); await cb.answer()
+
 @dp.callback_query(F.data.startswith("exportq:"))
 async def export_do(cb:CallbackQuery, state:FSMContext):
     qid=int(cb.data.split(":")[1]); payload=build_export_payload(qid)
@@ -440,17 +467,20 @@ async def export_do(cb:CallbackQuery, state:FSMContext):
 async def import_btn(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
     await state.set_state(ImportStates.waiting_json); await msg.answer("أرسل ملف JSON أو ألصق JSON مباشرة:")
+
 @dp.message(ImportStates.waiting_json, F.document)
 async def import_file(msg:Message, state:FSMContext):
     f=await bot.get_file(msg.document.file_id); path=f"/tmp/{msg.document.file_unique_id}.json"
     await bot.download_file(f.file_path, destination=path)
     with open(path,"r",encoding="utf-8") as fp: payload=json.load(fp)
     await perform_import(msg,payload,state)
+
 @dp.message(ImportStates.waiting_json, F.text)
 async def import_text(msg:Message, state:FSMContext):
     try: payload=json.loads(msg.text)
     except Exception: return await msg.answer("JSON غير صالح.")
     await perform_import(msg,payload,state)
+
 async def perform_import(msg:Message, payload:Dict, state:FSMContext):
     qz=payload["quiz"]; title=qz["title"]
     q_exec("INSERT INTO quizzes(title,created_by,created_at,grading_profile) VALUES (%s,%s,%s,%s)",
@@ -467,7 +497,7 @@ async def perform_import(msg:Message, payload:Dict, state:FSMContext):
         for a in qu.get("attachments",[]): q_exec("INSERT INTO question_attachments(question_id,kind,file_id,position) VALUES (%s,%s,%s,%s)",(nq,a["kind"],a["file_id"],a["position"]))
     await state.clear(); await msg.answer(f"✅ تم الاستيراد إلى اختبار جديد: {qid}")
 
-# ---------- نشر كـ Polls + زر Inline "تم" ----------
+# ---------- نشر كـ Quiz Polls + زر "✔️ تم" ----------
 def dur_kb():
     kb=InlineKeyboardBuilder()
     kb.button(text="⏱️ 12 ساعة", callback_data="dur:12")
@@ -481,13 +511,16 @@ async def pub_start(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
     await state.set_state(PublishStates.waiting_pick_quiz)
     await msg.answer("اختر اختبارًا للنشر:", reply_markup=paged_quizzes_kb(tag="pub"))
+
 @dp.callback_query(F.data.startswith("pub_page:"))
 async def pub_page(cb:CallbackQuery, state:FSMContext):
     _,p=cb.data.split(":"); await cb.message.edit_text("اختر الاختبار:", reply_markup=paged_quizzes_kb(page=int(p), tag="pub")); await cb.answer()
+
 @dp.callback_query(F.data.startswith("pub:"))
 async def pub_pick(cb:CallbackQuery, state:FSMContext):
     await state.update_data(pub_qid=int(cb.data.split(":")[1])); await state.set_state(PublishStates.waiting_duration_choice)
     await cb.message.answer("اختر مدة الإغلاق:", reply_markup=dur_kb()); await cb.answer()
+
 @dp.callback_query(F.data.startswith("dur:"))
 async def pub_duration(cb:CallbackQuery, state:FSMContext):
     action=cb.data.split(":")[1]
@@ -496,6 +529,7 @@ async def pub_duration(cb:CallbackQuery, state:FSMContext):
     hours=None if action=="none" else int(action)
     await do_publish(cb.message.chat.id, (await state.get_data())["pub_qid"], hours)
     await state.clear(); await cb.answer()
+
 @dp.message(PublishStates.waiting_custom_hours, F.text.regexp(r"^\d{1,3}$"))
 async def pub_custom(msg:Message, state:FSMContext):
     await do_publish(msg.chat.id, (await state.get_data())["pub_qid"], int(msg.text)); await state.clear()
@@ -510,7 +544,8 @@ async def do_publish(chat_id:int, quiz_id:int, hours:Optional[int]):
             opts=q_all("SELECT option_index,text,is_correct FROM options WHERE question_id=%s ORDER BY option_index",(r["id"],))
             options=[o["text"] for o in opts]; correct=next((o["option_index"] for o in opts if o["is_correct"]),0)
             kb=InlineKeyboardBuilder(); kb.button(text="✔️ تم", callback_data=f"done:{quiz_id}:{r['id']}")
-            m=await bot.send_poll(chat_id, question=f"{idx}. {r['text']}", options=options, type=PollType.QUIZ, correct_option_id=correct, is_anonymous=False, reply_markup=kb.as_markup())
+            m=await bot.send_poll(chat_id, question=f"{idx}. {r['text']}", options=options, type=PollType.QUIZ,
+                                  correct_option_id=correct, is_anonymous=False, reply_markup=kb.as_markup())
             q_exec("""INSERT INTO sent_polls(chat_id,quiz_id,question_id,poll_id,message_id,expires_at,is_closed)
                       VALUES (%s,%s,%s,%s,%s,%s,0)""",(chat_id,quiz_id,r["id"],m.poll.id,m.message_id,expires))
             sent+=1; await asyncio.sleep(0.6)  # Flood control
@@ -524,7 +559,7 @@ async def do_publish(chat_id:int, quiz_id:int, hours:Optional[int]):
 async def cb_done(cb:CallbackQuery):
     await cb.answer("تم 👍", show_alert=False)
 
-# ---------- إغلاق تلقائي ----------
+# ---------- إغلاق تلقائي للاستفتاءات ----------
 async def auto_closer():
     while True:
         try:
@@ -538,7 +573,7 @@ async def auto_closer():
         except Exception: pass
         await asyncio.sleep(30)
 
-# ---------- Poll answers: تسجيل + أسماء + HL ----------
+# ---------- تسجيل الإجابات + أسماء + HL ----------
 @dp.poll_answer()
 async def on_poll_answer(pa:PollAnswer):
     pid=pa.poll_id; uid=pa.user.id
@@ -551,12 +586,12 @@ async def on_poll_answer(pa:PollAnswer):
     q_exec("""INSERT INTO responses(chat_id,user_id,question_id,option_index,is_correct,answered_at)
               VALUES (%s,%s,%s,%s,%s,%s)
               ON CONFLICT (chat_id,user_id,question_id) DO NOTHING""",(chat_id,uid,qid,chosen,is_ok,_now().isoformat()))
-    # احفظ الاسم
+    # حفظ الاسم
     q_exec("""INSERT INTO participant_names(origin_chat_id,user_id,quiz_id,name)
               VALUES (%s,%s,%s,%s)
               ON CONFLICT (origin_chat_id,user_id,quiz_id) DO UPDATE SET name=EXCLUDED.name""",
            (chat_id,uid,quiz_id,hname(pa.user)))
-    # لو HL — أعرض نتيجة نهائية عندما يجاوب كل الأسئلة
+    # لو HL — عرض نتيجة نهائية عند الانتهاء
     prof=q_one("SELECT grading_profile FROM quizzes WHERE id=%s",(quiz_id,))
     if prof and prof["grading_profile"]=="HL_B1_DTZ":
         ids=[r["id"] for r in q_all("SELECT id FROM questions WHERE quiz_id=%s ORDER BY id",(quiz_id,))]
@@ -598,15 +633,17 @@ async def scoreboard(msg:Message):
         lines.append(f"{i}. {html.escape(name)}: <b>{correct}</b>/{answered if answered else total}{level}")
     await msg.answer("\n".join(lines))
 
-# ---------- HL Profile ----------
+# ---------- تعيين HL ----------
 @dp.message(F.text==BTN_HL_PROFILE)
 async def hl_set(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
     await state.set_state(HLStates.waiting_pick_quiz)
     await msg.answer("اختر اختبارًا لتعيينه Hören & Lesen:", reply_markup=paged_quizzes_kb(tag="sethl"))
+
 @dp.callback_query(F.data.startswith("sethl_page:"))
 async def sethl_page(cb:CallbackQuery, state:FSMContext):
     _,p=cb.data.split(":"); await cb.message.edit_text("اختر الاختبار:", reply_markup=paged_quizzes_kb(page=int(p), tag="sethl")); await cb.answer()
+
 @dp.callback_query(F.data.startswith("sethl:"))
 async def sethl_do(cb:CallbackQuery, state:FSMContext):
     q_exec("UPDATE quizzes SET grading_profile='HL_B1_DTZ' WHERE id=%s",(int(cb.data.split(":")[1]),))
@@ -647,6 +684,7 @@ def open_window(chat_id:int, owner:int, minutes:int, prompt:str)->Tuple[int,date
     return bid, closes
 
 def close_window(chat_id:int): q_exec("UPDATE brief_windows SET is_open=0 WHERE origin_chat_id=%s AND is_open=1",(chat_id,))
+
 def fmt_countdown(delta:timedelta)->str:
     s=int(delta.total_seconds()); m=s//60; s%=60; h=m//60; m%=60
     return f"{h}س {m}د" if h>0 else f"{m}د {s}ث"
@@ -679,7 +717,7 @@ async def brief_custom(msg:Message, state:FSMContext):
     q_exec("UPDATE brief_windows SET ann_message_id=%s WHERE id=%s",(m.message_id,bid))
     await state.clear()
 
-# **الهاندلر العام للبريف — يعمل فقط عندما لا توجد حالة نشطة**
+# يعمل فقط عندما لا توجد حالة نشطة: استقبال البريفات خلال النافذة المفتوحة
 @dp.message(StateFilter(None), F.text)
 async def maybe_brief(msg:Message):
     win=get_open_window(msg.chat.id)
