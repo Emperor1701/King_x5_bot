@@ -510,7 +510,7 @@ async def cb_sethl_page(cb: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("sethl:"))
 async def cb_sethl_pick(cb: CallbackQuery, state: FSMContext):
-    if not is_owner(cb.from_user.id)): return await cb.answer("للمالك فقط", show_alert=True)
+    if not is_owner(cb.from_user.id): return await cb.answer("للمالك فقط", show_alert=True)
     quiz_id = int(cb.data.split(":")[1])
     q_exec("UPDATE quizzes SET grading_profile='HL_B1_DTZ' WHERE id=%s", (quiz_id,))
     await cb.message.answer(f"✅ تم تعيين الاختبار {quiz_id} كـ Hören & Lesen (B1 DTZ)")
