@@ -2,15 +2,18 @@
 # -*- coding: utf-8 -*-
 """
 Telegram Quiz Bot — FULL + UI Enhancements (Railway + PostgreSQL)
-- Quizzes CRUD (إنشاء/عرض/تعديل/حذف/دمج)
-- Questions + options مع الصحيح
-- Bundles مرفقات مشتركة + مرفقات لكل سؤال
-- Import/Export JSON
-- نشر باستفتاءات Quiz + زر Inline "✔️ تم" + إغلاق تلقائي (12h/24h/مخصّص/بلا)
-- تتبّع الإجابات + حفظ أسماء المشاركين تلقائيًا
-- لوحة نتائج تُظهر الأسماء + تقييم Hören & Lesen (B1 DTZ bands)
-- Schreiben (بريف/إيميل): المالك يرسل نص السؤال ثم يختار مدة الاستقبال → إعلان مع عدّاد يُحدّث تلقائيًا → الطلاب يرسلون نصوصهم ويُصحّح تلقائيًا (OpenAI أو خوارزمية بديلة)
-- حماية Flood أثناء النشر + تنبيهات مفيدة
+
+ميزات:
+- إدارة اختبارات كاملة (إنشاء/عرض/تعديل/حذف/دمج)
+- أسئلة متعددة الخيارات مع تحديد الصحيح
+- مرفقات لكل سؤال + حزم مرفقات مشتركة (Bundles)
+- تصدير/استيراد JSON
+- نشر كـ Quiz Polls مع زر Inline "✔️ تم" + إغلاق تلقائي (12h/24h/مخصّص/بلا وقت)
+- تتبّع الإجابات وحفظ أسماء المشاركين تلقائيًا
+- لوحة نتائج تُظهر الأسماء
+- Hören & Lesen (B1 DTZ): تعيين اختبار + حساب المستوى تلقائيًا
+- Schreiben (بريف/إيميل): المالك يرسل نص السؤال ثم يختار مدة الاستقبال → إعلان مع عدّاد يتحدّث → الطلاب يرسلون النصوص ويُصحّح تلقائيًا (OpenAI أو بديل)
+- حماية من Flood أثناء النشر
 """
 
 import asyncio, os, json, html, re
@@ -18,28 +21,27 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Tuple
 
 from dotenv import load_dotenv
-from aiogram import Bot, Dispatcher, F, types
+from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode, ChatType, PollType
+from aiogram.enums import ParseMode, PollType
 from aiogram.types import (
     Message, CallbackQuery, PollAnswer,
-    ReplyKeyboardMarkup, KeyboardButton,
-    FSInputFile
+    ReplyKeyboardMarkup, KeyboardButton, FSInputFile
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 
-# -------- OpenAI (optional) --------
+# ---------- OpenAI (اختياري) ----------
 try:
     from openai import OpenAI
 except Exception:
     OpenAI = None  # type: ignore
 
-# -------- ENV --------
+# ---------- ENV ----------
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
@@ -48,36 +50,33 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 if not BOT_TOKEN or not OWNER_ID or not DATABASE_URL:
     raise SystemExit("Set BOT_TOKEN, OWNER_ID, DATABASE_URL")
 
-# -------- BOT --------
+# ---------- BOT ----------
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 
-# -------- Postgres --------
+# ---------- Postgres ----------
 import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 pool = ConnectionPool(conninfo=DATABASE_URL, kwargs={"row_factory": dict_row})
-print("[DB] Connected to Postgres")
+print("[DB] Connected")
 
 def q_exec(sql:str, params:tuple|list|None=None):
     with pool.connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, params or ())
+        with conn.cursor() as cur: cur.execute(sql, params or ())
         conn.commit()
 
 def q_one(sql:str, params:tuple|list|None=None):
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, params or ())
-            return cur.fetchone()
+            cur.execute(sql, params or ()); return cur.fetchone()
 
 def q_all(sql:str, params:tuple|list|None=None)->List[dict]:
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, params or ())
-            return cur.fetchall()
+            cur.execute(sql, params or ()); return cur.fetchall()
 
-# -------- Schema --------
+# ---------- Schema ----------
 def ensure_schema():
     ddls = [
         """CREATE TABLE IF NOT EXISTS quizzes(
@@ -90,23 +89,18 @@ def ensure_schema():
         )""",
         """CREATE TABLE IF NOT EXISTS questions(
             id INTEGER PRIMARY KEY GENERATED BY DEFAULT AS IDENTITY,
-            quiz_id INTEGER NOT NULL,
-            text TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            media_bundle_id INTEGER,
+            quiz_id INTEGER NOT NULL, text TEXT NOT NULL,
+            created_at TEXT NOT NULL, media_bundle_id INTEGER,
             photo TEXT, audio TEXT, audio_is_voice INTEGER DEFAULT 0
         )""",
         """CREATE TABLE IF NOT EXISTS options(
             id INTEGER PRIMARY KEY GENERATED BY DEFAULT AS IDENTITY,
-            question_id INTEGER NOT NULL,
-            option_index INTEGER NOT NULL,
-            text TEXT NOT NULL,
-            is_correct INTEGER NOT NULL DEFAULT 0
+            question_id INTEGER NOT NULL, option_index INTEGER NOT NULL,
+            text TEXT NOT NULL, is_correct INTEGER NOT NULL DEFAULT 0
         )""",
         """CREATE TABLE IF NOT EXISTS question_attachments(
             id INTEGER PRIMARY KEY GENERATED BY DEFAULT AS IDENTITY,
-            question_id INTEGER NOT NULL,
-            kind TEXT NOT NULL, file_id TEXT NOT NULL, position INTEGER NOT NULL
+            question_id INTEGER NOT NULL, kind TEXT NOT NULL, file_id TEXT NOT NULL, position INTEGER NOT NULL
         )""",
         """CREATE TABLE IF NOT EXISTS media_bundles(
             id INTEGER PRIMARY KEY GENERATED BY DEFAULT AS IDENTITY,
@@ -132,7 +126,7 @@ def ensure_schema():
         """CREATE TABLE IF NOT EXISTS sent_polls(
             id INTEGER PRIMARY KEY GENERATED BY DEFAULT AS IDENTITY,
             chat_id BIGINT NOT NULL, quiz_id INTEGER NOT NULL, question_id INTEGER NOT NULL,
-            poll_id TEXT NOT NULL, message_id BIGINT NOT NULL,  -- message_id = poll message id
+            poll_id TEXT NOT NULL, message_id BIGINT NOT NULL,
             expires_at TEXT, is_closed INTEGER NOT NULL DEFAULT 0
         )""",
         """CREATE TABLE IF NOT EXISTS writing_submissions(
@@ -160,7 +154,7 @@ def ensure_schema():
     for ddl in ddls: q_exec(ddl)
 ensure_schema()
 
-# -------- UI text --------
+# ---------- UI نصوص ----------
 BTN_NEWQUIZ="🆕 إنشاء اختبار"; BTN_ADDQ="➕ إضافة سؤال"; BTN_LISTQUIZ="📚 عرض الاختبارات"
 BTN_LISTQ="📖 عرض الأسئلة"; BTN_EDITQUIZ="🛠️ تعديل اختبار"; BTN_DELQUIZ="🗑️ حذف اختبار"
 BTN_BUNDLES="📎 مرفقات مشتركة"; BTN_MERGE="🔗 دمج الاختبارات"; BTN_EXPORT="📤 تصدير اختبار"
@@ -181,7 +175,7 @@ def owner_kb()->ReplyKeyboardMarkup:
         [KeyboardButton(text=BTN_BRIEF), KeyboardButton(text=BTN_WIPE_ALL)],
     ]; return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
-# -------- Helpers --------
+# ---------- Helpers ----------
 def _now()->datetime: return datetime.now(timezone.utc)
 def is_owner(uid:int)->bool: return uid==OWNER_ID
 async def ensure_owner(msg:Message)->bool:
@@ -189,14 +183,13 @@ async def ensure_owner(msg:Message)->bool:
         await msg.reply("🚫 هذا الزر/الأمر خاص بالمالك.", reply_markup=owner_kb()); return False
     return True
 def hname(u)->str:
-    nm = " ".join([x for x in [getattr(u,"first_name",None), getattr(u,"last_name",None)] if x]).strip()
-    if not nm and getattr(u,"username",None): nm = f"@{u.username}"
-    if not nm: nm = f"UID {u.id}"
-    return nm
+    nm=" ".join([x for x in [getattr(u,"first_name",None),getattr(u,"last_name",None)] if x]).strip()
+    if not nm and getattr(u,"username",None): nm=f"@{u.username}"
+    return nm or f"UID {u.id}"
 def slug(s:str)->str:
     s=re.sub(r"\s+","-",s.strip()); s=re.sub(r"[^\w\-]+","",s,flags=re.U); return s[:50] or "quiz"
 
-# -------- Bands & AI grading --------
+# ---------- Bands & AI ----------
 SCHREIBEN_BANDS=[(0,6,"Unter A2"),(7,14,"A2"),(15,20,"B1")]
 HL_BANDS=[(0,19,"Unter A2"),(20,32,"A2"),(33,45,"B1")]
 def map_level(score:int,bands)->str:
@@ -211,27 +204,24 @@ if OPENAI_API_KEY and OpenAI:
 
 async def ai_grade(text:str)->Tuple[int,str,Dict]:
     if not client:
-        base=min(20,max(0,len(text)//35)); lvl=map_level(base,SCHREIBEN_BANDS)
-        return base,lvl,{"note":"fallback heuristic (no OPENAI_API_KEY)"}
+        base=min(20,max(0,len(text)//35)); return base,map_level(base,SCHREIBEN_BANDS),{"note":"heuristic"}
     try:
         resp=client.chat.completions.create(
             model="gpt-4o-mini",
             temperature=0.3,
             messages=[
-                {"role":"system","content":"You are a certified Goethe/DTZ examiner. Grade B1 Schreiben (Brief/E-Mail) on a 0–20 scale (task fulfilment, coherence, range, accuracy, register). Return JSON: score(int), feedback(arabic short)."},
+                {"role":"system","content":"You are a certified Goethe/DTZ examiner. Grade B1 Schreiben on a 0–20 scale and return JSON: score, feedback(arabic short)."},
                 {"role":"user","content":text},
             ],
             response_format={"type":"json_object"}
         )
         data=json.loads(resp.choices[0].message.content)
-        score=int(max(0,min(20,int(data.get("score",0)))))
-        lvl=map_level(score,SCHREIBEN_BANDS)
-        return score,lvl,data
+        score=int(max(0,min(20,int(data.get("score",0))))))
+        return score,map_level(score,SCHREIBEN_BANDS),data
     except Exception as e:
-        base=min(20,max(0,len(text)//40)); lvl=map_level(base,SCHREIBEN_BANDS)
-        return base,lvl,{"error":str(e)}
+        base=min(20,max(0,len(text)//40)); return base,map_level(base,SCHREIBEN_BANDS),{"error":str(e)}
 
-# -------- States --------
+# ---------- States ----------
 class BuildStates(StatesGroup):
     waiting_title=State()
     waiting_pick_quiz_for_addq=State()
@@ -241,79 +231,53 @@ class BuildStates(StatesGroup):
     waiting_correct_index=State()
     waiting_pick_quiz_generic=State()
     waiting_edit_quiz_title=State()
-
 class BundleStates(StatesGroup):
     waiting_pick_quiz_for_bundle=State()
     waiting_bundle_files=State()
-
 class PublishStates(StatesGroup):
     waiting_pick_quiz=State()
     waiting_duration_choice=State()
     waiting_custom_hours=State()
-
 class MergeStates(StatesGroup):
     waiting_pick_src=State()
     waiting_pick_dst=State()
-
 class ExportStates(StatesGroup):
     waiting_pick_quiz=State()
-
 class ImportStates(StatesGroup):
     waiting_json=State()
-
 class HLStates(StatesGroup):
     waiting_pick_quiz=State()
-
 class BriefStates(StatesGroup):
     waiting_prompt=State()
     waiting_duration=State()
     waiting_custom=State()
 
-# -------- Keyboards (paged) --------
+# ---------- Keyboards ----------
 def paged_quizzes_kb(page:int=0, tag:str="pickq", per:int=8):
     rows=q_all("SELECT id,title FROM quizzes WHERE is_archived=0 ORDER BY id DESC")
     start=page*per; chunk=rows[start:start+per]
     kb=InlineKeyboardBuilder()
-    for r in chunk:
-        kb.button(text=f"✅ ID {r['id']} — {r['title']}", callback_data=f"{tag}:{r['id']}")
+    for r in chunk: kb.button(text=f"✅ ID {r['id']} — {r['title']}", callback_data=f"{tag}:{r['id']}")
     kb.adjust(1); kb.row()
     if start>0: kb.button(text="⬅️", callback_data=f"{tag}_page:{page-1}")
     kb.button(text=f"صفحة {page+1}", callback_data="noop")
     if start+per<len(rows): kb.button(text="➡️", callback_data=f"{tag}_page:{page+1}")
     return kb.as_markup()
 
-def paged_questions_kb(quiz_id:int, page:int=0, tag:str="manageq", per:int=10):
-    rows=q_all("SELECT id,text FROM questions WHERE quiz_id=%s ORDER BY id",(quiz_id,))
-    start=page*per; chunk=rows[start:start+per]
-    kb=InlineKeyboardBuilder()
-    for r in chunk:
-        t=r['text']; 
-        kb.button(text=f"🔹 Q{r['id']} — {(t[:40]+'…') if len(t)>40 else t}", callback_data=f"{tag}:{quiz_id}:{r['id']}:{page}")
-    kb.adjust(1); kb.row()
-    if start>0: kb.button(text="⬅️", callback_data=f"{tag}_page:{quiz_id}:{page-1}")
-    kb.button(text=f"صفحة {page+1}", callback_data="noop")
-    if start+per<len(rows): kb.button(text="➡️", callback_data=f"{tag}_page:{quiz_id}:{page+1}")
-    return kb.as_markup()
-
-# -------- /start & /dbinfo --------
+# ---------- /start ----------
 @dp.message(Command("start"))
 async def start(msg:Message):
     if is_owner(msg.from_user.id):
         await msg.answer("لوحة التحكم جاهزة — اختر من الأزرار:", reply_markup=owner_kb())
     else:
-        await msg.answer("أهلًا! هذا بوت اختبارات بإدارة المعلم.\nأجب عبر استفتاءات Quiz داخل المجموعة.")
+        await msg.answer("أهلًا! هذا بوت اختبارات بإدارة المعلم.")
 
 @dp.message(Command("dbinfo"))
 async def dbinfo(msg:Message):
-    try:
-        qz=q_one("SELECT COUNT(*) AS n FROM quizzes")["n"]
-        qs=q_one("SELECT COUNT(*) AS n FROM questions")["n"]
-        rs=q_one("SELECT COUNT(*) AS n FROM responses")["n"]
-    except Exception as e:
-        return await msg.answer(f"DB error: {e}")
-    await msg.answer(f"🗄️ DB: <code>PostgreSQL</code>\n🧪 Quizzes: <b>{qz}</b> — Questions: <b>{qs}</b> — Responses: <b>{rs}</b>")
+    qz=q_one("SELECT COUNT(*) AS n FROM quizzes")["n"]; qs=q_one("SELECT COUNT(*) AS n FROM questions")["n"]; rs=q_one("SELECT COUNT(*) AS n FROM responses")["n"]
+    await msg.answer(f"🗄️ DB: PostgreSQL\n🧪 Quizzes: <b>{qz}</b> — Questions: <b>{qs}</b> — Responses: <b>{rs}</b>")
 
-# -------- Create Quiz --------
+# ---------- إنشاء/عرض/تعديل/حذف ----------
 @dp.message(F.text==BTN_NEWQUIZ)
 async def new_quiz(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
@@ -321,56 +285,44 @@ async def new_quiz(msg:Message, state:FSMContext):
 
 @dp.message(BuildStates.waiting_title, F.text)
 async def got_title(msg:Message, state:FSMContext):
-    title=msg.text.strip()
-    q_exec("INSERT INTO quizzes(title,created_by,created_at) VALUES (%s,%s,%s)",(title,msg.from_user.id,_now().isoformat()))
-    await state.clear(); await msg.answer(f"✅ تم إنشاء الاختبار: <b>{html.escape(title)}</b>", reply_markup=owner_kb())
+    q_exec("INSERT INTO quizzes(title,created_by,created_at) VALUES (%s,%s,%s)",(msg.text.strip(),msg.from_user.id,_now().isoformat()))
+    await state.clear(); await msg.answer("✅ تم الإنشاء.", reply_markup=owner_kb())
 
-# -------- List Quizzes --------
 @dp.message(F.text==BTN_LISTQUIZ)
 async def list_quizzes(msg:Message):
     if not await ensure_owner(msg): return
     rows=q_all("SELECT id,title,is_archived FROM quizzes ORDER BY id DESC")
     if not rows: return await msg.answer("لا يوجد اختبارات.")
-    await msg.answer("\n".join([ "📚 <b>الاختبارات</b>:" ] + [ f"• {r['id']}: {html.escape(r['title'])} {'(مؤرشف)' if r['is_archived'] else ''}" for r in rows ] ))
+    await msg.answer("\n".join(["📚 <b>الاختبارات</b>:"]+[f"• {r['id']}: {html.escape(r['title'])}{' (مؤرشف)' if r['is_archived'] else ''}" for r in rows]))
 
-# -------- Edit Quiz --------
 @dp.message(F.text==BTN_EDITQUIZ)
 async def edit_quiz(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
     await state.set_state(BuildStates.waiting_pick_quiz_generic)
     await msg.answer("اختر اختبارًا لتعديل العنوان:", reply_markup=paged_quizzes_kb(tag="editq"))
-
 @dp.callback_query(F.data.startswith("editq_page:"))
 async def editq_page(cb:CallbackQuery, state:FSMContext):
     _,p=cb.data.split(":"); await cb.message.edit_text("اختر الاختبار:", reply_markup=paged_quizzes_kb(page=int(p), tag="editq")); await cb.answer()
-
 @dp.callback_query(F.data.startswith("editq:"))
 async def editq_pick(cb:CallbackQuery, state:FSMContext):
-    qid=int(cb.data.split(":")[1]); await state.update_data(edit_id=qid)
-    await state.set_state(BuildStates.waiting_edit_quiz_title)
+    await state.update_data(edit_id=int(cb.data.split(":")[1])); await state.set_state(BuildStates.waiting_edit_quiz_title)
     await cb.message.answer("أرسل العنوان الجديد:"); await cb.answer()
-
 @dp.message(BuildStates.waiting_edit_quiz_title, F.text)
 async def apply_edit(msg:Message, state:FSMContext):
-    qid=(await state.get_data()).get("edit_id")
-    q_exec("UPDATE quizzes SET title=%s WHERE id=%s",(msg.text.strip(),qid))
+    q_exec("UPDATE quizzes SET title=%s WHERE id=%s",(msg.text.strip(),(await state.get_data())["edit_id"]))
     await state.clear(); await msg.answer("✅ تم التعديل.")
 
-# -------- Delete Quiz --------
 @dp.message(F.text==BTN_DELQUIZ)
 async def del_quiz(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
     await state.set_state(BuildStates.waiting_pick_quiz_generic)
-    await msg.answer("اختر اختبارًا لحذفه (نهائيًا):", reply_markup=paged_quizzes_kb(tag="delq"))
-
+    await msg.answer("اختر اختبارًا للحذف:", reply_markup=paged_quizzes_kb(tag="delq"))
 @dp.callback_query(F.data.startswith("delq_page:"))
 async def delq_page(cb:CallbackQuery, state:FSMContext):
     _,p=cb.data.split(":"); await cb.message.edit_text("اختر الاختبار:", reply_markup=paged_quizzes_kb(page=int(p), tag="delq")); await cb.answer()
-
 @dp.callback_query(F.data.startswith("delq:"))
 async def delq_do(cb:CallbackQuery, state:FSMContext):
     qid=int(cb.data.split(":")[1])
-    # cascade delete (بسيطة)
     q_exec("DELETE FROM options WHERE question_id IN (SELECT id FROM questions WHERE quiz_id=%s)",(qid,))
     q_exec("DELETE FROM question_attachments WHERE question_id IN (SELECT id FROM questions WHERE quiz_id=%s)",(qid,))
     q_exec("DELETE FROM questions WHERE quiz_id=%s",(qid,))
@@ -381,48 +333,37 @@ async def delq_do(cb:CallbackQuery, state:FSMContext):
     q_exec("DELETE FROM quizzes WHERE id=%s",(qid,))
     await state.clear(); await cb.message.answer("🗑️ تم الحذف."); await cb.answer()
 
-# -------- Add Question --------
+# ---------- إضافة سؤال ----------
 @dp.message(F.text==BTN_ADDQ)
 async def addq_start(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
     await state.set_state(BuildStates.waiting_pick_quiz_for_addq)
     await msg.answer("اختر الاختبار لإضافة سؤال:", reply_markup=paged_quizzes_kb(tag="addq"))
-
 @dp.callback_query(F.data.startswith("addq_page:"))
 async def addq_page(cb:CallbackQuery, state:FSMContext):
     _,p=cb.data.split(":"); await cb.message.edit_text("اختر الاختبار:", reply_markup=paged_quizzes_kb(page=int(p), tag="addq")); await cb.answer()
-
 @dp.callback_query(F.data.startswith("addq:"))
 async def addq_pick(cb:CallbackQuery, state:FSMContext):
-    await state.update_data(quiz_id=int(cb.data.split(":")[1]))
-    await state.set_state(BuildStates.waiting_q_text)
+    await state.update_data(quiz_id=int(cb.data.split(":")[1])); await state.set_state(BuildStates.waiting_q_text)
     await cb.message.answer("أرسل نص السؤال:"); await cb.answer()
-
 @dp.message(BuildStates.waiting_q_text, F.text)
 async def q_text(msg:Message, state:FSMContext):
-    qid=(await state.get_data())["quiz_id"]; text=msg.text.strip()
-    q_exec("INSERT INTO questions(quiz_id,text,created_at) VALUES (%s,%s,%s)",(qid,text,_now().isoformat()))
+    qid=(await state.get_data())["quiz_id"]
+    q_exec("INSERT INTO questions(quiz_id,text,created_at) VALUES (%s,%s,%s)",(qid,msg.text.strip(),_now().isoformat()))
     new=q_one("SELECT id FROM questions WHERE quiz_id=%s ORDER BY id DESC LIMIT 1",(qid,))["id"]
-    await state.update_data(question_id=new)
-    await state.set_state(BuildStates.waiting_options_count)
+    await state.update_data(question_id=new); await state.set_state(BuildStates.waiting_options_count)
     await msg.answer("كم عدد الخيارات؟ (2..8)")
-
 @dp.message(BuildStates.waiting_options_count, F.text.regexp(r"^[2-8]$"))
 async def q_opts_count(msg:Message, state:FSMContext):
-    await state.update_data(opt_count=int(msg.text), opt_collected=0)
-    await state.set_state(BuildStates.waiting_option_text)
+    await state.update_data(opt_count=int(msg.text),opt_collected=0); await state.set_state(BuildStates.waiting_option_text)
     await msg.answer(f"أرسل نص الخيار 1/{int(msg.text)}:")
-
 @dp.message(BuildStates.waiting_option_text, F.text)
 async def q_opt_text(msg:Message, state:FSMContext):
     d=await state.get_data(); qid=d["question_id"]; cnt=d["opt_count"]; k=d["opt_collected"]
     q_exec("INSERT INTO options(question_id,option_index,text) VALUES (%s,%s,%s)",(qid,k,msg.text.strip()))
     k+=1; await state.update_data(opt_collected=k)
     if k<cnt: await msg.answer(f"أرسل نص الخيار {k+1}/{cnt}:")
-    else:
-        await state.set_state(BuildStates.waiting_correct_index)
-        await msg.answer(f"أرسل رقم الخيار الصحيح (1..{cnt}):")
-
+    else: await state.set_state(BuildStates.waiting_correct_index); await msg.answer(f"أرسل رقم الخيار الصحيح (1..{cnt}):")
 @dp.message(BuildStates.waiting_correct_index, F.text.regexp(r"^\d+$"))
 async def q_correct(msg:Message, state:FSMContext):
     d=await state.get_data(); qid=d["question_id"]; cnt=d["opt_count"]; i=int(msg.text)-1
@@ -430,49 +371,22 @@ async def q_correct(msg:Message, state:FSMContext):
     q_exec("UPDATE options SET is_correct=1 WHERE question_id=%s AND option_index=%s",(qid,i))
     await state.clear(); await msg.answer("✅ تمت إضافة السؤال.")
 
-# -------- List Questions --------
-@dp.message(F.text==BTN_LISTQ)
-async def listq(msg:Message, state:FSMContext):
-    if not await ensure_owner(msg): return
-    await state.set_state(BuildStates.waiting_pick_quiz_generic)
-    await msg.answer("اختر الاختبار:", reply_markup=paged_quizzes_kb(tag="listq"))
-
-@dp.callback_query(F.data.startswith("listq_page:"))
-async def listq_page(cb:CallbackQuery, state:FSMContext):
-    _,p=cb.data.split(":"); await cb.message.edit_text("اختر الاختبار:", reply_markup=paged_quizzes_kb(page=int(p), tag="listq")); await cb.answer()
-
-@dp.callback_query(F.data.startswith("listq:"))
-async def listq_show(cb:CallbackQuery, state:FSMContext):
-    qid=int(cb.data.split(":")[1])
-    rows=q_all("SELECT id,text FROM questions WHERE quiz_id=%s ORDER BY id",(qid,))
-    if not rows: await cb.message.answer("لا يوجد أسئلة."); await cb.answer(); return
-    out=["📖 أسئلة الاختبار:"]
-    for r in rows:
-        opts=q_all("SELECT option_index,text,is_correct FROM options WHERE question_id=%s ORDER BY option_index",(r["id"],))
-        out.append(f"Q{r['id']}: {r['text']}" + "".join([f"\n   {chr(0x61+o['option_index'])}) {o['text']}{' ✅' if o['is_correct'] else ''}" for o in opts]))
-    await cb.message.answer("\n".join(out)); await cb.answer(); await state.clear()
-
-# -------- Merge --------
+# ---------- دمج ----------
 @dp.message(F.text==BTN_MERGE)
 async def merge_start(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
     await state.set_state(MergeStates.waiting_pick_src)
     await msg.answer("اختر الاختبار المصدر:", reply_markup=paged_quizzes_kb(tag="merge_src"))
-
 @dp.callback_query(F.data.startswith("merge_src_page:"))
 async def merge_src_page(cb:CallbackQuery, state:FSMContext):
     _,p=cb.data.split(":"); await cb.message.edit_text("اختر المصدر:", reply_markup=paged_quizzes_kb(page=int(p), tag="merge_src")); await cb.answer()
-
 @dp.callback_query(F.data.startswith("merge_src:"))
 async def merge_src_pick(cb:CallbackQuery, state:FSMContext):
-    await state.update_data(src=int(cb.data.split(":")[1]))
-    await state.set_state(MergeStates.waiting_pick_dst)
+    await state.update_data(src=int(cb.data.split(":")[1])); await state.set_state(MergeStates.waiting_pick_dst)
     await cb.message.answer("اختر الهدف:", reply_markup=paged_quizzes_kb(tag="merge_dst")); await cb.answer()
-
 @dp.callback_query(F.data.startswith("merge_dst_page:"))
 async def merge_dst_page(cb:CallbackQuery, state:FSMContext):
     _,p=cb.data.split(":"); await cb.message.edit_text("اختر الهدف:", reply_markup=paged_quizzes_kb(page=int(p), tag="merge_dst")); await cb.answer()
-
 @dp.callback_query(F.data.startswith("merge_dst:"))
 async def merge_do(cb:CallbackQuery, state:FSMContext):
     d=await state.get_data(); src=int(d["src"]); dst=int(cb.data.split(":")[1])
@@ -488,7 +402,7 @@ async def merge_do(cb:CallbackQuery, state:FSMContext):
     q_exec("UPDATE quizzes SET is_archived=1 WHERE id=%s",(src,))
     await state.clear(); await cb.message.answer(f"✅ تم نقل {len(qs)} سؤالًا وأرشفة المصدر."); await cb.answer()
 
-# -------- Export / Import --------
+# ---------- تصدير/استيراد ----------
 def build_export_payload(quiz_id:int)->Dict:
     qz=q_one("SELECT id,title,created_by,created_at,grading_profile FROM quizzes WHERE id=%s",(quiz_id,))
     qs=q_all("SELECT id,text,created_at,media_bundle_id FROM questions WHERE quiz_id=%s ORDER BY id",(quiz_id,))
@@ -508,13 +422,10 @@ def build_export_payload(quiz_id:int)->Dict:
 @dp.message(F.text==BTN_EXPORT)
 async def export_btn(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
-    await state.set_state(ExportStates.waiting_pick_quiz)
-    await msg.answer("اختر الاختبار للتصدير:", reply_markup=paged_quizzes_kb(tag="exportq"))
-
+    await state.set_state(ExportStates.waiting_pick_quiz); await msg.answer("اختر الاختبار للتصدير:", reply_markup=paged_quizzes_kb(tag="exportq"))
 @dp.callback_query(F.data.startswith("exportq_page:"))
 async def export_page(cb:CallbackQuery, state:FSMContext):
     _,p=cb.data.split(":"); await cb.message.edit_text("اختر الاختبار:", reply_markup=paged_quizzes_kb(page=int(p), tag="exportq")); await cb.answer()
-
 @dp.callback_query(F.data.startswith("exportq:"))
 async def export_do(cb:CallbackQuery, state:FSMContext):
     qid=int(cb.data.split(":")[1]); payload=build_export_payload(qid)
@@ -522,29 +433,24 @@ async def export_do(cb:CallbackQuery, state:FSMContext):
     with open(path,"w",encoding="utf-8") as f: json.dump(payload,f,ensure_ascii=False,indent=2)
     try: await cb.message.answer_document(FSInputFile(path), caption="تم التصدير ✅")
     except Exception as e:
-        await cb.message.answer(f"تعذر إرسال الملف: {e}\nسأرسل JSON مباشرة:")
-        await cb.message.answer(f"<pre>{html.escape(json.dumps(payload,ensure_ascii=False,indent=2))}</pre>")
+        await cb.message.answer(f"تعذر إرسال الملف: {e}\nسأرسل JSON مباشرة:"); await cb.message.answer(f"<pre>{html.escape(json.dumps(payload,ensure_ascii=False,indent=2))}</pre>")
     await state.clear(); await cb.answer()
 
 @dp.message(F.text==BTN_IMPORT)
 async def import_btn(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
-    await state.set_state(ImportStates.waiting_json)
-    await msg.answer("أرسل ملف JSON أو ألصق JSON مباشرة:")
-
+    await state.set_state(ImportStates.waiting_json); await msg.answer("أرسل ملف JSON أو ألصق JSON مباشرة:")
 @dp.message(ImportStates.waiting_json, F.document)
 async def import_file(msg:Message, state:FSMContext):
     f=await bot.get_file(msg.document.file_id); path=f"/tmp/{msg.document.file_unique_id}.json"
     await bot.download_file(f.file_path, destination=path)
     with open(path,"r",encoding="utf-8") as fp: payload=json.load(fp)
-    await perform_import(msg, payload, state)
-
+    await perform_import(msg,payload,state)
 @dp.message(ImportStates.waiting_json, F.text)
 async def import_text(msg:Message, state:FSMContext):
     try: payload=json.loads(msg.text)
     except Exception: return await msg.answer("JSON غير صالح.")
-    await perform_import(msg, payload, state)
-
+    await perform_import(msg,payload,state)
 async def perform_import(msg:Message, payload:Dict, state:FSMContext):
     qz=payload["quiz"]; title=qz["title"]
     q_exec("INSERT INTO quizzes(title,created_by,created_at,grading_profile) VALUES (%s,%s,%s,%s)",
@@ -561,7 +467,7 @@ async def perform_import(msg:Message, payload:Dict, state:FSMContext):
         for a in qu.get("attachments",[]): q_exec("INSERT INTO question_attachments(question_id,kind,file_id,position) VALUES (%s,%s,%s,%s)",(nq,a["kind"],a["file_id"],a["position"]))
     await state.clear(); await msg.answer(f"✅ تم الاستيراد إلى اختبار جديد: {qid}")
 
-# -------- Publish (with Inline 'Done') + flood control --------
+# ---------- نشر كـ Polls + زر Inline "تم" ----------
 def dur_kb():
     kb=InlineKeyboardBuilder()
     kb.button(text="⏱️ 12 ساعة", callback_data="dur:12")
@@ -575,49 +481,39 @@ async def pub_start(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
     await state.set_state(PublishStates.waiting_pick_quiz)
     await msg.answer("اختر اختبارًا للنشر:", reply_markup=paged_quizzes_kb(tag="pub"))
-
 @dp.callback_query(F.data.startswith("pub_page:"))
 async def pub_page(cb:CallbackQuery, state:FSMContext):
     _,p=cb.data.split(":"); await cb.message.edit_text("اختر الاختبار:", reply_markup=paged_quizzes_kb(page=int(p), tag="pub")); await cb.answer()
-
 @dp.callback_query(F.data.startswith("pub:"))
 async def pub_pick(cb:CallbackQuery, state:FSMContext):
-    await state.update_data(pub_qid=int(cb.data.split(":")[1]))
-    await state.set_state(PublishStates.waiting_duration_choice)
+    await state.update_data(pub_qid=int(cb.data.split(":")[1])); await state.set_state(PublishStates.waiting_duration_choice)
     await cb.message.answer("اختر مدة الإغلاق:", reply_markup=dur_kb()); await cb.answer()
-
 @dp.callback_query(F.data.startswith("dur:"))
 async def pub_duration(cb:CallbackQuery, state:FSMContext):
     action=cb.data.split(":")[1]
     if action=="custom":
-        await state.set_state(PublishStates.waiting_custom_hours)
-        await cb.message.answer("كم ساعة؟ (عدد صحيح)"); return await cb.answer()
-    hours = None if action=="none" else int(action)
+        await state.set_state(PublishStates.waiting_custom_hours); await cb.message.answer("كم ساعة؟ (عدد صحيح)"); return await cb.answer()
+    hours=None if action=="none" else int(action)
     await do_publish(cb.message.chat.id, (await state.get_data())["pub_qid"], hours)
     await state.clear(); await cb.answer()
-
 @dp.message(PublishStates.waiting_custom_hours, F.text.regexp(r"^\d{1,3}$"))
 async def pub_custom(msg:Message, state:FSMContext):
-    await do_publish(msg.chat.id, (await state.get_data())["pub_qid"], int(msg.text))
-    await state.clear()
+    await do_publish(msg.chat.id, (await state.get_data())["pub_qid"], int(msg.text)); await state.clear()
 
 async def do_publish(chat_id:int, quiz_id:int, hours:Optional[int]):
     qs=q_all("SELECT id,text FROM questions WHERE quiz_id=%s ORDER BY id",(quiz_id,))
     if not qs: return await bot.send_message(chat_id,"لا يوجد أسئلة.")
-    expires = (_now()+timedelta(hours=hours)).isoformat() if hours is not None else None
+    expires=(_now()+timedelta(hours=hours)).isoformat() if hours is not None else None
     sent=0
     for idx,r in enumerate(qs,1):
         try:
             opts=q_all("SELECT option_index,text,is_correct FROM options WHERE question_id=%s ORDER BY option_index",(r["id"],))
             options=[o["text"] for o in opts]; correct=next((o["option_index"] for o in opts if o["is_correct"]),0)
             kb=InlineKeyboardBuilder(); kb.button(text="✔️ تم", callback_data=f"done:{quiz_id}:{r['id']}")
-            m=await bot.send_poll(chat_id, question=f"{idx}. {r['text']}", options=options,
-                                  type=PollType.QUIZ, correct_option_id=correct, is_anonymous=False,
-                                  reply_markup=kb.as_markup())
+            m=await bot.send_poll(chat_id, question=f"{idx}. {r['text']}", options=options, type=PollType.QUIZ, correct_option_id=correct, is_anonymous=False, reply_markup=kb.as_markup())
             q_exec("""INSERT INTO sent_polls(chat_id,quiz_id,question_id,poll_id,message_id,expires_at,is_closed)
                       VALUES (%s,%s,%s,%s,%s,%s,0)""",(chat_id,quiz_id,r["id"],m.poll.id,m.message_id,expires))
-            sent+=1
-            await asyncio.sleep(0.6)  # flood control
+            sent+=1; await asyncio.sleep(0.6)  # Flood control
         except TelegramRetryAfter as e:
             await asyncio.sleep(int(e.retry_after)+1)
         except TelegramBadRequest as e:
@@ -626,49 +522,48 @@ async def do_publish(chat_id:int, quiz_id:int, hours:Optional[int]):
 
 @dp.callback_query(F.data.startswith("done:"))
 async def cb_done(cb:CallbackQuery):
-    # مجرد تأكيد لطيف؛ لو بدك منعه إلا بعد الإجابة، ممكن نتحقّق من responses
     await cb.answer("تم 👍", show_alert=False)
 
-# -------- Auto-close polls --------
+# ---------- إغلاق تلقائي ----------
 async def auto_closer():
     while True:
         try:
             rows=q_all("SELECT id,chat_id,message_id,expires_at,is_closed FROM sent_polls WHERE expires_at IS NOT NULL AND is_closed=0")
             now=_now().isoformat()
             for r in rows:
-                if r["expires_at"] and r["expires_at"]<=now:
+                if r["expires_at"]<=now:
                     try: await bot.stop_poll(r["chat_id"], r["message_id"])
                     except Exception: pass
                     q_exec("UPDATE sent_polls SET is_closed=1 WHERE id=%s",(r["id"],))
         except Exception: pass
         await asyncio.sleep(30)
 
-# -------- Poll answers: record + save participant name + maybe HL result --------
+# ---------- Poll answers: تسجيل + أسماء + HL ----------
 @dp.poll_answer()
 async def on_poll_answer(pa:PollAnswer):
     pid=pa.poll_id; uid=pa.user.id
     sp=q_one("SELECT chat_id,quiz_id,question_id FROM sent_polls WHERE poll_id=%s",(pid,))
     if not sp: return
-    chat_id, quiz_id, qid = sp["chat_id"], sp["quiz_id"], sp["question_id"]
+    chat_id,quiz_id,qid=sp["chat_id"],sp["quiz_id"],sp["question_id"]
     chosen=pa.option_ids[0] if pa.option_ids else -1
     ok=q_one("SELECT is_correct FROM options WHERE question_id=%s AND option_index=%s",(qid,chosen))
     is_ok=int(ok["is_correct"]) if ok else 0
     q_exec("""INSERT INTO responses(chat_id,user_id,question_id,option_index,is_correct,answered_at)
-              VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT (chat_id,user_id,question_id) DO NOTHING""",
-           (chat_id,uid,qid,chosen,is_ok,_now().isoformat()))
-    # احفظ الاسم المعروض
-    name = hname(pa.user)
+              VALUES (%s,%s,%s,%s,%s,%s)
+              ON CONFLICT (chat_id,user_id,question_id) DO NOTHING""",(chat_id,uid,qid,chosen,is_ok,_now().isoformat()))
+    # احفظ الاسم
     q_exec("""INSERT INTO participant_names(origin_chat_id,user_id,quiz_id,name)
-              VALUES (%s,%s,%s,%s) ON CONFLICT (origin_chat_id,user_id,quiz_id) DO UPDATE SET name=EXCLUDED.name""",
-           (chat_id, uid, quiz_id, name))
-    # لو HL — اعرض نتيجة نهائية لما يكمّل كل الأسئلة
+              VALUES (%s,%s,%s,%s)
+              ON CONFLICT (origin_chat_id,user_id,quiz_id) DO UPDATE SET name=EXCLUDED.name""",
+           (chat_id,uid,quiz_id,hname(pa.user)))
+    # لو HL — أعرض نتيجة نهائية عندما يجاوب كل الأسئلة
     prof=q_one("SELECT grading_profile FROM quizzes WHERE id=%s",(quiz_id,))
     if prof and prof["grading_profile"]=="HL_B1_DTZ":
-        qids=[r["id"] for r in q_all("SELECT id FROM questions WHERE quiz_id=%s ORDER BY id",(quiz_id,))]
-        total=len(qids)
+        ids=[r["id"] for r in q_all("SELECT id FROM questions WHERE quiz_id=%s ORDER BY id",(quiz_id,))]
+        total=len(ids)
         row=q_one("""SELECT COUNT(*) AS answered, COALESCE(SUM(is_correct),0) AS correct
-                     FROM responses WHERE chat_id=%s AND user_id=%s AND question_id=ANY(%s)""",(chat_id, uid, qids))
-        if row and int(row["answered"] or 0)>=total>0:
+                     FROM responses WHERE chat_id=%s AND user_id=%s AND question_id=ANY(%s)""",(chat_id,uid,ids))
+        if int(row["answered"] or 0)>=total>0:
             correct=int(row["correct"] or 0); level=map_level(correct,HL_BANDS)
             q_exec("""INSERT INTO hl_results(origin_chat_id,quiz_id,user_id,correct_count,total_count,level,finished_at)
                       VALUES (%s,%s,%s,%s,%s,%s,%s)
@@ -677,53 +572,47 @@ async def on_poll_answer(pa:PollAnswer):
                    (chat_id,quiz_id,uid,correct,total,level,_now().isoformat()))
             await bot.send_message(chat_id,
                 f"🧠 <b>Hören & Lesen — النتيجة النهائية</b>\n"
-                f"👤 {html.escape(name)}\n"
+                f"👤 {html.escape(hname(pa.user))}\n"
                 f"📊 <b>{correct}/{total}</b>\n"
                 f"🎯 المستوى: <b>{level}</b>"
             )
 
-# -------- Scoreboard (names) --------
+# ---------- لوحة النتائج ----------
 @dp.message(F.text==BTN_SCORE)
 async def scoreboard(msg:Message):
     if not await ensure_owner(msg): return
     row=q_one("SELECT id,title,grading_profile FROM quizzes WHERE is_archived=0 ORDER BY id DESC LIMIT 1")
     if not row: return await msg.answer("لا يوجد اختبارات.")
     quiz_id,title,prof=row["id"],row["title"],row["grading_profile"]
-    data=q_all("""SELECT r.user_id,
-                         COALESCE(SUM(r.is_correct),0) AS correct,
-                         COUNT(r.question_id) AS answered,
-                         COALESCE(MAX(pn.name), '') AS name
+    data=q_all("""SELECT r.user_id, COALESCE(SUM(r.is_correct),0) AS correct, COUNT(r.question_id) AS answered,
+                         COALESCE(MAX(pn.name),'') AS name
                   FROM responses r
                   JOIN questions q ON q.id=r.question_id AND q.quiz_id=%s
                   LEFT JOIN participant_names pn ON pn.origin_chat_id=r.chat_id AND pn.user_id=r.user_id AND pn.quiz_id=%s
-                  GROUP BY r.user_id
-                  ORDER BY correct DESC""",(quiz_id,quiz_id))
+                  GROUP BY r.user_id ORDER BY correct DESC""",(quiz_id,quiz_id))
     total=q_one("SELECT COUNT(*) AS n FROM questions WHERE quiz_id=%s",(quiz_id,))["n"]
     lines=[f"🏆 <b>لوحة النتائج — {html.escape(title)}</b>"]
     for i,r in enumerate(data,1):
-        name=r["name"] or f"UID {r['user_id']}"
-        correct=int(r["correct"] or 0); answered=int(r["answered"] or 0)
+        name=r["name"] or f"UID {r['user_id']}"; correct=int(r["correct"] or 0); answered=int(r["answered"] or 0)
         level=f" — <i>{map_level(correct,HL_BANDS)}</i>" if prof=="HL_B1_DTZ" else ""
         lines.append(f"{i}. {html.escape(name)}: <b>{correct}</b>/{answered if answered else total}{level}")
     await msg.answer("\n".join(lines))
 
-# -------- HL Profile set --------
+# ---------- HL Profile ----------
 @dp.message(F.text==BTN_HL_PROFILE)
 async def hl_set(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
     await state.set_state(HLStates.waiting_pick_quiz)
     await msg.answer("اختر اختبارًا لتعيينه Hören & Lesen:", reply_markup=paged_quizzes_kb(tag="sethl"))
-
 @dp.callback_query(F.data.startswith("sethl_page:"))
 async def sethl_page(cb:CallbackQuery, state:FSMContext):
     _,p=cb.data.split(":"); await cb.message.edit_text("اختر الاختبار:", reply_markup=paged_quizzes_kb(page=int(p), tag="sethl")); await cb.answer()
-
 @dp.callback_query(F.data.startswith("sethl:"))
 async def sethl_do(cb:CallbackQuery, state:FSMContext):
-    qid=int(cb.data.split(":")[1]); q_exec("UPDATE quizzes SET grading_profile='HL_B1_DTZ' WHERE id=%s",(qid,))
+    q_exec("UPDATE quizzes SET grading_profile='HL_B1_DTZ' WHERE id=%s",(int(cb.data.split(":")[1]),))
     await state.clear(); await cb.message.answer("✅ تم تعيين Hören & Lesen."); await cb.answer()
 
-# -------- Brief flow (prompt → duration → announce + countdown) --------
+# ---------- Schreiben (بريف) ----------
 @dp.message(F.text==BTN_BRIEF)
 async def brief_admin(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
@@ -739,8 +628,7 @@ async def brief_prompt(msg:Message, state:FSMContext):
     kb.button(text="⏱️ 60 دقيقة", callback_data="briefdur:60")
     kb.button(text="⏱️ إدخال يدوي", callback_data="briefdur:custom")
     if get_open_window(msg.chat.id): kb.button(text="⛔ إيقاف الاستقبال", callback_data="briefdur:stop")
-    kb.adjust(2)
-    await state.set_state(BriefStates.waiting_duration)
+    kb.adjust(2); await state.set_state(BriefStates.waiting_duration)
     await msg.answer("اختر مدة الاستقبال:", reply_markup=kb.as_markup())
 
 def get_open_window(chat_id:int):
@@ -758,47 +646,41 @@ def open_window(chat_id:int, owner:int, minutes:int, prompt:str)->Tuple[int,date
     bid=q_one("SELECT id FROM brief_windows WHERE origin_chat_id=%s ORDER BY id DESC LIMIT 1",(chat_id,))["id"]
     return bid, closes
 
-def close_window(chat_id:int):
-    q_exec("UPDATE brief_windows SET is_open=0 WHERE origin_chat_id=%s AND is_open=1",(chat_id,))
-
+def close_window(chat_id:int): q_exec("UPDATE brief_windows SET is_open=0 WHERE origin_chat_id=%s AND is_open=1",(chat_id,))
 def fmt_countdown(delta:timedelta)->str:
-    secs=int(delta.total_seconds()); mins=secs//60; secs%=60
-    hrs=mins//60; mins%=60
-    if hrs>0: return f"{hrs}س {mins}د"
-    return f"{mins}د {secs}ث"
+    s=int(delta.total_seconds()); m=s//60; s%=60; h=m//60; m%=60
+    return f"{h}س {m}د" if h>0 else f"{m}د {s}ث"
 
 @dp.callback_query(F.data.startswith("briefdur:"))
 async def brief_duration(cb:CallbackQuery, state:FSMContext):
     if not is_owner(cb.from_user.id): return await cb.answer("للمالك فقط", show_alert=True)
     act=cb.data.split(":")[1]; data=await state.get_data(); prompt=data.get("prompt","")
     if act=="stop":
-        close_window(cb.message.chat.id); await cb.message.answer("⛔ تم إيقاف استقبال البريفات."); await cb.answer(); return
+        close_window(cb.message.chat.id); await cb.message.answer("⛔ تم إيقاف استقبال البريفات."); return await cb.answer()
     if act=="custom":
-        await state.set_state(BriefStates.waiting_custom)
-        await cb.message.answer("أرسل عدد الدقائق (مثال: 45)"); return await cb.answer()
-    minutes=int(act)
-    bid, closes = open_window(cb.message.chat.id, cb.from_user.id, minutes, prompt)
-    text = (f"📣 <b>سؤال البريف (B1 DTZ)</b>\n{html.escape(prompt)}\n\n"
-            f"⏱️ ينتهي خلال: <b>{fmt_countdown(closes - _now())}</b> (حتى {closes.strftime('%Y-%m-%d %H:%M UTC')})\n"
-            f"أرسلوا نص البريف هنا برسالة واحدة.")
-    m = await cb.message.answer(text)
-    q_exec("UPDATE brief_windows SET ann_message_id=%s WHERE id=%s",(m.message_id, bid))
+        await state.set_state(BriefStates.waiting_custom); await cb.message.answer("أرسل عدد الدقائق (مثال: 45)"); return await cb.answer()
+    minutes=int(act); bid, closes = open_window(cb.message.chat.id, cb.from_user.id, minutes, prompt)
+    txt=(f"📣 <b>سؤال البريف (B1 DTZ)</b>\n{html.escape(prompt)}\n\n"
+         f"⏱️ ينتهي خلال: <b>{fmt_countdown(closes - _now())}</b> (حتى {closes.strftime('%Y-%m-%d %H:%M UTC')})\n"
+         f"أرسلوا نص البريف هنا برسالة واحدة.")
+    m=await cb.message.answer(txt)
+    q_exec("UPDATE brief_windows SET ann_message_id=%s WHERE id=%s",(m.message_id,bid))
     await state.clear(); await cb.answer()
 
 @dp.message(BriefStates.waiting_custom, F.text.regexp(r"^\d{1,3}$"))
 async def brief_custom(msg:Message, state:FSMContext):
     minutes=int(msg.text); prompt=(await state.get_data()).get("prompt","")
-    bid, closes = open_window(msg.chat.id, msg.from_user.id, minutes, prompt)
-    m = await msg.answer(
+    bid,closes=open_window(msg.chat.id,msg.from_user.id,minutes,prompt)
+    m=await msg.answer(
         f"📣 <b>سؤال البريف (B1 DTZ)</b>\n{html.escape(prompt)}\n\n"
         f"⏱️ ينتهي خلال: <b>{fmt_countdown(closes - _now())}</b> (حتى {closes.strftime('%Y-%m-%d %H:%M UTC')})\n"
         f"أرسلوا نص البريف هنا برسالة واحدة."
     )
-    q_exec("UPDATE brief_windows SET ann_message_id=%s WHERE id=%s",(m.message_id, bid))
+    q_exec("UPDATE brief_windows SET ann_message_id=%s WHERE id=%s",(m.message_id,bid))
     await state.clear()
 
-# استقبال البريفات تلقائيًا خلال النافذة
-@dp.message(F.text)
+# **الهاندلر العام للبريف — يعمل فقط عندما لا توجد حالة نشطة**
+@dp.message(StateFilter(None), F.text)
 async def maybe_brief(msg:Message):
     win=get_open_window(msg.chat.id)
     if not win: return
@@ -806,8 +688,8 @@ async def maybe_brief(msg:Message):
     score, lvl, details = await ai_grade(text)
     q_exec("""INSERT INTO writing_submissions(origin_chat_id,quiz_id,user_id,text,score,level,evaluated_at,details_json)
               VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
-           (msg.chat.id, 0, msg.from_user.id, text, score, lvl, _now().isoformat(), json.dumps(details, ensure_ascii=False)))
-    fb = html.escape(details.get("feedback","")) if isinstance(details,dict) else ""
+           (msg.chat.id,0,msg.from_user.id,text,score,lvl,_now().isoformat(),json.dumps(details,ensure_ascii=False)))
+    fb=html.escape(details.get("feedback","")) if isinstance(details,dict) else ""
     await msg.reply(
         f"📮 <b>Schreiben (B1 DTZ)</b>\n"
         f"👤 {html.escape(hname(msg.from_user))}\n"
@@ -815,21 +697,19 @@ async def maybe_brief(msg:Message):
         f"🎯 المستوى: <b>{lvl}</b>" + (f"\n📝 ملاحظات: {fb}" if fb else "")
     )
 
-# -------- Brief countdown updater --------
+# تحديث العدّاد كل ~120 ثانية
 async def brief_countdown_updater():
     while True:
         try:
             rows=q_all("SELECT id,origin_chat_id,closes_at,ann_message_id FROM brief_windows WHERE is_open=1 AND ann_message_id IS NOT NULL")
             now=_now()
             for r in rows:
-                closes=datetime.fromisoformat(r["closes_at"])
-                remain=closes - now
+                closes=datetime.fromisoformat(r["closes_at"]); remain=closes-now
                 if remain.total_seconds()<=0:
                     q_exec("UPDATE brief_windows SET is_open=0 WHERE id=%s",(r["id"],))
                     try: await bot.edit_message_text("⛔ <b>انتهى وقت استقبال البريفات.</b>", r["origin_chat_id"], r["ann_message_id"])
                     except Exception: pass
                     continue
-                # حدّث العداد كل دورتين تقريبًا (كل ~120ث)
                 try:
                     await bot.edit_message_text(
                         f"📣 <b>سؤال البريف (B1 DTZ)</b>\n"
@@ -837,13 +717,11 @@ async def brief_countdown_updater():
                         f"أرسلوا نص البريف هنا برسالة واحدة.",
                         r["origin_chat_id"], r["ann_message_id"], parse_mode=ParseMode.HTML
                     )
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                except Exception: pass
+        except Exception: pass
         await asyncio.sleep(120)
 
-# -------- Wipe all --------
+# ---------- حذف كل شيء ----------
 @dp.message(F.text==BTN_WIPE_ALL)
 async def wipe_all(msg:Message):
     if not await ensure_owner(msg): return
@@ -852,9 +730,8 @@ async def wipe_all(msg:Message):
         q_exec(f"DELETE FROM {tbl}")
     await msg.answer("🧹 تم حذف كل شيء.")
 
-# -------- Runner --------
+# ---------- Runner ----------
 async def main():
-    print("Bot is starting…")
     asyncio.create_task(auto_closer())
     asyncio.create_task(brief_countdown_updater())
     await dp.start_polling(bot)
