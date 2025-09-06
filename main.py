@@ -216,7 +216,7 @@ async def ai_grade(text:str)->Tuple[int,str,Dict]:
             response_format={"type":"json_object"}
         )
         data=json.loads(resp.choices[0].message.content)
-        score=int(max(0,min(20,int(data.get("score",0))))))
+       score = int(max(0, min(20, int(data.get("score", 0)))))
         return score,map_level(score,SCHREIBEN_BANDS),data
     except Exception as e:
         base=min(20,max(0,len(text)//40)); return base,map_level(base,SCHREIBEN_BANDS),{"error":str(e)}
