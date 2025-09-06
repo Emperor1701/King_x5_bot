@@ -1,2 +1,4 @@
-aiogram==3.7.0
-python-dotenv>=1.0.1
+aiogram==3.*
+python-dotenv
+psycopg[binary,pool]
+openai   # (اختياري للتصحيح بالذكاء الاصطناعي)
