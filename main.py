@@ -8,7 +8,7 @@ from typing import Optional, List, Dict, Tuple
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode, PollType, ChatType
+from aiogram.enums import ParseMode, PollType
 from aiogram.types import (
     Message, CallbackQuery, PollAnswer,
     ReplyKeyboardMarkup, KeyboardButton, FSInputFile
@@ -150,18 +150,15 @@ BTN_IMPORT="📥 استيراد دفعة"; BTN_PUBLISH="🚀 نشر اختبار
 BTN_SCORE="🏆 لوحة النتائج"; BTN_BACK_HOME="↩️ العودة للبداية"; BTN_BACK_STEP="⬅️ رجوع للخلف"
 BTN_LEVEL="🎯 تقييم مستوى"; BTN_HL_PROFILE="🧠 اختبارات Hören & Lesen"; BTN_BRIEF="✉️ زر إرسال البريف"
 
-def owner_kb()->ReplyKeyboardMarkup:
-    rows=[
-        [KeyboardButton(text=BTN_BACK_HOME), KeyboardButton(text=BTN_BACK_STEP)],
-        [KeyboardButton(text=BTN_NEWQUIZ), KeyboardButton(text=BTN_ADDQ)],
-        [KeyboardButton(text=BTN_LISTQUIZ), KeyboardButton(text=BTN_LISTQ)],
-        [KeyboardButton(text=BTN_EDITQUIZ), KeyboardButton(text=BTN_DELQUIZ)],
-        [KeyboardButton(text=BTN_BUNDLES), KeyboardButton(text=BTN_MERGE)],
-        [KeyboardButton(text=BTN_IMPORT), KeyboardButton(text=BTN_EXPORT)],
-        [KeyboardButton(text=BTN_PUBLISH), KeyboardButton(text=BTN_SCORE)],
-        [KeyboardButton(text=BTN_HL_PROFILE), KeyboardButton(text=BTN_LEVEL)],
-        [KeyboardButton(text=BTN_BRIEF), KeyboardButton(text=BTN_WIPE_ALL)],
-    ]; return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+ACT_EDIT_TEXT  = "✏️ تعديل النص"
+ACT_EDIT_OPTS  = "🧩 تعديل الخيارات"
+ACT_EDIT_MEDIA = "🖼️ تبديل المرفقات"
+ACT_DELETE_Q   = "🗑️ حذف السؤال"
+ACT_BACK       = "⬅️ رجوع"
+
+BTN_USE_BUNDLE = "📎 استخدام مرفق مشترك"
+BTN_USE_OWN    = "🖼️ مرفقات خاصة بالسؤال"
+BTN_USE_NONE   = "❌ بدون مرفقات"
 
 # ---------- Helpers ----------
 def _now()->datetime: return datetime.now(timezone.utc)
@@ -177,6 +174,13 @@ def hname(u)->str:
 def slug(s:str)->str:
     s=re.sub(r"\s+","-",s.strip()); s=re.sub(r"[^\w\-]+","",s,flags=re.U); return s[:50] or "quiz"
 
+# --- حارس عام لأي Callback إداري (إشعار لطيف لغير المالك) ---
+ADMIN_PREFIX = ("addq","editq","delq","merge_","exportq","pub","dur","sethl","briefdur","pickbundle","attach_mode")
+@dp.callback_query(F.data.regexp(r"^(addq|editq|delq|merge_|exportq|pub|dur|sethl|briefdur|pickbundle|attach_mode)"))
+async def admin_cb_guard(cb: CallbackQuery):
+    if cb.from_user.id != OWNER_ID:
+        return await cb.answer("🚫 هذا الزر خاص بالمالك.", show_alert=True)
+
 # ---------- Bands & AI ----------
 SCHREIBEN_BANDS=[(0,6,"Unter A2"),(7,14,"A2"),(15,20,"B1")]
 HL_BANDS=[(0,19,"Unter A2"),(20,32,"A2"),(33,45,"B1")]
@@ -191,36 +195,22 @@ if OPENAI_API_KEY and OpenAI:
     except Exception: client=None
 
 async def ai_grade(text: str) -> Tuple[int, str, Dict]:
-    """
-    تقييم كتابة B1 على 0–20. مع OpenAI يرجّع JSON فيه score/feedback.
-    """
     if not client:
         base = min(20, max(0, len(text) // 35))
         return base, map_level(base, SCHREIBEN_BANDS), {"note": "fallback heuristic (no OPENAI_API_KEY)"}
-
     try:
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
             temperature=0.3,
             messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a certified Goethe/DTZ examiner. "
-                        "Grade B1 Schreiben (Brief/E-Mail) on a 0–20 scale "
-                        "(task fulfilment, coherence, range, accuracy, register). "
-                        "Return JSON: {\"score\": <int>, \"feedback\": \"<short Arabic feedback>\"}."
-                    ),
-                },
-                {"role": "user", "content": text},
+                {"role":"system","content":"You are a certified Goethe/DTZ examiner. Grade B1 Schreiben (Brief/E-Mail) on a 0–20 scale (task fulfilment, coherence, range, accuracy, register). Return JSON: {\"score\":<int>,\"feedback\":\"<Arabic short>\"}."},
+                {"role":"user","content":text},
             ],
-            response_format={"type": "json_object"},
+            response_format={"type":"json_object"},
         )
         raw = resp.choices[0].message.content or "{}"
-        try:
-            data = json.loads(raw)
-        except Exception:
-            data = {}
+        try: data = json.loads(raw)
+        except Exception: data = {}
         score = int(max(0, min(20, int(data.get("score", 0)))))
         level = map_level(score, SCHREIBEN_BANDS)
         return score, level, data
@@ -233,6 +223,9 @@ class BuildStates(StatesGroup):
     waiting_title=State()
     waiting_pick_quiz_for_addq=State()
     waiting_q_text=State()
+    waiting_attach_mode=State()
+    waiting_q_attachments=State()
+    waiting_pick_bundle_for_q=State()
     waiting_options_count=State()
     waiting_option_text=State()
     waiting_correct_index=State()
@@ -262,7 +255,36 @@ class BriefStates(StatesGroup):
     waiting_duration=State()
     waiting_custom=State()
 
+class BundleStates(StatesGroup):
+    waiting_pick_quiz_for_bundle=State()
+    waiting_bundle_files=State()
+
 # ---------- Keyboards ----------
+def owner_kb()->ReplyKeyboardMarkup:
+    rows=[
+        [KeyboardButton(text=BTN_BACK_HOME), KeyboardButton(text=BTN_BACK_STEP)],
+        [KeyboardButton(text=BTN_NEWQUIZ), KeyboardButton(text=BTN_ADDQ)],
+        [KeyboardButton(text=BTN_LISTQUIZ), KeyboardButton(text=BTN_LISTQ)],
+        [KeyboardButton(text=BTN_EDITQUIZ), KeyboardButton(text=BTN_DELQUIZ)],
+        [KeyboardButton(text=BTN_BUNDLES), KeyboardButton(text=BTN_MERGE)],
+        [KeyboardButton(text=BTN_IMPORT), KeyboardButton(text=BTN_EXPORT)],
+        [KeyboardButton(text=BTN_PUBLISH), KeyboardButton(text=BTN_SCORE)],
+        [KeyboardButton(text=BTN_HL_PROFILE), KeyboardButton(text=BTN_LEVEL)],
+        [KeyboardButton(text=BTN_BRIEF), KeyboardButton(text=BTN_WIPE_ALL)],
+    ]; return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+def attach_mode_kb() -> InlineKeyboardBuilder:
+    kb = InlineKeyboardBuilder()
+    kb.button(text=BTN_USE_BUNDLE, callback_data="attach_mode:bundle")
+    kb.button(text=BTN_USE_OWN, callback_data="attach_mode:own")
+    kb.button(text=BTN_USE_NONE, callback_data="attach_mode:none")
+    kb.adjust(1); return kb
+
+def done_button_kb(tag: str) -> InlineKeyboardBuilder:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✔️ تم", callback_data=f"done:{tag}")
+    return kb
+
 def paged_quizzes_kb(page:int=0, tag:str="pickq", per:int=8):
     rows=q_all("SELECT id,title FROM quizzes WHERE is_archived=0 ORDER BY id DESC")
     start=page*per; chunk=rows[start:start+per]
@@ -273,6 +295,37 @@ def paged_quizzes_kb(page:int=0, tag:str="pickq", per:int=8):
     kb.button(text=f"صفحة {page+1}", callback_data="noop")
     if start+per<len(rows): kb.button(text="➡️", callback_data=f"{tag}_page:{page+1}")
     return kb.as_markup()
+
+def paged_bundles_kb(quiz_id:int, page:int=0, tag:str="pickbundle", per:int=8):
+    rows=q_all("SELECT id FROM media_bundles WHERE quiz_id=%s ORDER BY id DESC",(quiz_id,))
+    start=page*per; chunk=rows[start:start+per]
+    kb=InlineKeyboardBuilder()
+    for r in chunk:
+        att_cnt=q_one("SELECT COUNT(*) AS c FROM media_bundle_attachments WHERE bundle_id=%s",(r["id"],))["c"]
+        q_cnt =q_one("SELECT COUNT(*) AS c FROM questions WHERE media_bundle_id=%s",(r["id"],))["c"]
+        kb.button(text=f"📎 حزمة {r['id']} — ملفات:{att_cnt} / أسئلة:{q_cnt}", callback_data=f"{tag}:{quiz_id}:{r['id']}")
+    kb.adjust(1); kb.row()
+    if start>0: kb.button(text="⬅️", callback_data=f"{tag}_page:{quiz_id}:{page-1}")
+    kb.button(text=f"صفحة {page+1}", callback_data="noop")
+    if start+per<len(rows): kb.button(text="➡️", callback_data=f"{tag}_page:{quiz_id}:{page+1}")
+    return kb.as_markup()
+
+# ---------- Attachments helpers ----------
+def get_question_atts(question_id:int)->List[dict]:
+    return q_all("SELECT kind,file_id,position FROM question_attachments WHERE question_id=%s ORDER BY position",(question_id,))
+
+def get_bundle_atts(bundle_id:int)->List[dict]:
+    return q_all("SELECT kind,file_id,position FROM media_bundle_attachments WHERE bundle_id=%s ORDER BY position",(bundle_id,))
+
+async def send_attachments(chat_id:int, atts:List[dict]):
+    # يرسل صور/فويس/أوديو بالترتيب
+    for a in atts:
+        try:
+            if a["kind"]=="photo":   await bot.send_photo(chat_id, a["file_id"])
+            elif a["kind"]=="voice": await bot.send_voice(chat_id, a["file_id"])
+            elif a["kind"]=="audio": await bot.send_audio(chat_id, a["file_id"])
+        except Exception: pass
+        await asyncio.sleep(0.2)
 
 # ---------- /start ----------
 @dp.message(Command("start"))
@@ -348,7 +401,7 @@ async def delq_do(cb:CallbackQuery, state:FSMContext):
     q_exec("DELETE FROM quizzes WHERE id=%s",(qid,))
     await state.clear(); await cb.message.answer("🗑️ تم الحذف."); await cb.answer()
 
-# ---------- إضافة سؤال ----------
+# ---------- إضافة سؤال + مرفقات ----------
 @dp.message(F.text==BTN_ADDQ)
 async def addq_start(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
@@ -366,16 +419,82 @@ async def addq_pick(cb:CallbackQuery, state:FSMContext):
 
 @dp.message(BuildStates.waiting_q_text, F.text)
 async def q_text(msg:Message, state:FSMContext):
-    qid=(await state.get_data())["quiz_id"]
-    q_exec("INSERT INTO questions(quiz_id,text,created_at) VALUES (%s,%s,%s)",(qid,msg.text.strip(),_now().isoformat()))
+    qid=(await state.get_data())["quiz_id"]; text=msg.text.strip()
+    q_exec("INSERT INTO questions(quiz_id,text,created_at) VALUES (%s,%s,%s)",(qid,text,_now().isoformat()))
     new=q_one("SELECT id FROM questions WHERE quiz_id=%s ORDER BY id DESC LIMIT 1",(qid,))["id"]
-    await state.update_data(question_id=new); await state.set_state(BuildStates.waiting_options_count)
-    await msg.answer("كم عدد الخيارات؟ (2..8)")
+    await state.update_data(question_id=new)
+    # اختيار وضع المرفقات
+    kb = attach_mode_kb()
+    await state.set_state(BuildStates.waiting_attach_mode)
+    await msg.answer("اختَر وضع المرفقات لهذا السؤال:", reply_markup=kb.as_markup())
 
-@dp.message(BuildStates.waiting_options_count, F.text.regexp(r"^[2-8]$"))
+@dp.callback_query(F.data.startswith("attach_mode:"))
+async def choose_attach_mode(cb:CallbackQuery, state:FSMContext):
+    mode=cb.data.split(":")[1]
+    d=await state.get_data(); qid=d["question_id"]; quiz_id=d["quiz_id"]
+    if mode=="none":
+        await state.set_state(BuildStates.waiting_options_count)
+        return await cb.message.answer("كم عدد الخيارات؟ (2..10)")
+    if mode=="own":
+        await state.update_data(att_pos=0)
+        await state.set_state(BuildStates.waiting_q_attachments)
+        await cb.message.answer("أرسل مرفقات السؤال (صور/فويس/أوديو). عند الانتهاء اضغط ✔️ تم.",
+                                reply_markup=done_button_kb("qatt").as_markup())
+        return await cb.answer()
+    if mode=="bundle":
+        await state.set_state(BuildStates.waiting_pick_bundle_for_q)
+        await cb.message.answer("اختر حزمة مرفقات مشتركة (أو أنشئ واحدة من زر 📎 مرفقات مشتركة):",
+                                reply_markup=paged_bundles_kb(quiz_id, tag="pickbundle"))
+        return await cb.answer()
+
+@dp.callback_query(F.data.startswith("pickbundle_page:"))
+async def pickbundle_page(cb:CallbackQuery, state:FSMContext):
+    _,quiz_id,page=cb.data.split(":")
+    await cb.message.edit_text("اختر الحزمة:", reply_markup=paged_bundles_kb(int(quiz_id), int(page), tag="pickbundle"))
+    await cb.answer()
+
+@dp.callback_query(F.data.startswith("pickbundle:"))
+async def pickbundle_apply(cb:CallbackQuery, state:FSMContext):
+    _,quiz_id,bundle_id=cb.data.split(":")
+    qid=(await state.get_data())["question_id"]
+    q_exec("UPDATE questions SET media_bundle_id=%s WHERE id=%s",(int(bundle_id), qid))
+    await state.set_state(BuildStates.waiting_options_count)
+    await cb.message.answer("تم ربط الحزمة. كم عدد الخيارات؟ (2..10)")
+    await cb.answer()
+
+# استقبال مرفقات السؤال (own)
+@dp.message(BuildStates.waiting_q_attachments, F.photo)
+async def qatt_photo(msg:Message, state:FSMContext):
+    d=await state.get_data(); qid=d["question_id"]; pos=int(d.get("att_pos",0))
+    file_id = msg.photo[-1].file_id
+    q_exec("INSERT INTO question_attachments(question_id,kind,file_id,position) VALUES (%s,%s,%s,%s)",(qid,"photo",file_id,pos))
+    await state.update_data(att_pos=pos+1)
+
+@dp.message(BuildStates.waiting_q_attachments, F.voice)
+async def qatt_voice(msg:Message, state:FSMContext):
+    d=await state.get_data(); qid=d["question_id"]; pos=int(d.get("att_pos",0))
+    q_exec("INSERT INTO question_attachments(question_id,kind,file_id,position) VALUES (%s,%s,%s,%s)",(qid,"voice",msg.voice.file_id,pos))
+    await state.update_data(att_pos=pos+1)
+
+@dp.message(BuildStates.waiting_q_attachments, F.audio)
+async def qatt_audio(msg:Message, state:FSMContext):
+    d=await state.get_data(); qid=d["question_id"]; pos=int(d.get("att_pos",0))
+    q_exec("INSERT INTO question_attachments(question_id,kind,file_id,position) VALUES (%s,%s,%s,%s)",(qid,"audio",msg.audio.file_id,pos))
+    await state.update_data(att_pos=pos+1)
+
+@dp.callback_query(F.data=="done:qatt")
+async def qatt_done(cb:CallbackQuery, state:FSMContext):
+    await state.set_state(BuildStates.waiting_options_count)
+    await cb.message.answer("تم حفظ المرفقات. كم عدد الخيارات؟ (2..10)")
+    await cb.answer()
+
+# خيارات السؤال (حتى 10)
+@dp.message(BuildStates.waiting_options_count, F.text.regexp(r"^\d{1,2}$"))
 async def q_opts_count(msg:Message, state:FSMContext):
-    await state.update_data(opt_count=int(msg.text),opt_collected=0); await state.set_state(BuildStates.waiting_option_text)
-    await msg.answer(f"أرسل نص الخيار 1/{int(msg.text)}:")
+    n=int(msg.text)
+    if not (2<=n<=10): return await msg.answer("الرجاء رقم بين 2 و 10.")
+    await state.update_data(opt_count=n,opt_collected=0); await state.set_state(BuildStates.waiting_option_text)
+    await msg.answer(f"أرسل نص الخيار 1/{n}:")
 
 @dp.message(BuildStates.waiting_option_text, F.text)
 async def q_opt_text(msg:Message, state:FSMContext):
@@ -390,7 +509,77 @@ async def q_correct(msg:Message, state:FSMContext):
     d=await state.get_data(); qid=d["question_id"]; cnt=d["opt_count"]; i=int(msg.text)-1
     if not (0<=i<cnt): return await msg.answer("خارج النطاق.")
     q_exec("UPDATE options SET is_correct=1 WHERE question_id=%s AND option_index=%s",(qid,i))
-    await state.clear(); await msg.answer("✅ تمت إضافة السؤال.")
+    await state.clear(); await msg.answer("✅ تمت إضافة السؤال.", reply_markup=owner_kb())
+
+# ---------- عرض الأسئلة ----------
+@dp.message(F.text==BTN_LISTQ)
+async def listq(msg:Message, state:FSMContext):
+    if not await ensure_owner(msg): return
+    await state.set_state(BuildStates.waiting_pick_quiz_generic)
+    await msg.answer("اختر الاختبار:", reply_markup=paged_quizzes_kb(tag="listq"))
+
+@dp.callback_query(F.data.startswith("listq_page:"))
+async def listq_page(cb:CallbackQuery, state:FSMContext):
+    _,p=cb.data.split(":"); await cb.message.edit_text("اختر الاختبار:", reply_markup=paged_quizzes_kb(page=int(p), tag="listq")); await cb.answer()
+
+@dp.callback_query(F.data.startswith("listq:"))
+async def listq_show(cb:CallbackQuery, state:FSMContext):
+    qid=int(cb.data.split(":")[1])
+    rows=q_all("SELECT id,text FROM questions WHERE quiz_id=%s ORDER BY id",(qid,))
+    if not rows: await cb.message.answer("لا يوجد أسئلة."); await cb.answer(); return
+    out=["📖 أسئلة الاختبار:"]
+    for r in rows:
+        opts=q_all("SELECT option_index,text,is_correct FROM options WHERE question_id=%s ORDER BY option_index",(r["id"],))
+        out.append(f"Q{r['id']}: {r['text']}" + "".join([f"\n   {chr(0x61+o['option_index'])}) {o['text']}{' ✅' if o['is_correct'] else ''}" for o in opts]))
+    await cb.message.answer("\n".join(out)); await cb.answer(); await state.clear()
+
+# ---------- Bundles (مرفقات مشتركة) ----------
+@dp.message(F.text==BTN_BUNDLES)
+async def bundles_entry(msg:Message, state:FSMContext):
+    if not await ensure_owner(msg): return
+    await state.set_state(BundleStates.waiting_pick_quiz_for_bundle)
+    await msg.answer("اختر اختبارًا لإدارة الحزم:", reply_markup=paged_quizzes_kb(tag="bundq"))
+
+@dp.callback_query(F.data.startswith("bundq_page:"))
+async def bundq_page(cb:CallbackQuery, state:FSMContext):
+    _,p=cb.data.split(":"); await cb.message.edit_text("اختر الاختبار:", reply_markup=paged_quizzes_kb(page=int(p), tag="bundq")); await cb.answer()
+
+@dp.callback_query(F.data.startswith("bundq:"))
+async def bundq_pick(cb:CallbackQuery, state:FSMContext):
+    await state.update_data(bundle_quiz_id=int(cb.data.split(":")[1]))
+    # أنشئ حزمة جديدة وفورًا اطلب الملفات
+    q_exec("INSERT INTO media_bundles(quiz_id,created_at) VALUES (%s,%s)",((await state.get_data())["bundle_quiz_id"], _now().isoformat()))
+    bid=q_one("SELECT id FROM media_bundles WHERE quiz_id=%s ORDER BY id DESC LIMIT 1",((await state.get_data())["bundle_quiz_id"],))["id"]
+    await state.update_data(active_bundle_id=bid, bundle_pos=0)
+    await state.set_state(BundleStates.waiting_bundle_files)
+    await cb.message.answer(f"📎 حزمة جديدة رقم {bid}. أرسل صور/فويس/أوديو. عند الانتهاء اضغط ✔️ تم.",
+                            reply_markup=done_button_kb("bundle").as_markup())
+    await cb.answer()
+
+@dp.message(BundleStates.waiting_bundle_files, F.photo)
+async def bundle_photo(msg:Message, state:FSMContext):
+    bid=(await state.get_data())["active_bundle_id"]; pos=int((await state.get_data()).get("bundle_pos",0))
+    q_exec("INSERT INTO media_bundle_attachments(bundle_id,kind,file_id,position) VALUES (%s,%s,%s,%s)",(bid,"photo",msg.photo[-1].file_id,pos))
+    await state.update_data(bundle_pos=pos+1)
+
+@dp.message(BundleStates.waiting_bundle_files, F.voice)
+async def bundle_voice(msg:Message, state:FSMContext):
+    bid=(await state.get_data())["active_bundle_id"]; pos=int((await state.get_data()).get("bundle_pos",0))
+    q_exec("INSERT INTO media_bundle_attachments(bundle_id,kind,file_id,position) VALUES (%s,%s,%s,%s)",(bid,"voice",msg.voice.file_id,pos))
+    await state.update_data(bundle_pos=pos+1)
+
+@dp.message(BundleStates.waiting_bundle_files, F.audio)
+async def bundle_audio(msg:Message, state:FSMContext):
+    bid=(await state.get_data())["active_bundle_id"]; pos=int((await state.get_data()).get("bundle_pos",0))
+    q_exec("INSERT INTO media_bundle_attachments(bundle_id,kind,file_id,position) VALUES (%s,%s,%s,%s)",(bid,"audio",msg.audio.file_id,pos))
+    await state.update_data(bundle_pos=pos+1)
+
+@dp.callback_query(F.data=="done:bundle")
+async def bundle_done(cb:CallbackQuery, state:FSMContext):
+    d=await state.get_data()
+    await state.clear()
+    await cb.message.answer(f"✅ تم حفظ حزمة {d.get('active_bundle_id')}.", reply_markup=owner_kb())
+    await cb.answer()
 
 # ---------- دمج ----------
 @dp.message(F.text==BTN_MERGE)
@@ -434,13 +623,13 @@ def build_export_payload(quiz_id:int)->Dict:
     out=[]
     for r in qs:
         opts=q_all("SELECT option_index,text,is_correct FROM options WHERE question_id=%s ORDER BY option_index",(r["id"],))
-        atts=q_all("SELECT kind,file_id,position FROM question_attachments WHERE question_id=%s ORDER BY position",(r["id"],))
+        atts=get_question_atts(r["id"])
         out.append({"id":r["id"],"text":r["text"],"created_at":r["created_at"],"media_bundle_id":r["media_bundle_id"],
                     "options":[dict(o) for o in opts],"attachments":[dict(a) for a in atts]})
     bundles=q_all("SELECT id,created_at FROM media_bundles WHERE quiz_id=%s ORDER BY id",(quiz_id,))
     b=[]
     for mb in bundles:
-        mb_at=q_all("SELECT kind,file_id,position FROM media_bundle_attachments WHERE bundle_id=%s ORDER BY position",(mb["id"],))
+        mb_at=get_bundle_atts(mb["id"])
         b.append({"id":mb["id"],"created_at":mb["created_at"],"attachments":[dict(x) for x in mb_at]})
     return {"quiz":dict(qz),"questions":out,"bundles":b,"exported_at":_now().isoformat(),"version":1}
 
@@ -485,19 +674,21 @@ async def perform_import(msg:Message, payload:Dict, state:FSMContext):
     qz=payload["quiz"]; title=qz["title"]
     q_exec("INSERT INTO quizzes(title,created_by,created_at,grading_profile) VALUES (%s,%s,%s,%s)",
            (title,msg.from_user.id,_now().isoformat(),qz.get("grading_profile","NONE")))
-    qid=q_one("SELECT id FROM quizzes ORDER BY id DESC LIMIT 1")["id"]
+    new_qid=q_one("SELECT id FROM quizzes ORDER BY id DESC LIMIT 1")["id"]
     for b in payload.get("bundles",[]):
-        q_exec("INSERT INTO media_bundles(quiz_id,created_at) VALUES (%s,%s)",(qid,b.get("created_at",_now().isoformat())))
-        nb=q_one("SELECT id FROM media_bundles WHERE quiz_id=%s ORDER BY id DESC LIMIT 1",(qid,))["id"]
+        q_exec("INSERT INTO media_bundles(quiz_id,created_at) VALUES (%s,%s)",(new_qid,b.get("created_at",_now().isoformat())))
+        nb=q_one("SELECT id FROM media_bundles WHERE quiz_id=%s ORDER BY id DESC LIMIT 1",(new_qid,))["id"]
         for a in b.get("attachments",[]): q_exec("INSERT INTO media_bundle_attachments(bundle_id,kind,file_id,position) VALUES (%s,%s,%s,%s)",(nb,a["kind"],a["file_id"],a["position"]))
+    id_map={}
     for qu in payload.get("questions",[]):
-        q_exec("INSERT INTO questions(quiz_id,text,created_at,media_bundle_id) VALUES (%s,%s,%s,%s)",(qid,qu["text"],qu.get("created_at",_now().isoformat()),qu.get("media_bundle_id")))
-        nq=q_one("SELECT id FROM questions WHERE quiz_id=%s ORDER BY id DESC LIMIT 1",(qid,))["id"]
+        q_exec("INSERT INTO questions(quiz_id,text,created_at,media_bundle_id) VALUES (%s,%s,%s,%s)",(new_qid,qu["text"],qu.get("created_at",_now().isoformat()),qu.get("media_bundle_id")))
+        nq=q_one("SELECT id FROM questions WHERE quiz_id=%s ORDER BY id DESC LIMIT 1",(new_qid,))["id"]
+        id_map[qu["id"]]=nq
         for o in qu.get("options",[]): q_exec("INSERT INTO options(question_id,option_index,text,is_correct) VALUES (%s,%s,%s,%s)",(nq,o["option_index"],o["text"],o["is_correct"]))
         for a in qu.get("attachments",[]): q_exec("INSERT INTO question_attachments(question_id,kind,file_id,position) VALUES (%s,%s,%s,%s)",(nq,a["kind"],a["file_id"],a["position"]))
-    await state.clear(); await msg.answer(f"✅ تم الاستيراد إلى اختبار جديد: {qid}")
+    await state.clear(); await msg.answer(f"✅ تم الاستيراد إلى اختبار جديد: {new_qid}")
 
-# ---------- نشر كـ Quiz Polls + زر "✔️ تم" ----------
+# ---------- نشر كـ Quiz Polls + إرسال المرفقات قبل السؤال ----------
 def dur_kb():
     kb=InlineKeyboardBuilder()
     kb.button(text="⏱️ 12 ساعة", callback_data="dur:12")
@@ -535,14 +726,23 @@ async def pub_custom(msg:Message, state:FSMContext):
     await do_publish(msg.chat.id, (await state.get_data())["pub_qid"], int(msg.text)); await state.clear()
 
 async def do_publish(chat_id:int, quiz_id:int, hours:Optional[int]):
-    qs=q_all("SELECT id,text FROM questions WHERE quiz_id=%s ORDER BY id",(quiz_id,))
+    qs=q_all("SELECT id,text,media_bundle_id FROM questions WHERE quiz_id=%s ORDER BY id",(quiz_id,))
     if not qs: return await bot.send_message(chat_id,"لا يوجد أسئلة.")
     expires=(_now()+timedelta(hours=hours)).isoformat() if hours is not None else None
     sent=0
     for idx,r in enumerate(qs,1):
         try:
+            # أرسل المرفقات (أولاً مرفقات السؤال، وإذا لا توجد فاستخدم حزمة مشتركة)
+            atts=get_question_atts(r["id"])
+            if not atts and r["media_bundle_id"]:
+                atts=get_bundle_atts(r["media_bundle_id"])
+            if atts:
+                await send_attachments(chat_id, atts)
+            # أرسل الاستفتاء
             opts=q_all("SELECT option_index,text,is_correct FROM options WHERE question_id=%s ORDER BY option_index",(r["id"],))
-            options=[o["text"] for o in opts]; correct=next((o["option_index"] for o in opts if o["is_correct"]),0)
+            options=[o["text"] for o in opts]
+            if not options: continue
+            correct=next((o["option_index"] for o in opts if o["is_correct"]),0)
             kb=InlineKeyboardBuilder(); kb.button(text="✔️ تم", callback_data=f"done:{quiz_id}:{r['id']}")
             m=await bot.send_poll(chat_id, question=f"{idx}. {r['text']}", options=options, type=PollType.QUIZ,
                                   correct_option_id=correct, is_anonymous=False, reply_markup=kb.as_markup())
@@ -573,7 +773,7 @@ async def auto_closer():
         except Exception: pass
         await asyncio.sleep(30)
 
-# ---------- تسجيل الإجابات + أسماء + HL ----------
+# ---------- Poll answers: تسجيل + أسماء + HL ----------
 @dp.poll_answer()
 async def on_poll_answer(pa:PollAnswer):
     pid=pa.poll_id; uid=pa.user.id
