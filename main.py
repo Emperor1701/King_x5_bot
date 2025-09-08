@@ -174,12 +174,14 @@ def hname(u)->str:
 def slug(s:str)->str:
     s=re.sub(r"\s+","-",s.strip()); s=re.sub(r"[^\w\-]+","",s,flags=re.U); return s[:50] or "quiz"
 
-# --- حارس عام لأي Callback إداري (إشعار لطيف لغير المالك) ---
+# --- حارس عام لغير المالك فقط ---
 ADMIN_PREFIX = ("addq","editq","delq","merge_","exportq","pub","dur","sethl","briefdur","pickbundle","attach_mode")
-@dp.callback_query(F.data.regexp(r"^(addq|editq|delq|merge_|exportq|pub|dur|sethl|briefdur|pickbundle|attach_mode)"))
+@dp.callback_query(
+    F.from_user.id != OWNER_ID,
+    F.data.regexp(r"^(addq|editq|delq|merge_|exportq|pub|dur|sethl|briefdur|pickbundle|attach_mode)")
+)
 async def admin_cb_guard(cb: CallbackQuery):
-    if cb.from_user.id != OWNER_ID:
-        return await cb.answer("🚫 هذا الزر خاص بالمالك.", show_alert=True)
+    await cb.answer("🚫 هذا الزر خاص بالمالك.", show_alert=True)
 
 # ---------- Bands & AI ----------
 SCHREIBEN_BANDS=[(0,6,"Unter A2"),(7,14,"A2"),(15,20,"B1")]
@@ -318,7 +320,6 @@ def get_bundle_atts(bundle_id:int)->List[dict]:
     return q_all("SELECT kind,file_id,position FROM media_bundle_attachments WHERE bundle_id=%s ORDER BY position",(bundle_id,))
 
 async def send_attachments(chat_id:int, atts:List[dict]):
-    # يرسل صور/فويس/أوديو بالترتيب
     for a in atts:
         try:
             if a["kind"]=="photo":   await bot.send_photo(chat_id, a["file_id"])
@@ -339,6 +340,19 @@ async def start(msg:Message):
 async def dbinfo(msg:Message):
     qz=q_one("SELECT COUNT(*) AS n FROM quizzes")["n"]; qs=q_one("SELECT COUNT(*) AS n FROM questions")["n"]; rs=q_one("SELECT COUNT(*) AS n FROM responses")["n"]
     await msg.answer(f"🗄️ DB: PostgreSQL\n🧪 Quizzes: <b>{qz}</b> — Questions: <b>{qs}</b> — Responses: <b>{rs}</b>")
+
+# أزرار الرجوع
+@dp.message(F.text == BTN_BACK_HOME)
+async def back_home(msg: Message, state: FSMContext):
+    if not await ensure_owner(msg): return
+    await state.clear()
+    await msg.answer("تم الرجوع للبداية.", reply_markup=owner_kb())
+
+@dp.message(F.text == BTN_BACK_STEP)
+async def back_step(msg: Message, state: FSMContext):
+    if not await ensure_owner(msg): return
+    await state.clear()
+    await msg.answer("رجعنا خطوة (تمت إعادة الضبط).", reply_markup=owner_kb())
 
 # ---------- إنشاء/عرض/تعديل/حذف ----------
 @dp.message(F.text==BTN_NEWQUIZ)
@@ -423,7 +437,6 @@ async def q_text(msg:Message, state:FSMContext):
     q_exec("INSERT INTO questions(quiz_id,text,created_at) VALUES (%s,%s,%s)",(qid,text,_now().isoformat()))
     new=q_one("SELECT id FROM questions WHERE quiz_id=%s ORDER BY id DESC LIMIT 1",(qid,))["id"]
     await state.update_data(question_id=new)
-    # اختيار وضع المرفقات
     kb = attach_mode_kb()
     await state.set_state(BuildStates.waiting_attach_mode)
     await msg.answer("اختَر وضع المرفقات لهذا السؤال:", reply_markup=kb.as_markup())
@@ -431,7 +444,7 @@ async def q_text(msg:Message, state:FSMContext):
 @dp.callback_query(F.data.startswith("attach_mode:"))
 async def choose_attach_mode(cb:CallbackQuery, state:FSMContext):
     mode=cb.data.split(":")[1]
-    d=await state.get_data(); qid=d["question_id"]; quiz_id=d["quiz_id"]
+    d=await state.get_data(); quiz_id=d["quiz_id"]
     if mode=="none":
         await state.set_state(BuildStates.waiting_options_count)
         return await cb.message.answer("كم عدد الخيارات؟ (2..10)")
@@ -547,7 +560,6 @@ async def bundq_page(cb:CallbackQuery, state:FSMContext):
 @dp.callback_query(F.data.startswith("bundq:"))
 async def bundq_pick(cb:CallbackQuery, state:FSMContext):
     await state.update_data(bundle_quiz_id=int(cb.data.split(":")[1]))
-    # أنشئ حزمة جديدة وفورًا اطلب الملفات
     q_exec("INSERT INTO media_bundles(quiz_id,created_at) VALUES (%s,%s)",((await state.get_data())["bundle_quiz_id"], _now().isoformat()))
     bid=q_one("SELECT id FROM media_bundles WHERE quiz_id=%s ORDER BY id DESC LIMIT 1",((await state.get_data())["bundle_quiz_id"],))["id"]
     await state.update_data(active_bundle_id=bid, bundle_pos=0)
@@ -679,16 +691,14 @@ async def perform_import(msg:Message, payload:Dict, state:FSMContext):
         q_exec("INSERT INTO media_bundles(quiz_id,created_at) VALUES (%s,%s)",(new_qid,b.get("created_at",_now().isoformat())))
         nb=q_one("SELECT id FROM media_bundles WHERE quiz_id=%s ORDER BY id DESC LIMIT 1",(new_qid,))["id"]
         for a in b.get("attachments",[]): q_exec("INSERT INTO media_bundle_attachments(bundle_id,kind,file_id,position) VALUES (%s,%s,%s,%s)",(nb,a["kind"],a["file_id"],a["position"]))
-    id_map={}
     for qu in payload.get("questions",[]):
         q_exec("INSERT INTO questions(quiz_id,text,created_at,media_bundle_id) VALUES (%s,%s,%s,%s)",(new_qid,qu["text"],qu.get("created_at",_now().isoformat()),qu.get("media_bundle_id")))
         nq=q_one("SELECT id FROM questions WHERE quiz_id=%s ORDER BY id DESC LIMIT 1",(new_qid,))["id"]
-        id_map[qu["id"]]=nq
         for o in qu.get("options",[]): q_exec("INSERT INTO options(question_id,option_index,text,is_correct) VALUES (%s,%s,%s,%s)",(nq,o["option_index"],o["text"],o["is_correct"]))
         for a in qu.get("attachments",[]): q_exec("INSERT INTO question_attachments(question_id,kind,file_id,position) VALUES (%s,%s,%s,%s)",(nq,a["kind"],a["file_id"],a["position"]))
     await state.clear(); await msg.answer(f"✅ تم الاستيراد إلى اختبار جديد: {new_qid}")
 
-# ---------- نشر كـ Quiz Polls + إرسال المرفقات قبل السؤال ----------
+# ---------- نشر + مرفقات ----------
 def dur_kb():
     kb=InlineKeyboardBuilder()
     kb.button(text="⏱️ 12 ساعة", callback_data="dur:12")
@@ -732,13 +742,11 @@ async def do_publish(chat_id:int, quiz_id:int, hours:Optional[int]):
     sent=0
     for idx,r in enumerate(qs,1):
         try:
-            # أرسل المرفقات (أولاً مرفقات السؤال، وإذا لا توجد فاستخدم حزمة مشتركة)
             atts=get_question_atts(r["id"])
             if not atts and r["media_bundle_id"]:
                 atts=get_bundle_atts(r["media_bundle_id"])
             if atts:
                 await send_attachments(chat_id, atts)
-            # أرسل الاستفتاء
             opts=q_all("SELECT option_index,text,is_correct FROM options WHERE question_id=%s ORDER BY option_index",(r["id"],))
             options=[o["text"] for o in opts]
             if not options: continue
@@ -748,7 +756,7 @@ async def do_publish(chat_id:int, quiz_id:int, hours:Optional[int]):
                                   correct_option_id=correct, is_anonymous=False, reply_markup=kb.as_markup())
             q_exec("""INSERT INTO sent_polls(chat_id,quiz_id,question_id,poll_id,message_id,expires_at,is_closed)
                       VALUES (%s,%s,%s,%s,%s,%s,0)""",(chat_id,quiz_id,r["id"],m.poll.id,m.message_id,expires))
-            sent+=1; await asyncio.sleep(0.6)  # Flood control
+            sent+=1; await asyncio.sleep(0.6)
         except TelegramRetryAfter as e:
             await asyncio.sleep(int(e.retry_after)+1)
         except TelegramBadRequest as e:
@@ -759,7 +767,7 @@ async def do_publish(chat_id:int, quiz_id:int, hours:Optional[int]):
 async def cb_done(cb:CallbackQuery):
     await cb.answer("تم 👍", show_alert=False)
 
-# ---------- إغلاق تلقائي للاستفتاءات ----------
+# ---------- إغلاق تلقائي ----------
 async def auto_closer():
     while True:
         try:
@@ -773,7 +781,7 @@ async def auto_closer():
         except Exception: pass
         await asyncio.sleep(30)
 
-# ---------- Poll answers: تسجيل + أسماء + HL ----------
+# ---------- Poll answers ----------
 @dp.poll_answer()
 async def on_poll_answer(pa:PollAnswer):
     pid=pa.poll_id; uid=pa.user.id
@@ -786,31 +794,10 @@ async def on_poll_answer(pa:PollAnswer):
     q_exec("""INSERT INTO responses(chat_id,user_id,question_id,option_index,is_correct,answered_at)
               VALUES (%s,%s,%s,%s,%s,%s)
               ON CONFLICT (chat_id,user_id,question_id) DO NOTHING""",(chat_id,uid,qid,chosen,is_ok,_now().isoformat()))
-    # حفظ الاسم
     q_exec("""INSERT INTO participant_names(origin_chat_id,user_id,quiz_id,name)
               VALUES (%s,%s,%s,%s)
               ON CONFLICT (origin_chat_id,user_id,quiz_id) DO UPDATE SET name=EXCLUDED.name""",
            (chat_id,uid,quiz_id,hname(pa.user)))
-    # لو HL — عرض نتيجة نهائية عند الانتهاء
-    prof=q_one("SELECT grading_profile FROM quizzes WHERE id=%s",(quiz_id,))
-    if prof and prof["grading_profile"]=="HL_B1_DTZ":
-        ids=[r["id"] for r in q_all("SELECT id FROM questions WHERE quiz_id=%s ORDER BY id",(quiz_id,))]
-        total=len(ids)
-        row=q_one("""SELECT COUNT(*) AS answered, COALESCE(SUM(is_correct),0) AS correct
-                     FROM responses WHERE chat_id=%s AND user_id=%s AND question_id=ANY(%s)""",(chat_id,uid,ids))
-        if int(row["answered"] or 0)>=total>0:
-            correct=int(row["correct"] or 0); level=map_level(correct,HL_BANDS)
-            q_exec("""INSERT INTO hl_results(origin_chat_id,quiz_id,user_id,correct_count,total_count,level,finished_at)
-                      VALUES (%s,%s,%s,%s,%s,%s,%s)
-                      ON CONFLICT (origin_chat_id,quiz_id,user_id) DO UPDATE
-                      SET correct_count=EXCLUDED.correct_count,total_count=EXCLUDED.total_count,level=EXCLUDED.level,finished_at=EXCLUDED.finished_at""",
-                   (chat_id,quiz_id,uid,correct,total,level,_now().isoformat()))
-            await bot.send_message(chat_id,
-                f"🧠 <b>Hören & Lesen — النتيجة النهائية</b>\n"
-                f"👤 {html.escape(hname(pa.user))}\n"
-                f"📊 <b>{correct}/{total}</b>\n"
-                f"🎯 المستوى: <b>{level}</b>"
-            )
 
 # ---------- لوحة النتائج ----------
 @dp.message(F.text==BTN_SCORE)
@@ -829,11 +816,10 @@ async def scoreboard(msg:Message):
     lines=[f"🏆 <b>لوحة النتائج — {html.escape(title)}</b>"]
     for i,r in enumerate(data,1):
         name=r["name"] or f"UID {r['user_id']}"; correct=int(r["correct"] or 0); answered=int(r["answered"] or 0)
-        level=f" — <i>{map_level(correct,HL_BANDS)}</i>" if prof=="HL_B1_DTZ" else ""
-        lines.append(f"{i}. {html.escape(name)}: <b>{correct}</b>/{answered if answered else total}{level}")
+        lines.append(f"{i}. {html.escape(name)}: <b>{correct}</b>/{answered if answered else total}")
     await msg.answer("\n".join(lines))
 
-# ---------- تعيين HL ----------
+# ---------- Hören & Lesen تعيين ----------
 @dp.message(F.text==BTN_HL_PROFILE)
 async def hl_set(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
@@ -891,7 +877,8 @@ def fmt_countdown(delta:timedelta)->str:
 
 @dp.callback_query(F.data.startswith("briefdur:"))
 async def brief_duration(cb:CallbackQuery, state:FSMContext):
-    if not is_owner(cb.from_user.id): return await cb.answer("للمالك فقط", show_alert=True)
+    if cb.from_user.id != OWNER_ID:
+        return await cb.answer("للمالك فقط", show_alert=True)
     act=cb.data.split(":")[1]; data=await state.get_data(); prompt=data.get("prompt","")
     if act=="stop":
         close_window(cb.message.chat.id); await cb.message.answer("⛔ تم إيقاف استقبال البريفات."); return await cb.answer()
@@ -917,7 +904,6 @@ async def brief_custom(msg:Message, state:FSMContext):
     q_exec("UPDATE brief_windows SET ann_message_id=%s WHERE id=%s",(m.message_id,bid))
     await state.clear()
 
-# يعمل فقط عندما لا توجد حالة نشطة: استقبال البريفات خلال النافذة المفتوحة
 @dp.message(StateFilter(None), F.text)
 async def maybe_brief(msg:Message):
     win=get_open_window(msg.chat.id)
@@ -935,7 +921,6 @@ async def maybe_brief(msg:Message):
         f"🎯 المستوى: <b>{lvl}</b>" + (f"\n📝 ملاحظات: {fb}" if fb else "")
     )
 
-# تحديث العدّاد كل ~120 ثانية
 async def brief_countdown_updater():
     while True:
         try:
