@@ -20,13 +20,11 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 
-# ---------- OpenAI (اختياري) ----------
 try:
     from openai import OpenAI
 except Exception:
     OpenAI = None  # type: ignore
 
-# ---------- ENV ----------
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
@@ -35,7 +33,6 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 if not BOT_TOKEN or not OWNER_ID or not DATABASE_URL:
     raise SystemExit("Set BOT_TOKEN, OWNER_ID, DATABASE_URL")
 
-# ---------- BOT ----------
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 
@@ -142,7 +139,7 @@ def ensure_schema():
     for ddl in ddls: q_exec(ddl)
 ensure_schema()
 
-# ---------- UI labels ----------
+# ---------- UI ----------
 BTN_NEWQUIZ="🆕 إنشاء اختبار"; BTN_ADDQ="➕ إضافة سؤال"; BTN_LISTQUIZ="📚 عرض الاختبارات"
 BTN_LISTQ="📖 عرض الأسئلة"; BTN_EDITQUIZ="🛠️ تعديل اختبار"; BTN_DELQUIZ="🗑️ حذف اختبار"
 BTN_BUNDLES="📎 مرفقات مشتركة"; BTN_MERGE="🔗 دمج الاختبارات"; BTN_EXPORT="📤 تصدير اختبار"
@@ -174,7 +171,7 @@ def hname(u)->str:
 def slug(s:str)->str:
     s=re.sub(r"\s+","-",s.strip()); s=re.sub(r"[^\w\-]+","",s,flags=re.U); return s[:50] or "quiz"
 
-# --- حارس عام لغير المالك فقط ---
+# --- Callback guard for NON-owner only ---
 ADMIN_PREFIX = ("addq","editq","delq","merge_","exportq","pub","dur","sethl","briefdur","pickbundle","attach_mode")
 @dp.callback_query(
     F.from_user.id != OWNER_ID,
@@ -328,7 +325,7 @@ async def send_attachments(chat_id:int, atts:List[dict]):
         except Exception: pass
         await asyncio.sleep(0.2)
 
-# ---------- /start ----------
+# ---------- /start & back buttons ----------
 @dp.message(Command("start"))
 async def start(msg:Message):
     if is_owner(msg.from_user.id):
@@ -341,7 +338,6 @@ async def dbinfo(msg:Message):
     qz=q_one("SELECT COUNT(*) AS n FROM quizzes")["n"]; qs=q_one("SELECT COUNT(*) AS n FROM questions")["n"]; rs=q_one("SELECT COUNT(*) AS n FROM responses")["n"]
     await msg.answer(f"🗄️ DB: PostgreSQL\n🧪 Quizzes: <b>{qz}</b> — Questions: <b>{qs}</b> — Responses: <b>{rs}</b>")
 
-# أزرار الرجوع
 @dp.message(F.text == BTN_BACK_HOME)
 async def back_home(msg: Message, state: FSMContext):
     if not await ensure_owner(msg): return
@@ -354,7 +350,7 @@ async def back_step(msg: Message, state: FSMContext):
     await state.clear()
     await msg.answer("رجعنا خطوة (تمت إعادة الضبط).", reply_markup=owner_kb())
 
-# ---------- إنشاء/عرض/تعديل/حذف ----------
+# ---------- CRUD Quizzes ----------
 @dp.message(F.text==BTN_NEWQUIZ)
 async def new_quiz(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
@@ -415,7 +411,7 @@ async def delq_do(cb:CallbackQuery, state:FSMContext):
     q_exec("DELETE FROM quizzes WHERE id=%s",(qid,))
     await state.clear(); await cb.message.answer("🗑️ تم الحذف."); await cb.answer()
 
-# ---------- إضافة سؤال + مرفقات ----------
+# ---------- Add Question + Attachments ----------
 @dp.message(F.text==BTN_ADDQ)
 async def addq_start(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
@@ -475,7 +471,6 @@ async def pickbundle_apply(cb:CallbackQuery, state:FSMContext):
     await cb.message.answer("تم ربط الحزمة. كم عدد الخيارات؟ (2..10)")
     await cb.answer()
 
-# استقبال مرفقات السؤال (own)
 @dp.message(BuildStates.waiting_q_attachments, F.photo)
 async def qatt_photo(msg:Message, state:FSMContext):
     d=await state.get_data(); qid=d["question_id"]; pos=int(d.get("att_pos",0))
@@ -501,7 +496,6 @@ async def qatt_done(cb:CallbackQuery, state:FSMContext):
     await cb.message.answer("تم حفظ المرفقات. كم عدد الخيارات؟ (2..10)")
     await cb.answer()
 
-# خيارات السؤال (حتى 10)
 @dp.message(BuildStates.waiting_options_count, F.text.regexp(r"^\d{1,2}$"))
 async def q_opts_count(msg:Message, state:FSMContext):
     n=int(msg.text)
@@ -524,7 +518,7 @@ async def q_correct(msg:Message, state:FSMContext):
     q_exec("UPDATE options SET is_correct=1 WHERE question_id=%s AND option_index=%s",(qid,i))
     await state.clear(); await msg.answer("✅ تمت إضافة السؤال.", reply_markup=owner_kb())
 
-# ---------- عرض الأسئلة ----------
+# ---------- List Questions ----------
 @dp.message(F.text==BTN_LISTQ)
 async def listq(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
@@ -546,7 +540,7 @@ async def listq_show(cb:CallbackQuery, state:FSMContext):
         out.append(f"Q{r['id']}: {r['text']}" + "".join([f"\n   {chr(0x61+o['option_index'])}) {o['text']}{' ✅' if o['is_correct'] else ''}" for o in opts]))
     await cb.message.answer("\n".join(out)); await cb.answer(); await state.clear()
 
-# ---------- Bundles (مرفقات مشتركة) ----------
+# ---------- Bundles ----------
 @dp.message(F.text==BTN_BUNDLES)
 async def bundles_entry(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
@@ -593,7 +587,7 @@ async def bundle_done(cb:CallbackQuery, state:FSMContext):
     await cb.message.answer(f"✅ تم حفظ حزمة {d.get('active_bundle_id')}.", reply_markup=owner_kb())
     await cb.answer()
 
-# ---------- دمج ----------
+# ---------- Merge ----------
 @dp.message(F.text==BTN_MERGE)
 async def merge_start(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
@@ -628,7 +622,7 @@ async def merge_do(cb:CallbackQuery, state:FSMContext):
     q_exec("UPDATE quizzes SET is_archived=1 WHERE id=%s",(src,))
     await state.clear(); await cb.message.answer(f"✅ تم نقل {len(qs)} سؤالًا وأرشفة المصدر."); await cb.answer()
 
-# ---------- تصدير/استيراد ----------
+# ---------- Export / Import ----------
 def build_export_payload(quiz_id:int)->Dict:
     qz=q_one("SELECT id,title,created_by,created_at,grading_profile FROM quizzes WHERE id=%s",(quiz_id,))
     qs=q_all("SELECT id,text,created_at,media_bundle_id FROM questions WHERE quiz_id=%s ORDER BY id",(quiz_id,))
@@ -698,7 +692,7 @@ async def perform_import(msg:Message, payload:Dict, state:FSMContext):
         for a in qu.get("attachments",[]): q_exec("INSERT INTO question_attachments(question_id,kind,file_id,position) VALUES (%s,%s,%s,%s)",(nq,a["kind"],a["file_id"],a["position"]))
     await state.clear(); await msg.answer(f"✅ تم الاستيراد إلى اختبار جديد: {new_qid}")
 
-# ---------- نشر + مرفقات ----------
+# ---------- Publish ----------
 def dur_kb():
     kb=InlineKeyboardBuilder()
     kb.button(text="⏱️ 12 ساعة", callback_data="dur:12")
@@ -767,7 +761,6 @@ async def do_publish(chat_id:int, quiz_id:int, hours:Optional[int]):
 async def cb_done(cb:CallbackQuery):
     await cb.answer("تم 👍", show_alert=False)
 
-# ---------- إغلاق تلقائي ----------
 async def auto_closer():
     while True:
         try:
@@ -781,25 +774,7 @@ async def auto_closer():
         except Exception: pass
         await asyncio.sleep(30)
 
-# ---------- Poll answers ----------
-@dp.poll_answer()
-async def on_poll_answer(pa:PollAnswer):
-    pid=pa.poll_id; uid=pa.user.id
-    sp=q_one("SELECT chat_id,quiz_id,question_id FROM sent_polls WHERE poll_id=%s",(pid,))
-    if not sp: return
-    chat_id,quiz_id,qid=sp["chat_id"],sp["quiz_id"],sp["question_id"]
-    chosen=pa.option_ids[0] if pa.option_ids else -1
-    ok=q_one("SELECT is_correct FROM options WHERE question_id=%s AND option_index=%s",(qid,chosen))
-    is_ok=int(ok["is_correct"]) if ok else 0
-    q_exec("""INSERT INTO responses(chat_id,user_id,question_id,option_index,is_correct,answered_at)
-              VALUES (%s,%s,%s,%s,%s,%s)
-              ON CONFLICT (chat_id,user_id,question_id) DO NOTHING""",(chat_id,uid,qid,chosen,is_ok,_now().isoformat()))
-    q_exec("""INSERT INTO participant_names(origin_chat_id,user_id,quiz_id,name)
-              VALUES (%s,%s,%s,%s)
-              ON CONFLICT (origin_chat_id,user_id,quiz_id) DO UPDATE SET name=EXCLUDED.name""",
-           (chat_id,uid,quiz_id,hname(pa.user)))
-
-# ---------- لوحة النتائج ----------
+# ---------- Scoreboard ----------
 @dp.message(F.text==BTN_SCORE)
 async def scoreboard(msg:Message):
     if not await ensure_owner(msg): return
@@ -819,7 +794,7 @@ async def scoreboard(msg:Message):
         lines.append(f"{i}. {html.escape(name)}: <b>{correct}</b>/{answered if answered else total}")
     await msg.answer("\n".join(lines))
 
-# ---------- Hören & Lesen تعيين ----------
+# ---------- HL Profile ----------
 @dp.message(F.text==BTN_HL_PROFILE)
 async def hl_set(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
@@ -835,10 +810,18 @@ async def sethl_do(cb:CallbackQuery, state:FSMContext):
     q_exec("UPDATE quizzes SET grading_profile='HL_B1_DTZ' WHERE id=%s",(int(cb.data.split(":")[1]),))
     await state.clear(); await cb.message.answer("✅ تم تعيين Hören & Lesen."); await cb.answer()
 
-# ---------- Schreiben (بريف) ----------
-@dp.message(F.text==BTN_BRIEF)
-async def brief_admin(msg:Message, state:FSMContext):
+# ---------- Brief (Schreiben) ----------
+@dp.message(Command("brief"))
+async def brief_cmd(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
+    await state.set_state(BriefStates.waiting_prompt)
+    await msg.answer("✍️ أرسل نص سؤال البريف/الإيميل (B1 DTZ):")
+
+@dp.message(F.text.in_({BTN_BRIEF, "زر إرسال البريف", "زر ارسال البريف"}))
+async def brief_admin_btn(msg:Message, state:FSMContext):
+    if not await ensure_owner(msg): return
+    # لو كان في حالة ثانية معلّقة، نظّفها
+    await state.clear()
     await state.set_state(BriefStates.waiting_prompt)
     await msg.answer("✍️ أرسل نص سؤال البريف/الإيميل (B1 DTZ):")
 
@@ -944,7 +927,7 @@ async def brief_countdown_updater():
         except Exception: pass
         await asyncio.sleep(120)
 
-# ---------- حذف كل شيء ----------
+# ---------- Wipe ----------
 @dp.message(F.text==BTN_WIPE_ALL)
 async def wipe_all(msg:Message):
     if not await ensure_owner(msg): return
