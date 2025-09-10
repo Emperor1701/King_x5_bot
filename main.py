@@ -870,7 +870,7 @@ async def ai_grade(text: str) -> Tuple[int, str, Dict]:
         return base, lvl, {"error": str(e)}
 
 @dp.message(
-    StateFilter("*"),
+    StateFilter(None),
     F.text,
     ~F.text.in_(ALL_BTN_TEXTS),
     ~F.text.startswith("/"),
