@@ -237,6 +237,16 @@ async def attach_file_to_question(question_id:int, kind:str, file_id:str):
     q_exec("INSERT INTO question_attachments(question_id,kind,file_id,position) VALUES (%s,%s,%s,%s)",
            (question_id, kind, file_id, pos))
 
+# --------- NEW: مستوى من مجموع 45 نقطة ---------
+def level_from_points(points:int)->str:
+    # المجال القياسي المطلوب 0..45
+    if points <= 19:
+        return "Unter A2"
+    elif points <= 32:
+        return "A2"
+    else:
+        return "B1"
+
 # --- Callback guard for NON-owner only ---
 @dp.callback_query(
     F.from_user.id != OWNER_ID,
@@ -1056,6 +1066,56 @@ async def on_poll_answer(pa: PollAnswer):
         )
     except Exception:
         pass
+
+    # -------- NEW: إعلان النتيجة فور إكمال جميع الأسئلة --------
+    # إجمالي عدد الأسئلة المنشورة لهذا الاختبار في هذه المحادثة
+    total_q_row = q_one(
+        "SELECT COUNT(*) AS c FROM sent_polls WHERE chat_id=%s AND quiz_id=%s",
+        (chat_id, quiz_id)
+    )
+    total_q = int(total_q_row["c"] or 0)
+
+    if total_q > 0:
+        # عدد الأسئلة التي أجابها هذا المستخدم (مميزًا حسب question_id)
+        answered_row = q_one(
+            """SELECT COUNT(DISTINCT question_id) AS c
+               FROM quiz_responses
+               WHERE chat_id=%s AND quiz_id=%s AND user_id=%s""",
+            (chat_id, quiz_id, u.id)
+        )
+        answered = int(answered_row["c"] or 0)
+
+        # إذا أكمل كل الأسئلة، احسب الصحيح وارسِل النتيجة
+        if answered >= total_q:
+            correct_row = q_one(
+                """SELECT COALESCE(SUM(is_correct),0) AS s
+                   FROM quiz_responses
+                   WHERE chat_id=%s AND quiz_id=%s AND user_id=%s""",
+                (chat_id, quiz_id, u.id)
+            )
+            correct = int(correct_row["s"] or 0)
+
+            # تحويل الدرجة لسُلَّم 45 نقطة
+            points_45 = round((correct / total_q) * 45)
+            level = level_from_points(points_45)
+
+            # اسم المستخدم المُعلن
+            uname = ("@" + u.username) if getattr(u, "username", None) else (u.full_name or f"UID {u.id}")
+
+            try:
+                await bot.send_message(
+                    chat_id,
+                    (
+                        "🎓 <b>النتيجة النهائية</b>\n"
+                        f"👤 {html.escape(uname)}\n"
+                        f"✅ الصحيحة: <b>{correct}</b> / {total_q}\n"
+                        f"🧮 النقاط (من 45): <b>{points_45}</b>/45\n"
+                        f"🎯 المستوى: <b>{level}</b>"
+                    )
+                )
+            except Exception:
+                pass
+    # -------- END NEW --------
 
 # ---------- Leaderboard ----------
 @dp.message(F.text==BTN_SCORE)
