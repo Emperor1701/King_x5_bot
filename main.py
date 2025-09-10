@@ -60,6 +60,15 @@ def q_all(sql:str, params:tuple|list|None=None)->List[dict]:
             cur.execute(sql, params or ())
             return cur.fetchall()
 
+def insert_returning_id(sql:str, params:tuple|list|None=None)->int:
+    """Execute INSERT ... RETURNING id and return the id safely (no race)."""
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql + " RETURNING id", params or ())
+            row = cur.fetchone()
+        conn.commit()
+    return int(row["id"] if isinstance(row, dict) else row[0])
+
 # ---------- Schema ----------
 def ensure_schema():
     ddls = [
@@ -117,6 +126,42 @@ BTN_PUBLISH="🚀 نشر اختبار"; BTN_WIPE_ALL="🧹 حذف كل الاخ�
 BTN_SCORE="🏆 لوحة النتائج"; BTN_BACK_HOME="↩️ العودة للبداية"; BTN_BACK_STEP="⬅️ رجوع للخلف"
 BTN_BRIEF="✉️ زر إرسال البريف"
 
+def owner_kb()->ReplyKeyboardMarkup:
+    rows=[
+        [KeyboardButton(text=BTN_BACK_HOME), KeyboardButton(text=BTN_BACK_STEP)],
+        [KeyboardButton(text=BTN_NEWQUIZ), KeyboardButton(text=BTN_ADDQ)],
+        [KeyboardButton(text=BTN_LISTQUIZ), KeyboardButton(text=BTN_EDITQUIZ)],
+        [KeyboardButton(text=BTN_DELQUIZ), KeyboardButton(text=BTN_BRIEF)],
+        [KeyboardButton(text=BTN_WIPE_ALL), KeyboardButton(text=BTN_SCORE)],
+        [KeyboardButton(text=BTN_PUBLISH), KeyboardButton(text=BTN_BUNDLES)],
+        [KeyboardButton(text=BTN_MERGE), KeyboardButton(text=BTN_EXPORT)],
+        [KeyboardButton(text=BTN_IMPORT)]
+    ]
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="اختر أمرًا من الأزرار 👇"
+    )
+
+ALL_BTN_TEXTS = {
+    BTN_BACK_HOME, BTN_BACK_STEP, BTN_NEWQUIZ, BTN_ADDQ, BTN_LISTQUIZ, BTN_EDITQUIZ,
+    BTN_DELQUIZ, BTN_BRIEF, BTN_WIPE_ALL, BTN_SCORE, BTN_PUBLISH, BTN_BUNDLES,
+    BTN_MERGE, BTN_EXPORT, BTN_IMPORT
+}
+
+def done_button_kb(tag: str):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✔️ تم", callback_data=f"done:{tag}")
+    kb.button(text="❌ بدون مرفقات", callback_data=f"skip:{tag}")
+    kb.adjust(2); return kb.as_markup()
+
+def inline_confirm_kb(tag:str):
+    kb=InlineKeyboardBuilder()
+    kb.button(text="✅ تأكيد", callback_data=f"{tag}:yes")
+    kb.button(text="❌ إلغاء", callback_data=f"{tag}:no")
+    kb.adjust(2); return kb.as_markup()
+
 # ---------- Helpers ----------
 def _now()->datetime: return datetime.now(timezone.utc)
 def is_owner(uid:int)->bool: return uid==OWNER_ID
@@ -155,31 +200,6 @@ class BriefStates(StatesGroup):
     waiting_prompt=State()
     waiting_duration=State()
     waiting_custom=State()
-
-# ---------- KBs ----------
-def owner_kb()->ReplyKeyboardMarkup:
-    rows=[
-        [KeyboardButton(text=BTN_BACK_HOME), KeyboardButton(text=BTN_BACK_STEP)],
-        [KeyboardButton(text=BTN_NEWQUIZ), KeyboardButton(text=BTN_ADDQ)],
-        [KeyboardButton(text=BTN_LISTQUIZ), KeyboardButton(text=BTN_EDITQUIZ)],
-        [KeyboardButton(text=BTN_DELQUIZ), KeyboardButton(text=BTN_BRIEF)],
-        [KeyboardButton(text=BTN_WIPE_ALL), KeyboardButton(text=BTN_SCORE)],
-        [KeyboardButton(text=BTN_PUBLISH), KeyboardButton(text=BTN_BUNDLES)],
-        [KeyboardButton(text=BTN_MERGE), KeyboardButton(text=BTN_EXPORT)],
-        [KeyboardButton(text=BTN_IMPORT)]
-    ]; return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
-
-def done_button_kb(tag: str):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✔️ تم", callback_data=f"done:{tag}")
-    kb.button(text="❌ بدون مرفقات", callback_data=f"skip:{tag}")
-    kb.adjust(2); return kb.as_markup()
-
-def inline_confirm_kb(tag:str):
-    kb=InlineKeyboardBuilder()
-    kb.button(text="✅ تأكيد", callback_data=f"{tag}:yes")
-    kb.button(text="❌ إلغاء", callback_data=f"{tag}:no")
-    kb.adjust(2); return kb.as_markup()
 
 # ---------- Parsers ----------
 _option_line_re = re.compile(
@@ -242,25 +262,28 @@ async def new_quiz(msg:Message, state:FSMContext):
 @dp.message(BuildStates.waiting_title, F.text)
 async def save_quiz_title(msg:Message, state:FSMContext):
     title = msg.text.strip()
-    q_exec("INSERT INTO quizzes(title,created_by,created_at) VALUES (%s,%s,%s)", (title, msg.from_user.id, _now().isoformat()))
+    qid = insert_returning_id(
+        "INSERT INTO quizzes(title,created_by,created_at) VALUES (%s,%s,%s)",
+        (title, msg.from_user.id, _now().isoformat())
+    )
     await state.clear()
-    await msg.answer("✅ تم إنشاء الاختبار.", reply_markup=owner_kb())
+    await msg.answer(f"✅ تم إنشاء الاختبار (ID {qid}).", reply_markup=owner_kb())
 
 # ---------- List quizzes ----------
 @dp.message(F.text==BTN_LISTQUIZ)
 async def list_quizzes(msg:Message):
     if not await ensure_owner(msg): return
     rows = q_all("SELECT id,title FROM quizzes ORDER BY id DESC")
-    if not rows: return await msg.answer("لا يوجد اختبارات.\nأنشئ واحدًا أولاً.")
+    if not rows: return await msg.answer("لا يوجد اختبارات.\nأنشئ واحدًا أولاً.", reply_markup=owner_kb())
     txt = "📚 <b>الاختبارات</b>:\n" + "\n".join([f"• {r['id']}: {html.escape(r['title'])}" for r in rows[:100]])
-    await msg.answer(txt)
+    await msg.answer(txt, reply_markup=owner_kb())
 
 # ---------- Edit quiz title ----------
 @dp.message(F.text==BTN_EDITQUIZ)
 async def editquiz(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
     rows=q_all("SELECT id,title FROM quizzes ORDER BY id DESC")
-    if not rows: return await msg.answer("لا يوجد اختبارات.")
+    if not rows: return await msg.answer("لا يوجد اختبارات.", reply_markup=owner_kb())
     kb=InlineKeyboardBuilder()
     for r in rows[:50]:
         kb.button(text=f"✏️ {r['id']} — {r['title']}", callback_data=f"editq:{r['id']}")
@@ -288,7 +311,7 @@ async def apply_edit(msg:Message, state:FSMContext):
 async def delquiz(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
     rows=q_all("SELECT id,title FROM quizzes ORDER BY id DESC")
-    if not rows: return await msg.answer("لا يوجد اختبارات.")
+    if not rows: return await msg.answer("لا يوجد اختبارات.", reply_markup=owner_kb())
     kb=InlineKeyboardBuilder()
     for r in rows[:50]:
         kb.button(text=f"🗑️ {r['id']} — {r['title']}", callback_data=f"delq:{r['id']}")
@@ -309,7 +332,7 @@ async def delq_apply(cb:CallbackQuery):
     qid, decision = rest.split(":")
     qid=int(qid)
     if decision=="no":
-        await cb.message.answer("تم الإلغاء ✅"); return await cb.answer()
+        await cb.message.answer("تم الإلغاء ✅", reply_markup=owner_kb()); return await cb.answer()
     # cascade delete
     q_exec("DELETE FROM options WHERE question_id IN (SELECT id FROM questions WHERE quiz_id=%s)", (qid,))
     q_exec("DELETE FROM question_attachments WHERE question_id IN (SELECT id FROM questions WHERE quiz_id=%s)", (qid,))
@@ -324,7 +347,7 @@ async def delq_apply(cb:CallbackQuery):
 async def addq_start(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
     rows=q_all("SELECT id,title FROM quizzes ORDER BY id DESC")
-    if not rows: return await msg.answer("لا يوجد اختبارات.\nأنشئ واحدًا أولاً.")
+    if not rows: return await msg.answer("لا يوجد اختبارات.\nأنشئ واحدًا أولاً.", reply_markup=owner_kb())
     kb=InlineKeyboardBuilder()
     for r in rows[:30]:
         kb.button(text=f"✅ {r['id']} — {r['title']}", callback_data=f"addq:{r['id']}")
@@ -346,36 +369,15 @@ async def addq_pick(cb:CallbackQuery, state:FSMContext):
     )
     await cb.answer()
 
-_option_line_re = re.compile(
-    r"""^\s*(
-        (\d+)[\)\.\-]\s*|([A-Za-z])[)\.\-]\s*|[\-\*\•]\s*
-    )?(?P<txt>.+?)\s*(?P<mark>(✅|\(\*\)|\*\)|\*\s*$))?\s*$""", re.X|re.U
-)
-
-def parse_q_block(text:str)->Tuple[str, List[Tuple[str,bool]]]:
-    lines=[l for l in (text.replace("\r","").split("\n")) if l.strip()]
-    if not lines: raise ValueError("نص فارغ.")
-    qline=lines[0].strip()
-    opts=[]
-    for l in lines[1:]:
-        m=_option_line_re.match(l)
-        if not m: continue
-        t=m.group("txt").strip()
-        if not t: continue
-        is_correct=bool(m.group("mark"))
-        opts.append((t,is_correct))
-    if len(opts)<2 or len(opts)>10:
-        raise ValueError("أدخل 2 إلى 10 خيارات.")
-    return qline, opts
-
 @dp.message(BuildStates.waiting_q_block, F.text)
 async def got_q_block(msg:Message, state:FSMContext):
     try:
         sel=(await state.get_data()); quiz_id=sel["quiz_id"]
         qtext, opts = parse_q_block(msg.text)
-        q_exec("INSERT INTO questions(quiz_id,text,created_at) VALUES (%s,%s,%s)",
-               (quiz_id, qtext, _now().isoformat()))
-        new_q=q_one("SELECT id FROM questions WHERE quiz_id=%s ORDER BY id DESC LIMIT 1",(quiz_id,))["id"]
+        new_q = insert_returning_id(
+            "INSERT INTO questions(quiz_id,text,created_at) VALUES (%s,%s,%s)",
+            (quiz_id, qtext, _now().isoformat())
+        )
         correct=None
         for i,(t,is_ok) in enumerate(opts):
             q_exec("INSERT INTO options(question_id,option_index,text,is_correct) VALUES (%s,%s,%s,%s)",
@@ -409,7 +411,7 @@ async def qatt_audio(msg:Message, state:FSMContext):
 async def after_atts(cb:CallbackQuery, state:FSMContext):
     d=await state.get_data()
     if not d.get("needs_correct", True):
-        await state.clear(); await cb.message.answer("🎯 تم الحفظ بالكامل."); return await cb.answer()
+        await state.clear(); await cb.message.answer("🎯 تم الحفظ بالكامل.", reply_markup=owner_kb()); return await cb.answer()
     await state.set_state(BuildStates.waiting_correct_index)
     await cb.message.answer(f"أرسل رقم الخيار الصحيح (1..{int(d['opt_count'])}):")
     await cb.answer()
@@ -427,16 +429,23 @@ async def set_correct(msg:Message, state:FSMContext):
 def get_open_window(chat_id:int):
     row=q_one("SELECT id,closes_at,prompt_text,ann_message_id FROM brief_windows WHERE origin_chat_id=%s AND is_open=1 ORDER BY id DESC LIMIT 1",(chat_id,))
     if not row: return None
-    if row["closes_at"]<=_now().isoformat():
+    # Defensive: if expired, close it here.
+    try:
+        closes = datetime.fromisoformat(row["closes_at"])
+    except Exception:
+        closes = _now()
+    if closes <= _now():
         q_exec("UPDATE brief_windows SET is_open=0 WHERE id=%s",(row["id"],)); return None
     return row
 
 def open_window(chat_id:int, owner:int, minutes:int, prompt:str)->Tuple[int,datetime]:
     q_exec("UPDATE brief_windows SET is_open=0 WHERE origin_chat_id=%s AND is_open=1",(chat_id,))
     opened=_now(); closes=opened+timedelta(minutes=minutes)
-    q_exec("""INSERT INTO brief_windows(origin_chat_id,opened_by,opened_at,closes_at,is_open,prompt_text)
-              VALUES (%s,%s,%s,%s,1,%s)""",(chat_id,owner,opened.isoformat(),closes.isoformat(),prompt))
-    bid=q_one("SELECT id FROM brief_windows WHERE origin_chat_id=%s ORDER BY id DESC LIMIT 1",(chat_id,))["id"]
+    bid = insert_returning_id(
+        """INSERT INTO brief_windows(origin_chat_id,opened_by,opened_at,closes_at,is_open,prompt_text)
+              VALUES (%s,%s,%s,%s,1,%s)""",
+        (chat_id,owner,opened.isoformat(),closes.isoformat(),prompt)
+    )
     return bid, closes
 
 def close_window(chat_id:int): q_exec("UPDATE brief_windows SET is_open=0 WHERE origin_chat_id=%s AND is_open=1",(chat_id,))
@@ -470,14 +479,15 @@ async def brief_set_duration(cb:CallbackQuery, state:FSMContext):
     act=cb.data.split(":")[1]
     data=await state.get_data(); prompt=data.get("prompt","")
     if act=="stop":
-        close_window(cb.message.chat.id); await cb.message.answer("⛔ تم إيقاف استقبال البريفات."); return await cb.answer()
+        close_window(cb.message.chat.id); await cb.message.answer("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
     if act=="custom":
         await state.set_state(BriefStates.waiting_custom); await cb.message.answer("أرسل عدد الدقائق (مثال: 45)"); return await cb.answer()
     minutes=int(act); bid, closes = open_window(cb.message.chat.id, cb.from_user.id, minutes, prompt)
+    mins_left = max(0, int((closes - _now()).total_seconds() // 60))
     txt=(f"📣 <b>سؤال البريف (B1 DTZ)</b>\n{html.escape(prompt)}\n\n"
-         f"⏱️ ينتهي خلال: <b>{(closes - _now()).seconds//60}د</b>\n"
+         f"⏱️ ينتهي خلال: <b>{mins_left}د</b>\n"
          f"أرسلوا نص البريف هنا برسالة واحدة.")
-    m=await cb.message.answer(txt)
+    m=await cb.message.answer(txt, reply_markup=owner_kb())
     q_exec("UPDATE brief_windows SET ann_message_id=%s WHERE id=%s",(m.message_id,bid))
     await state.clear(); await cb.answer()
 
@@ -485,10 +495,11 @@ async def brief_set_duration(cb:CallbackQuery, state:FSMContext):
 async def brief_custom_duration(msg:Message, state:FSMContext):
     minutes=int(msg.text); prompt=(await state.get_data()).get("prompt","")
     bid,closes=open_window(msg.chat.id,msg.from_user.id,minutes,prompt)
+    mins_left = max(0, int((closes - _now()).total_seconds() // 60))
     m=await msg.answer(
         f"📣 <b>سؤال البريف (B1 DTZ)</b>\n{html.escape(prompt)}\n\n"
-        f"⏱️ ينتهي خلال: <b>{(closes - _now()).seconds//60}د</b>\n"
-        f"أرسلوا نص البريف هنا برسالة واحدة."
+        f"⏱️ ينتهي خلال: <b>{mins_left}د</b>\n"
+        f"أرسلوا نص البريف هنا برسالة واحدة.", reply_markup=owner_kb()
     )
     q_exec("UPDATE brief_windows SET ann_message_id=%s WHERE id=%s",(m.message_id,bid))
     await state.clear()
@@ -526,10 +537,16 @@ async def ai_grade(text: str) -> Tuple[int, str, Dict]:
         lvl = "Unter A2" if base<=6 else ("A2" if base<=14 else "B1")
         return base, lvl, {"error": str(e)}
 
-@dp.message(StateFilter(None), F.text)
+@dp.message(
+    StateFilter(None),
+    F.text,
+    ~F.text.in_(ALL_BTN_TEXTS),
+    ~F.text.startswith("/")
+)
 async def collect_briefs(msg:Message):
     win=q_one("SELECT id FROM brief_windows WHERE origin_chat_id=%s AND is_open=1 ORDER BY id DESC LIMIT 1",(msg.chat.id,))
-    if not win: return
+    if not win: 
+        return  # لا تلتقط رسائل ما لم تكن نافذة بريف مفتوحة
     text=msg.text.strip()
     score, lvl, details = await ai_grade(text)
     fb=html.escape(details.get("feedback","")) if isinstance(details,dict) else ""
@@ -540,14 +557,15 @@ async def collect_briefs(msg:Message):
         f"📮 <b>Schreiben (B1 DTZ)</b>\n"
         f"👤 {html.escape(hname(msg.from_user))}\n"
         f"📊 <b>{score}/20</b>\n"
-        f"🎯 المستوى: <b>{lvl}</b>" + (f"\n📝 ملاحظات: {fb}" if fb else "")
+        f"🎯 المستوى: <b>{lvl}</b>" + (f"\n📝 ملاحظات: {fb}" if fb else ""),
+        reply_markup=owner_kb()
     )
 
 # ---------- Not-yet-implemented buttons (reply instead of silence) ----------
 @dp.message(F.text.in_({BTN_BUNDLES, BTN_MERGE, BTN_EXPORT, BTN_IMPORT, BTN_PUBLISH, BTN_SCORE}))
 async def placeholder(msg:Message):
     if not await ensure_owner(msg): return
-    await msg.answer("هذه الميزة ستُفعّل لاحقًا — الزر يعمل وتم الاستجابة ✅")
+    await msg.answer("هذه الميزة ستُفعّل لاحقًا — الزر يعمل وتم الاستجابة ✅", reply_markup=owner_kb())
 
 # ---------- Wipe All with confirmation ----------
 @dp.message(F.text==BTN_WIPE_ALL)
