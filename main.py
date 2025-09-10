@@ -11,7 +11,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, PollType
 from aiogram.types import (
     Message, CallbackQuery, PollAnswer,
-    ReplyKeyboardMarkup, KeyboardButton, FSInputFile
+    ReplyKeyboardMarkup, KeyboardButton, FSInputFile, File
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.filters import Command, StateFilter
@@ -247,11 +247,6 @@ def parse_q_block(text:str)->Tuple[str, List[Tuple[str,bool]]]:
         raise ValueError("الرجاء إدخال 2 إلى 10 خيارات ضمن الرسالة.")
     return qline, opts
 
-# ---------- Attachments helpers ----------
-async def save_attachment(question_id:int, kind:str, file_id:str, pos:int):
-    q_exec("INSERT INTO question_attachments(question_id,kind,file_id,position) VALUES (%s,%s,%s,%s)",
-           (question_id,kind,file_id,pos))
-
 # ---------- /start & back ----------
 @dp.message(Command("start"))
 async def start(msg:Message):
@@ -301,7 +296,7 @@ async def list_quizzes(msg:Message):
     kb.adjust(1)
     await msg.answer("اختر اختبارًا لعرض تفاصيله:", reply_markup=kb.as_markup())
 
-# ---------- NEW: List Questions button ----------
+# ---------- List Questions button ----------
 @dp.message(F.text==BTN_LISTQUESTIONS)
 async def list_questions_entry(msg:Message):
     if not await ensure_owner(msg): return
@@ -428,20 +423,15 @@ async def got_q_block(msg:Message, state:FSMContext):
             q_exec("INSERT INTO options(question_id,option_index,text,is_correct) VALUES (%s,%s,%s,%s)",
                    (new_q,i,t,1 if is_ok else 0))
             if is_ok: correct=i
-        await state.update_data(question_id=new_q, next_att_pos=0, opt_count=len(opts), needs_correct=(correct is None))
-        await state.set_state(BuildStates.waiting_q_attachments)
-        await msg.answer("✅ تم حفظ السؤال والخيارات.\nأرسل المرفقات (صور/فويس/أوديو). ثم اضغط ✔️ تم أو ❌ بدون مرفقات.", reply_markup=done_button_kb("qatt"))
+        await state.update_data(question_id=new_q, opt_count=len(opts), needs_correct=(correct is None))
+        await state.set_state(BuildStates.waiting_correct_index if correct is None else None)
+        if correct is None:
+            await msg.answer(f"أرسل رقم الخيار الصحيح (1..{int(len(opts))}):")
+        else:
+            await msg.answer("✅ تم الحفظ النهائي.", reply_markup=owner_kb())
+            await state.clear()
     except Exception as e:
         await msg.answer(f"⚠️ لم أفهم الرسالة: <code>{html.escape(str(e))}</code>")
-
-@dp.callback_query(F.data.in_({"done:qatt","skip:qatt"}))
-async def after_atts(cb:CallbackQuery, state:FSMContext):
-    d=await state.get_data()
-    if not d.get("needs_correct", True):
-        await state.clear(); await cb.message.answer("🎯 تم الحفظ بالكامل.", reply_markup=owner_kb()); return await cb.answer()
-    await state.set_state(BuildStates.waiting_correct_index)
-    await cb.message.answer(f"أرسل رقم الخيار الصحيح (1..{int(d['opt_count'])}):")
-    await cb.answer()
 
 @dp.message(BuildStates.waiting_correct_index, F.text.regexp(r"^\d+$"))
 async def set_correct(msg:Message, state:FSMContext):
@@ -453,6 +443,11 @@ async def set_correct(msg:Message, state:FSMContext):
     await state.clear(); await msg.answer("✅ تم الحفظ النهائي.", reply_markup=owner_kb())
 
 # ---------- Edit single question ----------
+class EditQStates(StatesGroup):
+    pick_quiz=State()
+    pick_question=State()
+    edit_text=State()
+
 @dp.message(F.text==BTN_EDITQUESTION)
 async def edit_question_entry(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
@@ -564,7 +559,6 @@ async def brief_set_duration(cb:CallbackQuery, state:FSMContext):
 # دعم أرقام عربية وهندية عربية
 DIGITS_AR = "٠١٢٣٤٥٦٧٨٩"
 _AR_DIGIT_MAP = {ord(a): str(i) for i,a in enumerate(DIGITS_AR)}
-
 def normalize_digits(s:str)->str:
     return s.translate(_AR_DIGIT_MAP)
 
@@ -743,7 +737,7 @@ async def show_score(cb:CallbackQuery):
     await cb.message.answer(text, reply_markup=owner_kb())
     await cb.answer()
 
-# ---------- Export / Import ----------
+# ---------- Export / Import (files) ----------
 @dp.message(F.text==BTN_EXPORT)
 async def export_entry(msg:Message):
     if not await ensure_owner(msg): return
@@ -763,7 +757,7 @@ async def do_export(cb:CallbackQuery):
         await cb.message.answer("❌ لم يتم العثور على الاختبار."); return await cb.answer()
     qs = q_all("SELECT id,text FROM questions WHERE quiz_id=%s ORDER BY id",(quiz_id,))
     payload = {
-        "quiz": {"id": qrow["id"], "title": qrow["title"], "created_by": qrow["created_by"], "created_at": qrow["created_at"]},
+        "title": qrow["title"],
         "questions": []
     }
     for q in qs:
@@ -772,7 +766,6 @@ async def do_export(cb:CallbackQuery):
             "text": q["text"],
             "options": [{"text": o["text"], "is_correct": int(o["is_correct"])==1} for o in opts]
         })
-    # write to temp file
     with tempfile.NamedTemporaryFile("w", delete=False, suffix=f"_quiz_{quiz_id}.json", encoding="utf-8") as tf:
         json.dump(payload, tf, ensure_ascii=False, indent=2)
         temp_path = tf.name
@@ -783,35 +776,63 @@ async def do_export(cb:CallbackQuery):
 async def import_entry(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
     await state.set_state(ImportStates.waiting_json)
-    await msg.answer("📥 أرسل JSON بالتنسيق التالي:\n<code>{\"title\":\"...\",\"questions\":[{\"text\":\"...\",\"options\":[{\"text\":\"...\",\"is_correct\":true}, ...]}]}</code>")
+    await msg.answer("📥 ارفع ملف <b>.json</b> بنفس تنسيق التصدير، أو ألصق JSON كنص.")
 
+# Import from uploaded JSON file
+@dp.message(ImportStates.waiting_json, F.document)
+async def import_from_file(msg:Message, state:FSMContext):
+    try:
+        doc = msg.document
+        if not (doc.file_name.lower().endswith(".json") or (doc.mime_type and "json" in doc.mime_type)):
+            return await msg.reply("❌ رجاءً ارفع ملف JSON بامتداد .json")
+        with tempfile.NamedTemporaryFile("wb", delete=False, suffix=".json") as tf:
+            temp_path = tf.name
+        # aiogram v3 يوفر download مباشرة
+        try:
+            await bot.download(doc, destination=temp_path)
+        except Exception:
+            f: File = await bot.get_file(doc.file_id)
+            await bot.download(f, destination=temp_path)
+        with open(temp_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        quiz_id = await _import_payload_create_quiz(data, msg.from_user.id)
+        await state.clear()
+        await msg.answer(f"✅ تم الاستيراد من الملف وإنشاء الاختبار ID {quiz_id}.", reply_markup=owner_kb())
+    except Exception as e:
+        await msg.answer(f"❌ فشل الاستيراد من الملف: <code>{html.escape(str(e))}</code>")
+
+# Import from pasted JSON
 @dp.message(ImportStates.waiting_json, F.text)
-async def do_import(msg:Message, state:FSMContext):
+async def import_from_text(msg:Message, state:FSMContext):
     try:
         data = json.loads(msg.text)
-        title = str(data.get("title") or "").strip()
-        if not title: raise ValueError("title مطلوب")
-        questions = data.get("questions") or []
-        if not isinstance(questions, list) or not questions: raise ValueError("questions يجب أن تكون قائمة غير فارغة")
-
-        quiz_id = insert_returning_id("INSERT INTO quizzes(title,created_by,created_at) VALUES (%s,%s,%s)",
-                                      (title, msg.from_user.id, _now().isoformat()))
-        for q in questions:
-            qtext = str(q.get("text") or "").strip()
-            opts = q.get("options") or []
-            if not qtext or len(opts) < 2: continue
-            qid = insert_returning_id("INSERT INTO questions(quiz_id,text,created_at) VALUES (%s,%s,%s)",
-                                      (quiz_id, qtext, _now().isoformat()))
-            for i, o in enumerate(opts[:10]):
-                t = str(o.get("text") or "").strip()
-                ok = 1 if bool(o.get("is_correct")) else 0
-                if not t: continue
-                q_exec("INSERT INTO options(question_id,option_index,text,is_correct) VALUES (%s,%s,%s,%s)",
-                       (qid, i, t, ok))
+        quiz_id = await _import_payload_create_quiz(data, msg.from_user.id)
         await state.clear()
-        await msg.answer(f"✅ تم الاستيراد وإنشاء الاختبار ID {quiz_id}.", reply_markup=owner_kb())
+        await msg.answer(f"✅ تم الاستيراد كنص وإنشاء الاختبار ID {quiz_id}.", reply_markup=owner_kb())
     except Exception as e:
         await msg.answer(f"❌ JSON غير صالح: <code>{html.escape(str(e))}</code>")
+
+async def _import_payload_create_quiz(data:dict, creator_id:int)->int:
+    title = str(data.get("title") or "").strip()
+    if not title: raise ValueError("title مطلوب")
+    questions = data.get("questions") or []
+    if not isinstance(questions, list) or not questions: raise ValueError("questions يجب أن تكون قائمة غير فارغة")
+
+    quiz_id = insert_returning_id("INSERT INTO quizzes(title,created_by,created_at) VALUES (%s,%s,%s)",
+                                  (title, creator_id, _now().isoformat()))
+    for q in questions:
+        qtext = str(q.get("text") or "").strip()
+        opts = q.get("options") or []
+        if not qtext or len(opts) < 2: continue
+        qid = insert_returning_id("INSERT INTO questions(quiz_id,text,created_at) VALUES (%s,%s,%s)",
+                                  (quiz_id, qtext, _now().isoformat()))
+        for i, o in enumerate(opts[:10]):
+            t = str(o.get("text") or "").strip()
+            ok = 1 if bool(o.get("is_correct")) else 0
+            if not t: continue
+            q_exec("INSERT INTO options(question_id,option_index,text,is_correct) VALUES (%s,%s,%s,%s)",
+                   (qid, i, t, ok))
+    return quiz_id
 
 # ---------- Not-yet-implemented buttons ----------
 @dp.message(F.text.in_({BTN_BUNDLES, BTN_MERGE}))
