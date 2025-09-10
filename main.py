@@ -134,8 +134,6 @@ def ensure_schema():
     for ddl in ddls: q_exec(ddl)
 ensure_schema()
 
-PENDING_BRIEF_MINUTES: dict[int, str] = {}
-
 # ---------- UI ----------
 BTN_NEWQUIZ="🆕 إنشاء اختبار"; BTN_ADDQ="➕ إضافة سؤال"; BTN_LISTQUIZ="📚 عرض الاختبارات"
 BTN_EDITQUIZ="🛠️ تعديل اختبار"; BTN_DELQUIZ="🗑️ حذف اختبار"
@@ -347,7 +345,6 @@ async def start(msg:Message):
 @dp.message(F.text==BTN_BACK_HOME)
 async def back_home(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
-    PENDING_BRIEF_MINUTES.pop(msg.chat.id, None)
     await state.clear()
     await msg.answer("تم الرجوع للبداية.", reply_markup=owner_kb())
 
@@ -803,12 +800,9 @@ async def brief_set_duration(cb:CallbackQuery, state:FSMContext):
     act=cb.data.split(":")[1]
     data=await state.get_data(); prompt=data.get("prompt","")
     if act=="stop":
-        PENDING_BRIEF_MINUTES.pop(cb.message.chat.id, None)
         close_window(cb.message.chat.id); await cb.message.answer("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
     if act=="custom":
-        PENDING_BRIEF_MINUTES[cb.message.chat.id] = data.get("prompt","")
         await state.set_state(BriefStates.waiting_custom); await cb.message.answer("اكتب المدة بالدقائق (مثال: 45 أو ٤٥)."); return await cb.answer()
-    PENDING_BRIEF_MINUTES.pop(cb.message.chat.id, None)
     minutes=int(act); bid, closes = open_window(cb.message.chat.id, cb.from_user.id, minutes, prompt)
     mins_left = max(0, int((closes - _now()).total_seconds() // 60))
     txt=(f"📣 <b>سؤال البريف (B1 DTZ)</b>\n{html.escape(prompt)}\n\n"
@@ -822,28 +816,6 @@ DIGITS_AR = "٠١٢٣٤٥٦٧٨٩"
 _AR_DIGIT_MAP = {ord(a): str(i) for i,a in enumerate(DIGITS_AR)}
 def normalize_digits(s:str)->str:
     return s.translate(_AR_DIGIT_MAP)
-
-# --- Fallback: if FSM got lost, take any owner numeric message as custom duration when pending ---
-@dp.message(StateFilter(None), F.from_user.id == OWNER_ID, F.text.as_('t'))
-async def brief_custom_fallback(msg:Message, t:str, state:FSMContext):
-    prompt = PENDING_BRIEF_MINUTES.get(msg.chat.id)
-    if not prompt:
-        return
-    raw = normalize_digits(t)
-    m = re.search(r"(\d{1,3})", raw)
-    if not m:
-        return await msg.reply("❗ اكتب رقم بالدقائق فقط، مثل: 45 أو ٤٥")
-    minutes=int(m.group(1)); minutes=max(1, min(720, minutes))
-    bid,closes=open_window(msg.chat.id,msg.from_user.id,minutes,prompt)
-    mins_left = max(0, int((closes - _now()).total_seconds() // 60))
-    m = await msg.answer(
-        f"📣 <b>سؤال البريف (B1 DTZ)</b>\n{html.escape(prompt)}\n\n"
-        f"⏱️ ينتهي خلال: <b>{mins_left}د</b>\n"
-        f"أرسلوا نص البريف هنا برسالة واحدة.", reply_markup=owner_kb()
-    )
-    q_exec("UPDATE brief_windows SET ann_message_id=%s WHERE id=%s",(m.message_id,bid))
-    PENDING_BRIEF_MINUTES.pop(msg.chat.id, None)
-    await state.clear()
 
 @dp.message(BriefStates.waiting_custom, F.text)
 async def brief_custom_duration(msg:Message, state:FSMContext):
@@ -898,7 +870,7 @@ async def ai_grade(text: str) -> Tuple[int, str, Dict]:
         return base, lvl, {"error": str(e)}
 
 @dp.message(
-    StateFilter(None),
+    StateFilter("*"),
     F.text,
     ~F.text.in_(ALL_BTN_TEXTS),
     ~F.text.startswith("/"),
