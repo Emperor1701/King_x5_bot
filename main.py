@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import asyncio, os, json, html, re, tempfile
+import asyncio, os, json, html, re, tempfile, random
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Tuple
 
@@ -27,6 +27,20 @@ except Exception:
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+
+# --- Rate limiting delays (configurable via .env) ---
+POLL_BASE_DELAY = float(os.getenv("POLL_BASE_DELAY", "0.9"))
+POLL_JITTER     = float(os.getenv("POLL_JITTER", "0.6"))
+ATTACH_BASE_DELAY = float(os.getenv("ATTACH_BASE_DELAY", "1.2"))
+ATTACH_JITTER     = float(os.getenv("ATTACH_JITTER", "0.8"))
+
+async def sleep_jitter(kind: str = "poll"):
+    """Sleep with jitter to reduce flood limits."""
+    if kind == "attach":
+        await asyncio.sleep(ATTACH_BASE_DELAY + random.random() * ATTACH_JITTER)
+    else:
+        await asyncio.sleep(POLL_BASE_DELAY + random.random() * POLL_JITTER)
+
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
@@ -236,16 +250,6 @@ async def attach_file_to_question(question_id:int, kind:str, file_id:str):
     pos = int(pos_row["p"]) + 1
     q_exec("INSERT INTO question_attachments(question_id,kind,file_id,position) VALUES (%s,%s,%s,%s)",
            (question_id, kind, file_id, pos))
-
-# --------- NEW: مستوى من مجموع 45 نقطة ---------
-def level_from_points(points:int)->str:
-    # المجال القياسي المطلوب 0..45
-    if points <= 19:
-        return "Unter A2"
-    elif points <= 32:
-        return "A2"
-    else:
-        return "B1"
 
 # --- Callback guard for NON-owner only ---
 @dp.callback_query(
@@ -910,6 +914,7 @@ async def collect_briefs(msg:Message, u):
     )
 
 # ---------- Publish quiz with HOURS timer ----------
+
 async def send_question_attachments(chat_id:int, question_id:int):
     atts = q_all("SELECT kind,file_id FROM question_attachments WHERE question_id=%s ORDER BY position",(question_id,))
     for a in atts:
@@ -921,8 +926,23 @@ async def send_question_attachments(chat_id:int, question_id:int):
                 await bot.send_voice(chat_id, fid)
             elif kind=="audio":
                 await bot.send_audio(chat_id, fid)
-        except Exception:
-            pass
+            else:
+                # أنواع أخرى ممكن تضاف لاحقاً
+                continue
+            # نوم بجِتر بعد كل مرفق ناجح
+            await sleep_jitter("attach")
+        except Exception as e:
+            # Backoff تلقائي إذا قدّم تيليجرام retry_after/timeout
+            ra = getattr(e, "retry_after", None) or getattr(e, "timeout", None)
+            try:
+                if ra:
+                    await asyncio.sleep(float(ra) + 1)
+                else:
+                    await asyncio.sleep(2.0)
+            except Exception:
+                pass
+            # تابع للمرفق التالي بدون فشل شامل
+            continue
 
 @dp.message(F.text==BTN_PUBLISH)
 async def publish_entry(msg:Message):
@@ -987,23 +1007,74 @@ async def _publish_quiz_now(cb_or_dummy, quiz_id:int, hours:int):
 
     sent = 0
     for q in qs:
-        await send_question_attachments(chat_id, q["id"])
-        opts = q_all("SELECT option_index,text,is_correct FROM options WHERE question_id=%s ORDER BY option_index",(q["id"],))
-        if len(opts) < 2: 
-            continue
-        options_text = [o["text"] for o in opts]
-        correct_index = next((o["option_index"] for o in opts if o["is_correct"]), 0)
-        m = await bot.send_poll(
-            chat_id=chat_id,
-            question=q["text"][:295],
-            options=options_text[:10],
-            type=PollType.QUIZ,
-            correct_option_id=correct_index,
-            is_anonymous=False
+        
+        # أرسل المرفقات لكن لا تجعل فشلها يوقف النشر
+        try:
+            await send_question_attachments(chat_id, q["id"])
+        except Exception as _att_e:
+            try:
+                await cb_or_dummy.message.answer(f"⚠️ تعذّر إرسال مرفقات للسؤال {q['id']}: {_att_e}")
+            except Exception:
+                pass
+
+        # قراءة الخيارات
+        opts = q_all(
+            "SELECT option_index,text,is_correct FROM options WHERE question_id=%s ORDER BY option_index",
+            (q["id"],)
         )
-        q_exec("INSERT INTO sent_polls(chat_id,quiz_id,question_id,poll_id,message_id,expires_at,is_closed) VALUES (%s,%s,%s,%s,%s,%s,0)",
-               (chat_id, quiz_id, q["id"], m.poll.id, m.message_id, expiry_iso))
-        sent += 1
+        if len(opts) < 2:
+            # تجاوز الأسئلة غير الصالحة
+            continue
+
+        # إيجاد الخيار الصحيح (إن لم يوجد معلّم، اعتبر أول خيار صحيحًا كحل إسعافي)
+        correct = next((o for o in opts if o.get("is_correct")), None) or opts[0]
+
+        # إعداد القائمة النهائية ≤ 10 عناصر مع ضمان وجود الصحيح
+        if len(opts) > 10:
+            incorrect = [o for o in opts if not o.get("is_correct")]
+            selected = [correct] + incorrect[:9]
+        else:
+            selected = list(opts)
+
+        # قصّ النصوص وفق حدود تيليجرام
+        question_text = str(q["text"])[:295]
+        options_text = [str(o["text"])[:100] for o in selected]
+        correct_index = selected.index(correct)
+
+        try:
+            m = await bot.send_poll(
+                chat_id=chat_id,
+                question=question_text,
+                options=options_text,
+                type=PollType.QUIZ,
+                correct_option_id=correct_index,
+                is_anonymous=False,
+            )
+            # سجّل البول كما في الجدول الأصلي
+            q_exec(
+                "INSERT INTO sent_polls(chat_id,quiz_id,question_id,poll_id,message_id,expires_at,is_closed) VALUES (%s,%s,%s,%s,%s,%s,0)",
+                (chat_id, quiz_id, q["id"], m.poll.id, m.message_id, expiry_iso)
+            )
+            sent += 1
+            # فاصل بسيط لتخفيف الـ FloodWait
+            await sleep_jitter("poll")
+        except Exception as e:
+            try:
+                await cb_or_dummy.message.answer(f"⚠️ تعذّر نشر سؤال ID {q['id']}: {e}")
+            except Exception:
+                pass
+            # Backoff تلقائي إذا وفّر Telegram مهلة
+            try:
+                ra = getattr(e, 'retry_after', None) or getattr(e, 'timeout', None)
+                if ra:
+                    await asyncio.sleep(float(ra) + 1)
+                else:
+                    await asyncio.sleep(2.0)
+            except Exception:
+                pass
+            # تابع للسؤال التالي
+            continue
+
 
     await cb_or_dummy.message.answer(
         f"🚀 تم نشر {sent} سؤالًا من الاختبار {quiz_id}"
@@ -1066,56 +1137,6 @@ async def on_poll_answer(pa: PollAnswer):
         )
     except Exception:
         pass
-
-    # -------- NEW: إعلان النتيجة فور إكمال جميع الأسئلة --------
-    # إجمالي عدد الأسئلة المنشورة لهذا الاختبار في هذه المحادثة
-    total_q_row = q_one(
-        "SELECT COUNT(*) AS c FROM sent_polls WHERE chat_id=%s AND quiz_id=%s",
-        (chat_id, quiz_id)
-    )
-    total_q = int(total_q_row["c"] or 0)
-
-    if total_q > 0:
-        # عدد الأسئلة التي أجابها هذا المستخدم (مميزًا حسب question_id)
-        answered_row = q_one(
-            """SELECT COUNT(DISTINCT question_id) AS c
-               FROM quiz_responses
-               WHERE chat_id=%s AND quiz_id=%s AND user_id=%s""",
-            (chat_id, quiz_id, u.id)
-        )
-        answered = int(answered_row["c"] or 0)
-
-        # إذا أكمل كل الأسئلة، احسب الصحيح وارسِل النتيجة
-        if answered >= total_q:
-            correct_row = q_one(
-                """SELECT COALESCE(SUM(is_correct),0) AS s
-                   FROM quiz_responses
-                   WHERE chat_id=%s AND quiz_id=%s AND user_id=%s""",
-                (chat_id, quiz_id, u.id)
-            )
-            correct = int(correct_row["s"] or 0)
-
-            # تحويل الدرجة لسُلَّم 45 نقطة
-            points_45 = round((correct / total_q) * 45)
-            level = level_from_points(points_45)
-
-            # اسم المستخدم المُعلن
-            uname = ("@" + u.username) if getattr(u, "username", None) else (u.full_name or f"UID {u.id}")
-
-            try:
-                await bot.send_message(
-                    chat_id,
-                    (
-                        "🎓 <b>النتيجة النهائية</b>\n"
-                        f"👤 {html.escape(uname)}\n"
-                        f"✅ الصحيحة: <b>{correct}</b> / {total_q}\n"
-                        f"🧮 النقاط (من 45): <b>{points_45}</b>/45\n"
-                        f"🎯 المستوى: <b>{level}</b>"
-                    )
-                )
-            except Exception:
-                pass
-    # -------- END NEW --------
 
 # ---------- Leaderboard ----------
 @dp.message(F.text==BTN_SCORE)
