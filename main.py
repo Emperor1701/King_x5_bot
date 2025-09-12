@@ -6,12 +6,12 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Tuple
 
 from dotenv import load_dotenv
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, PollType
 from aiogram.types import (
     Message, CallbackQuery, PollAnswer,
-    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, FSInputFile, File,
+    ReplyKeyboardMarkup, KeyboardButton, FSInputFile, File,
     ReactionTypeEmoji
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -48,11 +48,6 @@ if not BOT_TOKEN or not OWNER_ID or not DATABASE_URL:
     raise SystemExit("Set BOT_TOKEN, OWNER_ID, DATABASE_URL")
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-
-@dp.message(F.text == "/menu")
-async def cmd_menu(msg: Message):
-    await msg.answer("اختر أمرًا:", reply_markup=owner_kb())
-
 dp = Dispatcher(storage=MemoryStorage())
 
 # ---------- Postgres ----------
@@ -185,12 +180,10 @@ def owner_kb()->ReplyKeyboardMarkup:
     )
 
 
+@dp.message(F.text == "/menu")
+async def cmd_menu(msg: Message):
+    await msg.answer("اختر أمرًا:", reply_markup=owner_kb())
 
-from aiogram.types import ReplyKeyboardRemove
-
-def hide_kb() -> ReplyKeyboardRemove:
-    """Return a markup that hides the reply keyboard."""
-    return ReplyKeyboardRemove()
 
 ALL_BTN_TEXTS = {
     BTN_BACK_HOME, BTN_BACK_STEP, BTN_NEWQUIZ, BTN_ADDQ, BTN_LISTQUIZ, BTN_EDITQUIZ,
@@ -900,15 +893,7 @@ async def ai_grade(text: str) -> Tuple[int, str, Dict]:
 @dp.message(
     StateFilter("*"),
     F.text,
-    ~F.text.in_(
-
-from aiogram.types import ReplyKeyboardRemove
-
-def hide_kb() -> ReplyKeyboardRemove:
-    """Return a markup that hides the reply keyboard."""
-    return ReplyKeyboardRemove()
-
-ALL_BTN_TEXTS),
+    ~F.text.in_(ALL_BTN_TEXTS),
     ~F.text.startswith("/"),
     F.from_user.as_('u')
 )
