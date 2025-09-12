@@ -6,7 +6,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Tuple
 
 from dotenv import load_dotenv
-from aiogram import Bot, Dispatcher, F, types
+from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, PollType
 from aiogram.types import (
@@ -26,20 +26,6 @@ except Exception:
     OpenAI = None  # type: ignore
 
 load_dotenv()
-
-# --- Rate limiting delays (configurable via .env) ---
-POLL_BASE_DELAY = float(os.getenv('POLL_BASE_DELAY', '0.9'))
-POLL_JITTER = float(os.getenv('POLL_JITTER', '0.6'))
-ATTACH_BASE_DELAY = float(os.getenv('ATTACH_BASE_DELAY', '1.2'))
-ATTACH_JITTER = float(os.getenv('ATTACH_JITTER', '0.8'))
-
-async def sleep_jitter(kind: str = 'poll'):
-    import random, asyncio
-    if kind == 'attach':
-        await asyncio.sleep(ATTACH_BASE_DELAY + random.random()*ATTACH_JITTER)
-    else:
-        await asyncio.sleep(POLL_BASE_DELAY + random.random()*POLL_JITTER)
-
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
@@ -158,7 +144,6 @@ BTN_SCORE="🏆 لوحة النتائج"; BTN_BACK_HOME="↩️ العودة ل�
 BTN_BRIEF="✉️ زر إرسال البريف"
 BTN_LISTQUESTIONS="📝 عرض الأسئلة"
 BTN_EDITQUESTION="✏️ تعديل سؤال"
-BTN_DELQUESTION="🗑️ حذف سؤال"
 
 def owner_kb()->ReplyKeyboardMarkup:
     rows=[
@@ -166,7 +151,6 @@ def owner_kb()->ReplyKeyboardMarkup:
         [KeyboardButton(text=BTN_NEWQUIZ), KeyboardButton(text=BTN_ADDQ)],
         [KeyboardButton(text=BTN_LISTQUIZ), KeyboardButton(text=BTN_EDITQUIZ)],
         [KeyboardButton(text=BTN_LISTQUESTIONS), KeyboardButton(text=BTN_EDITQUESTION)],
-        [KeyboardButton(text=BTN_DELQUESTION)],
         [KeyboardButton(text=BTN_DELQUIZ), KeyboardButton(text=BTN_BRIEF)],
         [KeyboardButton(text=BTN_PUBLISH), KeyboardButton(text=BTN_SCORE)],
         [KeyboardButton(text=BTN_EXPORT), KeyboardButton(text=BTN_IMPORT)],
@@ -176,8 +160,7 @@ def owner_kb()->ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=rows,
         resize_keyboard=True,
-        one_time_keyboard=True,
-        is_persistent=False,
+        is_persistent=True,
         input_field_placeholder="اختر أمرًا من الأزرار 👇"
     )
 
@@ -419,7 +402,7 @@ async def show_quiz_details(cb:CallbackQuery):
     title = title_row["title"] if title_row else f"ID {qid}"
     qs=q_all("SELECT id,text FROM questions WHERE quiz_id=%s ORDER BY id ASC",(qid,))
     if not qs:
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+        await cb.message.answer(f"📚 \"{html.escape(title)}\" بلا أسئلة بعد.", reply_markup=owner_kb()); return await cb.answer()
     chunks=[]
     current=f"📝 <b>أسئلة الاختبار:</b> {html.escape(title)}\n"
     for q in qs:
@@ -430,7 +413,7 @@ async def show_quiz_details(cb:CallbackQuery):
         current += block
     if current: chunks.append(current)
     for part in chunks:
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+        await cb.message.answer(part)
     await cb.answer()
 
 # ---------- Edit quiz title ----------
@@ -451,7 +434,7 @@ async def pick_for_edit(cb:CallbackQuery, state:FSMContext):
     qid=int(cb.data.split(":")[1])
     await state.update_data(edit_id=qid)
     await state.set_state(BuildStates.waiting_new_title)
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+    await cb.message.answer("أرسل العنوان الجديد:")
     await cb.answer()
 
 @dp.message(BuildStates.waiting_new_title, F.text)
@@ -478,7 +461,7 @@ async def delquiz(msg:Message, state:FSMContext):
 async def delq_confirm(cb:CallbackQuery, state:FSMContext):
     qid=int(cb.data.split(":")[1])
     kb=inline_confirm_kb(f"delqconfirm:{qid}")
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+    await cb.message.answer(f"⚠️ تأكيد حذف الاختبار ID {qid}؟", reply_markup=kb)
     await cb.answer()
 
 @dp.callback_query(F.data.regexp(r"^delqconfirm:(\d+):(yes|no)$"))
@@ -487,13 +470,13 @@ async def delq_apply(cb:CallbackQuery):
     qid, decision = rest.split(":")
     qid=int(qid)
     if decision=="no":
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+        await cb.message.answer("تم الإلغاء ✅", reply_markup=owner_kb()); return await cb.answer()
     q_exec("DELETE FROM options WHERE question_id IN (SELECT id FROM questions WHERE quiz_id=%s)", (qid,))
     q_exec("DELETE FROM question_attachments WHERE question_id IN (SELECT id FROM questions WHERE quiz_id=%s)", (qid,))
     q_exec("DELETE FROM questions WHERE quiz_id=%s", (qid,))
     q_exec("DELETE FROM sent_polls WHERE quiz_id=%s", (qid,))
     q_exec("DELETE FROM quizzes WHERE id=%s", (qid,))
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+    await cb.message.answer("🗑️ تم حذف الاختبار.", reply_markup=owner_kb())
     await cb.answer()
 
 # ---------- Add Question (with attachment choice) ----------
@@ -514,7 +497,7 @@ async def addq_pick(cb:CallbackQuery, state:FSMContext):
     qid=int(cb.data.split(":")[1])
     await state.update_data(quiz_id=qid)
     await state.set_state(BuildStates.waiting_q_block)
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+    await cb.message.answer(
         "أرسل <b>رسالة واحدة</b>:\n"
         "السطر الأول السؤال، ثم كل خيار بسطر جديد (2..10).\n"
         "مثال:\n"
@@ -550,21 +533,21 @@ async def addq_attach_mode(cb:CallbackQuery, state:FSMContext):
     qid = int(d["question_id"])
     if mode=="upload":
         await state.set_state(BuildStates.waiting_q_attachments_upload)
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+        await cb.message.answer("أرسل صور/فويس/أوديو كمرفقات خاصة. ثم اضغط ✔️ تم.", reply_markup=done_button_kb("qatt"))
     elif mode=="shared":
         rows = q_all("SELECT id FROM shared_attachments ORDER BY id DESC LIMIT 1")
         if not rows:
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+            await cb.message.answer("لا توجد مرفقات مشتركة بعد. أضف من زر 📎 مرفقات مشتركة.", reply_markup=owner_kb())
+            await cb.message.answer("اختر نوع المرفقات:", reply_markup=attach_choice_kb())
             await cb.answer(); return
         await state.set_state(BuildStates.waiting_q_attachments_shared)
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+        await cb.message.answer("اختر من المرفقات المشتركة (يمكن اختيار أكثر من واحد) ثم اضغط ✔️ تم.", reply_markup=shared_list_kb(qid))
     elif mode=="none":
         if d.get("needs_correct", True):
             await state.set_state(BuildStates.waiting_correct_index)
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+            await cb.message.answer(f"أرسل رقم الخيار الصحيح (1..{int(d['opt_count'])}):")
         else:
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+            await state.clear(); await cb.message.answer("✅ تم الحفظ النهائي.", reply_markup=owner_kb())
     await cb.answer()
 
 @dp.message(BuildStates.waiting_q_attachments_upload, F.photo | F.voice | F.audio)
@@ -582,9 +565,9 @@ async def addq_attach_done(cb:CallbackQuery, state:FSMContext):
     d=await state.get_data()
     if d.get("needs_correct", True):
         await state.set_state(BuildStates.waiting_correct_index)
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+        await cb.message.answer(f"أرسل رقم الخيار الصحيح (1..{int(d['opt_count'])}):")
     else:
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+        await state.clear(); await cb.message.answer("✅ تم الحفظ النهائي.", reply_markup=owner_kb())
     await cb.answer()
 
 @dp.callback_query(BuildStates.waiting_q_attachments_shared, F.data.startswith("attadd:"))
@@ -602,9 +585,9 @@ async def addq_attach_shared_done(cb:CallbackQuery, state:FSMContext):
     d=await state.get_data()
     if d.get("needs_correct", True):
         await state.set_state(BuildStates.waiting_correct_index)
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+        await cb.message.answer(f"أرسل رقم الخيار الصحيح (1..{int(d['opt_count'])}):")
     else:
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+        await state.clear(); await cb.message.answer("✅ تم الحفظ النهائي.", reply_markup=owner_kb())
     await cb.answer()
 
 @dp.message(BuildStates.waiting_correct_index, F.text.regexp(r"^\d+$"))
@@ -634,13 +617,13 @@ async def pick_quiz_for_question(cb:CallbackQuery, state:FSMContext):
     qz=int(cb.data.split(":")[1])
     qs=q_all("SELECT id,text FROM questions WHERE quiz_id=%s ORDER BY id ASC",(qz,))
     if not qs:
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+        await cb.message.answer("لا يوجد أسئلة.", reply_markup=owner_kb()); return await cb.answer()
     kb=InlineKeyboardBuilder()
     for q in qs[:80]:
-        preview = (q['text'][:40] + "") if len(q['text'])>40 else q['text']
+        preview = (q['text'][:40] + "…") if len(q['text'])>40 else q['text']
         kb.button(text=f"Q{q['id']} — {preview}", callback_data=f"pickqs:{q['id']}")
     kb.adjust(1)
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+    await cb.message.answer("اختر سؤالًا للتعديل:", reply_markup=kb.as_markup())
     await cb.answer()
 
 @dp.callback_query(F.data.startswith("pickqs:"))
@@ -657,19 +640,19 @@ async def picked_question(cb:CallbackQuery, state:FSMContext):
     kb.button(text="🗑️ إزالة كل المرفقات", callback_data="editm:att_clear")
     kb.adjust(1)
     await state.set_state(EditQStates.edit_menu)
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+    await cb.message.answer(txt + "\n\nاختر العملية:", reply_markup=kb.as_markup())
     await cb.answer()
 
 @dp.callback_query(EditQStates.edit_menu, F.data=="editm:text")
 async def editm_text(cb:CallbackQuery, state:FSMContext):
     await state.set_state(EditQStates.edit_text)
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+    await cb.message.answer("أرسل الصيغة الجديدة كاملة (سطر سؤال + خيارات).")
     await cb.answer()
 
 @dp.callback_query(EditQStates.edit_menu, F.data=="editm:opts")
 async def editm_opts(cb:CallbackQuery, state:FSMContext):
     await state.set_state(EditQStates.edit_options)
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+    await cb.message.answer("أرسل الخيارات فقط، كل خيار بسطر، ضع ✅ على الصحيح.")
     await cb.answer()
 
 @dp.callback_query(EditQStates.edit_menu, F.data=="editm:att_add")
@@ -679,7 +662,7 @@ async def editm_att_add(cb:CallbackQuery, state:FSMContext):
     kb.button(text="📎 مرفقات خاصة (أرسل ملفات)", callback_data="att:upload")
     kb.button(text="📎 من المشتركة", callback_data="att:shared")
     kb.adjust(1)
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+    await cb.message.answer("اختر طريقة إضافة المرفقات:", reply_markup=kb.as_markup())
     await cb.answer()
 
 @dp.callback_query(EditQStates.edit_menu, F.data=="editm:att_clear")
@@ -687,7 +670,7 @@ async def editm_att_clear(cb:CallbackQuery, state:FSMContext):
     qid=(await state.get_data()).get("edit_question_id")
     q_exec("DELETE FROM question_attachments WHERE question_id=%s",(qid,))
     await state.clear()
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+    await cb.message.answer("🗑️ تم إزالة جميع المرفقات.", reply_markup=owner_kb())
     await cb.answer()
 
 @dp.message(EditQStates.edit_text, F.text)
@@ -732,11 +715,11 @@ async def edit_attach_mode(cb:CallbackQuery, state:FSMContext):
     mode=cb.data.split(":")[1]
     if mode=="upload":
         await state.set_state(EditQStates.attach_upload)
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+        await cb.message.answer("أرسل صور/فويس/أوديو لإرفاقها، ثم اضغط ✔️ تم.", reply_markup=done_button_kb("qatt"))
     elif mode=="shared":
         qid=(await state.get_data()).get("edit_question_id")
         await state.set_state(EditQStates.attach_shared)
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+        await cb.message.answer("اختر من المرفقات المشتركة ثم اضغط ✔️ تم.", reply_markup=shared_list_kb(qid))
     await cb.answer()
 
 @dp.message(EditQStates.attach_upload, F.photo | F.voice | F.audio)
@@ -752,7 +735,7 @@ async def edit_attach_upload(msg:Message, state:FSMContext):
 @dp.callback_query(EditQStates.attach_upload, F.data=="done:qatt")
 async def edit_attach_upload_done(cb:CallbackQuery, state:FSMContext):
     await state.clear()
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+    await cb.message.answer("✅ تم إضافة المرفقات.", reply_markup=owner_kb())
     await cb.answer()
 
 @dp.callback_query(EditQStates.attach_shared, F.data.startswith("attadd:"))
@@ -768,7 +751,7 @@ async def edit_attach_shared_add(cb:CallbackQuery, state:FSMContext):
 @dp.callback_query(EditQStates.attach_shared, F.data.startswith("attdone:"))
 async def edit_attach_shared_done(cb:CallbackQuery, state:FSMContext):
     await state.clear()
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+    await cb.message.answer("✅ تم إضافة المرفقات من المشتركة.", reply_markup=owner_kb())
     await cb.answer()
 
 # ---------- Brief (prompt -> duration -> announce) ----------
@@ -809,7 +792,6 @@ async def brief_got_prompt(msg:Message, state:FSMContext):
     await state.update_data(prompt=prompt)
     await state.set_state(BriefStates.waiting_duration)
     await msg.answer("✅ تم استلام السؤال.\nاختر مدة الاستقبال:", reply_markup=dur_buttons_for_brief(has_open=chat_has_open_window(msg.chat.id)))
-eply_markup=dur_buttons_for_brief(has_open=chat_has_open_window(msg.chat.id)))
 
 @dp.callback_query(F.data.startswith("briefdur:"))
 async def brief_set_duration(cb:CallbackQuery, state:FSMContext):
@@ -818,15 +800,15 @@ async def brief_set_duration(cb:CallbackQuery, state:FSMContext):
     act=cb.data.split(":")[1]
     data=await state.get_data(); prompt=data.get("prompt","")
     if act=="stop":
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+        close_window(cb.message.chat.id); await cb.message.answer("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
     if act=="custom":
-        await state.set_state(BriefStates.waiting_custom); await cb.message.answerr("⌨️ اكتب المدة بالدقائق (مثال: 45 أو ٤٥)."); return await cb.answer()
+        await state.set_state(BriefStates.waiting_custom); await cb.message.answer("اكتب المدة بالدقائق (مثال: 45 أو ٤٥)."); return await cb.answer()
     minutes=int(act); bid, closes = open_window(cb.message.chat.id, cb.from_user.id, minutes, prompt)
     mins_left = max(0, int((closes - _now()).total_seconds() // 60))
     txt=(f"📣 <b>سؤال البريف (B1 DTZ)</b>\n{html.escape(prompt)}\n\n"
          f"⏱️ ينتهي خلال: <b>{mins_left}د</b>\n"
          f"أرسلوا نص البريف هنا برسالة واحدة.")
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+    m=await cb.message.answer(txt, reply_markup=owner_kb())
     q_exec("UPDATE brief_windows SET ann_message_id=%s WHERE id=%s",(m.message_id,bid))
     await state.clear(); await cb.answer()
 
@@ -840,7 +822,7 @@ async def brief_custom_duration(msg:Message, state:FSMContext):
     raw = normalize_digits(msg.text)
     m = re.search(r"(\d{1,3})", raw)
     if not m:
-        await state.set_state(BriefStates.waiting_custom); await cb.message.answerr("⌨️ اكتب المدة بالدقائق (مثال: 45 أو ٤٥)."); return await cb.answer()
+        return await msg.answer("❗ اكتب رقم بالدقائق فقط، مثل: 45 أو ٤٥")
     minutes=int(m.group(1))
     minutes=max(1, min(720, minutes))
     prompt=(await state.get_data()).get("prompt","")
@@ -925,47 +907,11 @@ async def send_question_attachments(chat_id:int, question_id:int):
         try:
             if kind=="photo":
                 await bot.send_photo(chat_id, fid)
-            try:
-                await sleep_jitter('attach')
-            except Exception as e:
-            ra = getattr(e,'retry_after',None) or getattr(e,'timeout',None)
-            try:
-                await asyncio.sleep(float(ra)+1 if ra else 2.0)
-            except Exception:
-                pass
-
-                await asyncio.sleep(0.8)
             elif kind=="voice":
                 await bot.send_voice(chat_id, fid)
-            try:
-                await sleep_jitter('attach')
-            except Exception as e:
-            ra = getattr(e,'retry_after',None) or getattr(e,'timeout',None)
-            try:
-                await asyncio.sleep(float(ra)+1 if ra else 2.0)
-            except Exception:
-                pass
-
-                await asyncio.sleep(0.8)
             elif kind=="audio":
                 await bot.send_audio(chat_id, fid)
-            try:
-                await sleep_jitter('attach')
-            except Exception as e:
-            ra = getattr(e,'retry_after',None) or getattr(e,'timeout',None)
-            try:
-                await asyncio.sleep(float(ra)+1 if ra else 2.0)
-            except Exception:
-                pass
-
-                await asyncio.sleep(0.8)
-        except Exception as e:
-            ra = getattr(e,'retry_after',None) or getattr(e,'timeout',None)
-            try:
-                await asyncio.sleep(float(ra)+1 if ra else 2.0)
-            except Exception:
-                pass
-
+        except Exception:
             pass
 
 @dp.message(F.text==BTN_PUBLISH)
@@ -985,7 +931,7 @@ async def publish_pick_hours(cb:CallbackQuery, state:FSMContext):
         return await cb.answer("للمالك فقط", show_alert=True)
     quiz_id = int(cb.data.split(":")[1])
     await state.update_data(pub_quiz_id=quiz_id)
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+    await cb.message.answer("اختر مؤقّت النشر (بالساعات):", reply_markup=publish_hours_kb(quiz_id))
     await cb.answer()
 
 # Arabic numerals normalize
@@ -1000,7 +946,7 @@ async def publish_with_hours_decide(cb:CallbackQuery, state:FSMContext):
     if token == "custom":
         await state.set_state(PublishStates.waiting_hours_custom)
         await state.update_data(pub_quiz_id=quiz_id)
-        await state.set_state(BriefStates.waiting_custom); await cb.message.answerr("⌨️ اكتب المدة بالدقائق (مثال: 45 أو ٤٥)."); return await cb.answer()
+        await cb.message.answer("اكتب عدد الساعات (مثال: 2 أو ٢).")
         return await cb.answer()
     hours = int(token)
     await _publish_quiz_now(cb, quiz_id, hours)
@@ -1011,7 +957,7 @@ async def publish_hours_custom(msg:Message, state:FSMContext):
     raw = normalize_arabic_digits(msg.text)
     m = re.search(r"(\d{1,3})", raw)
     if not m:
-        await state.set_state(BriefStates.waiting_custom); await cb.message.answerr("⌨️ اكتب المدة بالدقائق (مثال: 45 أو ٤٥)."); return await cb.answer()
+        return await msg.reply("اكتب رقم الساعات فقط (1..240).")
     hours = int(m.group(1)); hours = max(1, min(240, hours))
     quiz_id = int((await state.get_data()).get("pub_quiz_id"))
     await state.clear()
@@ -1020,77 +966,34 @@ async def publish_hours_custom(msg:Message, state:FSMContext):
     dummy = Dummy(); dummy.message = msg
     await _publish_quiz_now(dummy, quiz_id, hours)
 
+async def _publish_quiz_now(cb_or_dummy, quiz_id:int, hours:int):
+    chat_id = cb_or_dummy.message.chat.id
+    qs = q_all("SELECT id,text FROM questions WHERE quiz_id=%s ORDER BY id ASC",(quiz_id,))
+    if not qs:
+        await cb_or_dummy.message.answer("❌ الاختبار لا يحتوي أسئلة.", reply_markup=owner_kb()); return
+    expiry_iso = None
+    if hours > 0:
+        expiry_iso = (_now() + timedelta(hours=hours)).isoformat()
 
-        # patched loop start
-
-        # إرسال المرفقات مع تجاهل الأخطاء
-        try:
-            await send_question_attachments(chat_id, q["id"])
-        except Exception as _att_e:
-            try:
-                await cb_or_dummy.message.answer(f"⚠️ تعذّر إرسال مرفقات للسؤال {q['id']}: {_att_e}")
-            except Exception:
-                pass
-
-        # قراءة الخيارات
-        opts = q_all(
-            "SELECT option_index,text,is_correct FROM options WHERE question_id=%s ORDER BY option_index",
-            (q["id"],)
+    sent = 0
+    for q in qs:
+        await send_question_attachments(chat_id, q["id"])
+        opts = q_all("SELECT option_index,text,is_correct FROM options WHERE question_id=%s ORDER BY option_index",(q["id"],))
+        if len(opts) < 2: 
+            continue
+        options_text = [o["text"] for o in opts]
+        correct_index = next((o["option_index"] for o in opts if o["is_correct"]), 0)
+        m = await bot.send_poll(
+            chat_id=chat_id,
+            question=q["text"][:295],
+            options=options_text[:10],
+            type=PollType.QUIZ,
+            correct_option_id=correct_index,
+            is_anonymous=False
         )
-        if len(opts) < 2:
-            continue
-
-        # تحديد الصحيح (افتراضيًا الأول لو غير مميز)
-        correct = next((o for o in opts if o.get("is_correct")), None) or opts[0]
-
-        # اختيار 10 خيارات كحد أقصى مع ضمان وجود الصحيح
-        if len(opts) > 10:
-            incorrect = [o for o in opts if not o.get("is_correct")]
-            selected = [correct] + incorrect[:9]
-        else:
-            selected = list(opts)
-
-        num_prefix = f"{sent+1}. "
-        base_txt = str(q["text"]).strip()
-        question_text = (num_prefix + base_txt)[:295]
-        options_text = [str(o["text"])[:100] for o in selected]
-        correct_index = selected.index(correct)
-
-        try:
-            m = await bot.send_poll(
-                chat_id=chat_id,
-                question=question_text,
-                options=options_text,
-                type=PollType.QUIZ,
-                correct_option_id=correct_index,
-                is_anonymous=False,
-            )
-            q_exec(
-                "INSERT INTO sent_polls (chat_id,quiz_id,question_id,poll_id,message_id,expires_at,is_closed) VALUES (%s,%s,%s,%s,%s,%s,0)",
-                (chat_id, quiz_id, q["id"], m.poll.id, m.message_id, expiry_iso)
-            )
-            sent += 1
-            # نوم مع جتر لتخفيف Flood
-            try:
-                await sleep_jitter("poll")
-            except Exception:
-                await asyncio.sleep(0.8)
-        except Exception as e:
-            try:
-                await cb_or_dummy.message.answer(f"⚠️ تعذّر نشر سؤال ID {q['id']}: {e}")
-            except Exception:
-                pass
-            # Backoff تلقائي إذا قدّم تيليجرام مهلة
-            try:
-                ra = getattr(e, "retry_after", None) or getattr(e, "timeout", None)
-                if ra:
-                    await asyncio.sleep(float(ra) + 1)
-                else:
-                    await asyncio.sleep(2.0)
-            except Exception:
-                pass
-            continue
-    
+        q_exec("INSERT INTO sent_polls(chat_id,quiz_id,question_id,poll_id,message_id,expires_at,is_closed) VALUES (%s,%s,%s,%s,%s,%s,0)",
+               (chat_id, quiz_id, q["id"], m.poll.id, m.message_id, expiry_iso))
+        sent += 1
 
     await cb_or_dummy.message.answer(
         f"🚀 تم نشر {sent} سؤالًا من الاختبار {quiz_id}"
@@ -1171,7 +1074,7 @@ async def show_score(cb:CallbackQuery):
     quiz_id=int(cb.data.split(":")[1])
     total_q = q_one("SELECT COUNT(*) AS c FROM sent_polls WHERE chat_id=%s AND quiz_id=%s",(cb.message.chat.id,quiz_id))["c"]
     if total_q == 0:
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+        await cb.message.answer("لا توجد أسئلة منشورة لهذا الاختبار في هذه المحادثة.", reply_markup=owner_kb()); return await cb.answer()
 
     rows = q_all("""
         SELECT user_id, COALESCE(NULLIF(username,''),'مجهول') AS uname, SUM(is_correct)::int AS correct
@@ -1184,7 +1087,7 @@ async def show_score(cb:CallbackQuery):
 
     lines = [f"{i+1:>2}. {html.escape(r['uname'])} — {r['correct']}/{total_q}" for i,r in enumerate(rows)]
     text = "🏆 <b>لوحة النتائج</b>\n" + ("\n".join(lines) if lines else "لا يوجد مشاركات بعد.")
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+    await cb.message.answer(text, reply_markup=owner_kb())
     await cb.answer()
 
 # ---------- Export / Import (files + text) ----------
@@ -1204,7 +1107,7 @@ async def do_export(cb:CallbackQuery):
     quiz_id = int(cb.data.split(":")[1])
     qrow = q_one("SELECT id,title FROM quizzes WHERE id=%s",(quiz_id,))
     if not qrow:
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+        await cb.message.answer("❌ لم يتم العثور على الاختبار."); return await cb.answer()
     qs = q_all("SELECT id,text FROM questions WHERE quiz_id=%s ORDER BY id",(quiz_id,))
     payload = {
         "title": qrow["title"],
@@ -1296,7 +1199,7 @@ async def bundles_entry(msg:Message, state:FSMContext):
 @dp.callback_query(BundleStates.idle, F.data=="bund:add")
 async def bundles_add(cb:CallbackQuery, state:FSMContext):
     await state.set_state(BundleStates.add_wait_file)
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+    await cb.message.answer("أرسل <b>صورة/صوت/فويس</b> كمرفق مشترك (ضع عنوانًا في الكابتشن اختياري).")
     await cb.answer()
 
 @dp.message(BundleStates.add_wait_file, F.photo | F.audio | F.voice)
@@ -1317,22 +1220,22 @@ async def bundles_add_file(msg:Message, state:FSMContext):
 async def bundles_list(cb:CallbackQuery):
     rows = q_all("SELECT id,kind,title FROM shared_attachments ORDER BY id DESC LIMIT 100")
     if not rows:
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+        await cb.message.answer("لا توجد مرفقات مشتركة بعد.", reply_markup=owner_kb()); return await cb.answer()
     text = "📜 <b>المرفقات المشتركة</b>:\n" + "\n".join([f"• {r['id']} — {r['kind']} — {html.escape(r['title'] or '')}" for r in rows])
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+    await cb.message.answer(text, reply_markup=owner_kb())
     await cb.answer()
 
 @dp.callback_query(BundleStates.idle, F.data=="bund:attach")
 async def bundles_attach_start(cb:CallbackQuery, state:FSMContext):
     rows=q_all("SELECT id,title FROM quizzes ORDER BY id DESC")
     if not rows:
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+        await cb.message.answer("لا يوجد اختبارات.", reply_markup=owner_kb()); return await cb.answer()
     kb=InlineKeyboardBuilder()
     for r in rows[:50]:
         kb.button(text=f"{r['id']} — {r['title']}", callback_data=f"bund:q:{r['id']}")
     kb.adjust(1)
     await state.set_state(BundleStates.attach_pick_quiz)
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+    await cb.message.answer("اختر الاختبار:", reply_markup=kb.as_markup())
     await cb.answer()
 
 @dp.callback_query(BundleStates.attach_pick_quiz, F.data.startswith("bund:q:"))
@@ -1340,15 +1243,15 @@ async def bundles_attach_pick_quiz(cb:CallbackQuery, state:FSMContext):
     qid=int(cb.data.split(":")[2])
     qs=q_all("SELECT id,text FROM questions WHERE quiz_id=%s ORDER BY id",(qid,))
     if not qs:
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+        await cb.message.answer("هذا الاختبار بلا أسئلة.", reply_markup=owner_kb()); return await cb.answer()
     kb=InlineKeyboardBuilder()
     for q in qs[:100]:
-        preview = (q['text'][:40] + "") if len(q['text'])>40 else q['text']
+        preview = (q['text'][:40] + "…") if len(q['text'])>40 else q['text']
         kb.button(text=f"Q{q['id']} — {preview}", callback_data=f"bund:qq:{q['id']}")
     kb.adjust(1)
     await state.update_data(bundle_target_quiz=qid)
     await state.set_state(BundleStates.attach_pick_question)
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+    await cb.message.answer("اختر السؤال:", reply_markup=kb.as_markup())
     await cb.answer()
 
 @dp.callback_query(BundleStates.attach_pick_question, F.data.startswith("bund:qq:"))
@@ -1356,14 +1259,14 @@ async def bundles_attach_pick_question(cb:CallbackQuery, state:FSMContext):
     qid=int(cb.data.split(":")[2])
     rows = q_all("SELECT id,kind,title FROM shared_attachments ORDER BY id DESC LIMIT 100")
     if not rows:
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+        await cb.message.answer("لا يوجد مرفقات مشتركة لإرفاقها.", reply_markup=owner_kb()); return await cb.answer()
     kb=InlineKeyboardBuilder()
     for r in rows:
         label = f"{r['id']} — {r['kind']} — {(r['title'] or '')[:20]}"
         kb.button(text=label, callback_data=f"bund:pick:{qid}:{r['id']}")
     kb.adjust(1)
     await state.set_state(BundleStates.attach_pick_bundle)
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+    await cb.message.answer("اختر المرفق:", reply_markup=kb.as_markup())
     await cb.answer()
 
 @dp.callback_query(BundleStates.attach_pick_bundle, F.data.startswith("bund:pick:"))
@@ -1372,13 +1275,13 @@ async def bundles_attach_apply(cb:CallbackQuery, state:FSMContext):
     question_id = int(qid_str); bundle_id = int(bid_str)
     b = q_one("SELECT kind,file_id FROM shared_attachments WHERE id=%s",(bundle_id,))
     if not b:
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+        await cb.message.answer("المرفق غير موجود.", reply_markup=owner_kb()); return await cb.answer()
     pos_row = q_one("SELECT COALESCE(MAX(position),-1) AS p FROM question_attachments WHERE question_id=%s",(question_id,))
     pos = int(pos_row["p"]) + 1
     q_exec("INSERT INTO question_attachments(question_id,kind,file_id,position) VALUES (%s,%s,%s,%s)",
            (question_id, b["kind"], b["file_id"], pos))
     await state.clear()
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+    await cb.message.answer("✅ تم ربط المرفق بالسؤال.", reply_markup=owner_kb())
     await cb.answer()
 
 # ---------- Merge Quizzes ----------
@@ -1400,13 +1303,13 @@ async def merge_pick_dest(cb:CallbackQuery, state:FSMContext):
     await state.update_data(merge_dest=dest)
     rows=q_all("SELECT id,title FROM quizzes WHERE id<>%s ORDER BY id DESC",(dest,))
     if not rows: 
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+        await cb.message.answer("لا يوجد مصدر للدمج.", reply_markup=owner_kb()); return await cb.answer()
     kb=InlineKeyboardBuilder()
     for r in rows[:50]:
         kb.button(text=f"مصدر → {r['id']} — {r['title']}", callback_data=f"merge:src:{r['id']}")
     kb.adjust(1)
     await state.set_state(MergeStates.pick_source)
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+    await cb.message.answer("اختر <b>الاختبار المصدر</b> لنسخ أسئلته:", reply_markup=kb.as_markup())
     await cb.answer()
 
 @dp.callback_query(MergeStates.pick_source, F.data.startswith("merge:src:"))
@@ -1414,7 +1317,7 @@ async def merge_apply(cb:CallbackQuery, state:FSMContext):
     src=int(cb.data.split(":")[2])
     dest=(await state.get_data()).get("merge_dest")
     if not dest:
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+        await cb.message.answer("خطأ في اختيار الوجهة.", reply_markup=owner_kb()); return await cb.answer()
     qs = q_all("SELECT id,text,created_at FROM questions WHERE quiz_id=%s ORDER BY id",(src,))
     copied=0
     for q in qs:
@@ -1430,7 +1333,7 @@ async def merge_apply(cb:CallbackQuery, state:FSMContext):
                    (new_qid, a["kind"], a["file_id"], a["position"]))
         copied += 1
     await state.clear()
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+    await cb.message.answer(f"🔗 تم الدمج: نُسخ {copied} سؤالًا من {src} إلى {dest}.", reply_markup=owner_kb())
     await cb.answer()
 
 # ---------- Wipe All ----------
@@ -1447,10 +1350,10 @@ async def wipe_all_confirm(msg:Message, state:FSMContext):
 @dp.callback_query(WipeStates.waiting_confirm, F.data.in_({"wipe:yes","wipe:no"}))
 async def wipe_all_decide(cb:CallbackQuery, state:FSMContext):
     if cb.data=="wipe:no":
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+        await state.clear(); await cb.message.answer("تم الإلغاء ✅", reply_markup=owner_kb()); return await cb.answer()
     for tbl in ["options","question_attachments","questions","sent_polls","writing_submissions","quiz_responses","brief_windows","shared_attachments","quizzes"]:
         q_exec(f"DELETE FROM {tbl}")
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
+    await state.clear(); await cb.message.answer("🧹 تم حذف كل شيء.", reply_markup=owner_kb()); await cb.answer()
 
 # ---------- Runner ----------
 async def main():
@@ -1461,356 +1364,3 @@ async def main():
 if __name__=="__main__":
     try: asyncio.run(main())
     except (KeyboardInterrupt,SystemExit): pass
-
-
-# ---------- حذف سؤال ----------
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-
-def paginated_questions_kb(quiz_id:int, page:int=0, per_page:int=10, mode:str="del")->InlineKeyboardBuilder:
-    rows = q_all("SELECT id, text FROM questions WHERE quiz_id=%s ORDER BY id ASC", (quiz_id,))
-    kb = InlineKeyboardBuilder()
-    start = page*per_page
-    chunk = rows[start:start+per_page]
-    for r in chunk:
-        label = f"🗑️ حذف Q{r['id']}"
-        kb.button(text=label, callback_data=f"{mode}:{quiz_id}:{r['id']}")
-    # pagination
-    total = len(rows); pages = (total + per_page - 1)//per_page
-    nav = []
-    if page>0: kb.button(text="⬅️ السابق", callback_data=f"pgq:{mode}:{quiz_id}:{page-1}")
-    if page<pages-1: kb.button(text="التالي ➡️", callback_data=f"pgq:{mode}:{quiz_id}:{page+1}")
-    kb.adjust(1)
-    return kb
-
-@dp.message(F.text==BTN_DELQUESTION)
-async def del_question_start(msg:Message):
-    if not await ensure_owner(msg): return
-    rows = q_all("SELECT id,title FROM quizzes ORDER BY id DESC",( ))
-    if not rows:
-        return await msg.answer("لا يوجد اختبارات.", reply_markup=owner_kb())
-    kb = InlineKeyboardBuilder()
-    for r in rows[:50]:
-        kb.button(text=f"🗑️ حذف أسئلة: {r['id']} — {(r['title'] or '')[:16]}", callback_data=f"delpick:{r['id']}:0")
-    kb.adjust(1)
-    await msg.answer("اختر اختبارًا لحذف أسئلته:", reply_markup=kb.as_markup())
-
-@dp.callback_query(F.data.startswith("delpick:"))
-async def del_question_pick(cb:CallbackQuery):
-    if cb.from_user.id != OWNER_ID:
-        return await cb.answer("غير مصرح.", show_alert=True)
-    _, quiz_id, page = cb.data.split(":"); quiz_id=int(quiz_id); page=int(page)
-    kb = paginated_questions_kb(quiz_id, page, mode="del")
-    await cb.message.edit_text(f"🗑️ اختر سؤالًا للحذف — اختبار {quiz_id}
-صفحة {page+1}", reply_markup=kb.as_markup())
-    await cb.answer()
-
-@dp.callback_query(F.data.startswith("pgq:"))
-async def del_question_page(cb:CallbackQuery):
-    if cb.from_user.id != OWNER_ID:
-        return await cb.answer("غير مصرح.", show_alert=True)
-    _, mode, quiz_id, page = cb.data.split(":"); quiz_id=int(quiz_id); page=int(page)
-    kb = paginated_questions_kb(quiz_id, page, mode=mode)
-    title = "🗑️ اختر سؤالًا للحذف" if mode=="del" else "✏️ اختر سؤالًا للتعديل"
-    await cb.message.edit_text(f"{title} — اختبار {quiz_id}
-صفحة {page+1}", reply_markup=kb.as_markup())
-    await cb.answer()
-
-@dp.callback_query(F.data.startswith("del:"))
-async def del_question_confirm(cb:CallbackQuery):
-    if cb.from_user.id != OWNER_ID:
-        return await cb.answer("غير مصرح.", show_alert=True)
-    _, quiz_id, qid = cb.data.split(":"); quiz_id=int(quiz_id); qid=int(qid)
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✅ نعم، احذف", callback_data=f"delc:{qid}")
-    kb.button(text="❌ إلغاء", callback_data=f"delpick:{quiz_id}:0")
-    kb.adjust(2)
-    await cb.message.edit_text(f"تأكيد حذف السؤال {qid}؟", reply_markup=kb.as_markup())
-    await cb.answer()
-
-@dp.callback_query(F.data.startswith("delc:"))
-async def del_question_apply(cb:CallbackQuery):
-    if cb.from_user.id != OWNER_ID:
-        return await cb.answer("غير مصرح.", show_alert=True)
-    _, qid = cb.data.split(":"); qid=int(qid)
-    # احذف الخيارات والمرفقات ثم السؤال
-    q_exec("DELETE FROM options WHERE question_id=%s", (qid,))
-    q_exec("DELETE FROM question_attachments WHERE question_id=%s", (qid,))
-    q_exec("DELETE FROM questions WHERE id=%s", (qid,))
-    await cb.message.edit_text(f"✅ تم حذف السؤال {qid}.", reply_markup=owner_kb())
-    await cb.answer()
-
-
-
-# --- Helper: return 1-based index of question inside quiz (ORDER BY id) ---
-def get_question_index(quiz_id:int, qid:int) -> int:
-    rows = q_all("SELECT id FROM questions WHERE quiz_id=%s ORDER BY id ASC", (quiz_id,))
-    for i, r in enumerate(rows, start=1):
-        if r["id"] == qid:
-            return i
-    return 0
-# ---------- عرض اختبارات/أسئلة بترقيم صفحات ----------
-def paginated_quizzes_kb(page:int=0, per_page:int=10):
-    rows = q_all("SELECT id,title FROM quizzes ORDER BY id DESC", ())
-    kb = InlineKeyboardBuilder()
-    start = page*per_page
-    chunk = rows[start:start+per_page]
-    for r in chunk:
-        title = (r['title'] or '')[:32]
-        kb.button(text=f"📦 {r['id']} — {title}", callback_data=f"qlist:{r['id']}")
-    if page>0: kb.button(text="⬅️ السابق", callback_data=f"pgql:{page-1}")
-    pages = (len(rows)+per_page-1)//per_page
-    if page<pages-1: kb.button(text="التالي ➡️", callback_data=f"pgql:{page+1}")
-    kb.adjust(1)
-    return kb, len(rows), pages
-
-@dp.message(F.text==BTN_LISTQUIZ)
-async def list_quizzes(msg:Message):
-    if not await ensure_owner(msg): return
-    kb, total, pages = paginated_quizzes_kb(0)
-    await msg.answer(f"📚 الاختبارات (الإجمالي: {total}) — صفحة 1/{max(pages,1)}", reply_markup=kb.as_markup())
-
-@dp.callback_query(F.data.startswith("pgql:"))
-async def list_quizzes_page(cb:CallbackQuery):
-    if cb.from_user.id != OWNER_ID:
-        return await cb.answer("غير مصرح.", show_alert=True)
-    _, page = cb.data.split(":"); page=int(page)
-    kb, total, pages = paginated_quizzes_kb(page)
-    await cb.message.edit_text(f"📚 الاختبارات (الإجمالي: {total}) — صفحة {page+1}/{max(pages,1)}", reply_markup=kb.as_markup())
-    await cb.answer()
-
-def paginated_questions_view_kb(quiz_id:int, page:int=0, per_page:int=10):
-    rows = q_all("SELECT id,text FROM questions WHERE quiz_id=%s ORDER BY id ASC", (quiz_id,))
-    kb = InlineKeyboardBuilder()
-    start = page*per_page
-    chunk = rows[start:start+per_page]
-    for r in chunk:
-        label = (r['text'] or '')[:40].replace('\n',' ')
-        kb.button(text=f"❓Q{r['id']} — {label}", callback_data=f\"qview:{quiz_id}:{r['id']}:{page}\")
-    total = len(rows); pages=(total+per_page-1)//per_page
-    if page>0: kb.button(text="⬅️ السابق", callback_data=f"pgqs:{quiz_id}:{page-1}")
-    if page<pages-1: kb.button(text="التالي ➡️", callback_data=f"pgqs:{quiz_id}:{page+1}")
-    kb.adjust(1)
-    return kb, total, pages
-
-@dp.callback_query(F.data.startswith("qlist:"))
-async def list_questions_of_quiz(cb:CallbackQuery):
-    if cb.from_user.id != OWNER_ID:
-        return await cb.answer("غير مصرح.", show_alert=True)
-    _, quiz_id = cb.data.split(":"); quiz_id=int(quiz_id)
-    kb, total, pages = paginated_questions_view_kb(quiz_id, 0)
-    await cb.message.edit_text(f"📝 أسئلة الاختبار {quiz_id} (الإجمالي: {total}) — صفحة 1/{max(pages,1)}", reply_markup=kb.as_markup())
-    await cb.answer()
-
-@dp.callback_query(F.data.startswith("pgqs:"))
-async def list_questions_page(cb:CallbackQuery):
-    if cb.from_user.id != OWNER_ID:
-        return await cb.answer("غير مصرح.", show_alert=True)
-    _, quiz_id, page = cb.data.split(":"); quiz_id=int(quiz_id); page=int(page)
-    kb, total, pages = paginated_questions_view_kb(quiz_id, page)
-    await cb.message.edit_text(f"📝 أسئلة الاختبار {quiz_id} (الإجمالي: {total}) — صفحة {page+1}/{max(pages,1)}", reply_markup=kb.as_markup())
-    await cb.answer()
-
-
-@dp.callback_query(F.data.startswith("qview:"))
-async def qview_question(cb: CallbackQuery):
-    # qview:<quiz_id>:<qid>:<page>
-    try:
-        _, quiz_id, qid, page = cb.data.split(":"); quiz_id=int(quiz_id); qid=int(qid); page=int(page)
-    except Exception:
-        # fallback if page not provided
-        parts = cb.data.split(":")
-        quiz_id = int(parts[1]); qid = int(parts[2]); page = 0
-    if cb.from_user.id != OWNER_ID:
-        return await cb.answer("غير مصرح.", show_alert=True)
-
-    qrow = q_one("SELECT text FROM questions WHERE id=%s", (qid,))
-    if not qrow:
-        await cb.message.edit_text("السؤال غير موجود.", reply_markup=owner_kb()); return
-
-    # fetch attachments
-    atts = q_all("SELECT id,kind,file_id,position FROM question_attachments WHERE question_id=%s ORDER BY position",(qid,))
-    # Build view text
-    txt = f"❓ <b>سؤال {qid}</b> — اختبار {quiz_id}\n\n<code>{(qrow['text'] or '').strip()}</code>"
-    kb = InlineKeyboardBuilder()
-    # زر إضافة مرفق جديد
-    kb.button(text="➕ إضافة مرفق", callback_data=f"attadd:{quiz_id}:{qid}:{page}")
-    if atts:
-        txt += f"\n\n📎 <b>المرفقات</b>:"
-        for a in atts:
-            label = "🖼️ صورة" if a['kind']=='photo' else ("🎙️ فويس" if a['kind']=='voice' else ("🎧 صوت" if a['kind']=='audio' else a['kind']))
-            kb.button(text=f"🔁 تبديل {label} #{a['position']}", callback_data=f"attrep:{a['id']}:{quiz_id}:{qid}:{page}")
-            kb.button(text=f"🗑️ حذف {label} #{a['position']}", callback_data=f"attdel:{a['id']}:{quiz_id}:{qid}:{page}")
-    else:
-        txt += "\n\n(لا يوجد مرفقات)"
-    # nav buttons
-    kb.button(text="⬅️ رجوع للقائمة", callback_data=f"pgqs:{quiz_id}:{page}")
-    kb.adjust(1)
-    try:
-        await cb.message.edit_text(txt, reply_markup=kb.as_markup(), parse_mode=ParseMode.HTML)
-    except Exception:
-        await cb.message.edit_caption(txt, reply_markup=kb.as_markup(), parse_mode=ParseMode.HTML)
-    await cb.answer()
-
-
-class AttReplaceStates(StatesGroup):
-    waiting_file = State()
-
-@dp.callback_query(F.data.startswith("attrep:"))
-async def attrep_prompt(cb: CallbackQuery, state: FSMContext):
-    # attrep:<att_id>:<quiz_id>:<qid>:<page>
-    _, att_id, quiz_id, qid, page = cb.data.split(":")
-    await state.update_data(att_id=int(att_id), quiz_id=int(quiz_id), qid=int(qid), page=int(page))
-    await state.set_state(AttReplaceStates.waiting_file)
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
-    await cb.answer()
-
-@dp.message(AttReplaceStates.waiting_file)
-async def attrep_receive(msg: Message, state: FSMContext):
-    d = await state.get_data()
-    att_id = int(d["att_id"]); quiz_id = int(d["quiz_id"]); qid = int(d["qid"]); page = int(d["page"])
-
-    # detect kind and file_id
-    kind = None; fid = None
-    if msg.photo:
-        kind = "photo"; fid = msg.photo[-1].file_id
-    elif msg.voice:
-        kind = "voice"; fid = msg.voice.file_id
-    elif msg.audio:
-        kind = "audio"; fid = msg.audio.file_id
-
-    if not fid:
-        return await msg.reply("❌ رجاءً أرسل صورة أو فويس أو ملف صوتي لتبديل المرفق.")
-
-    # update in DB
-    q_exec("UPDATE question_attachments SET kind=%s, file_id=%s WHERE id=%s", (kind, fid, att_id))
-    await state.clear()
-    # Refresh the view
-    kb, total, pages = paginated_questions_view_kb(quiz_id, page)
-    # re-open the same question view
-    # (call by sending a new message to keep it simple)
-    await msg.answer("✅ تم تبديل المرفق بنجاح.")
-    # send updated detail view
-    # simulate callback flow
-    class Dummy: pass
-    dummy = Dummy(); dummy.data = f"qview:{quiz_id}:{qid}:{page}"
-    # we can't call callback handler directly; reuse logic
-    qrow = q_one("SELECT text FROM questions WHERE id=%s", (qid,))
-    atts = q_all("SELECT id,kind,file_id,position FROM question_attachments WHERE question_id=%s ORDER BY position",(qid,))
-    txt = f"❓ <b>سؤال {qid}</b> — اختبار {quiz_id}\n\n<code>{(qrow['text'] or '').strip()}</code>"
-    from aiogram.utils.keyboard import InlineKeyboardBuilder
-    kb2 = InlineKeyboardBuilder()
-    if atts:
-        txt += f"\n\n📎 <b>المرفقات</b>:"
-        for a in atts:
-            label = "🖼️ صورة" if a['kind']=='photo' else ("🎙️ فويس" if a['kind']=='voice' else ("🎧 صوت" if a['kind']=='audio' else a['kind']))
-            kb2.button(text=f"🔁 تبديل {label} #{a['position']}", callback_data=f"attrep:{a['id']}:{quiz_id}:{qid}:{page}")
-    else:
-        txt += "\n\n(لا يوجد مرفقات)"
-    kb2.button(text="⬅️ رجوع للقائمة", callback_data=f"pgqs:{quiz_id}:{page}")
-    kb2.adjust(1)
-    try:
-        await msg.answer(txt, reply_markup=kb2.as_markup(), parse_mode=ParseMode.HTML)
-    except Exception:
-        await msg.answer(txt, reply_markup=kb2.as_markup())
-
-
-class AttAddStates(StatesGroup):
-    waiting_file = State()
-    pending_quiz_id = State()
-
-@dp.callback_query(F.data.startswith("attadd:"))
-async def attadd_prompt(cb: CallbackQuery, state: FSMContext):
-    # attadd:<quiz_id>:<qid>:<page>
-    _, quiz_id, qid, page = cb.data.split(":")
-    await state.update_data(mode="add", quiz_id=int(quiz_id), qid=int(qid), page=int(page))
-    await state.set_state(AttAddStates.waiting_file)
-        close_window(cb.message.chat.id); await cb.message.answerr("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb()); return await cb.answer()
-    await cb.answer()
-
-@dp.message(AttAddStates.waiting_file)
-async def attadd_receive(msg: Message, state: FSMContext):
-    d = await state.get_data()
-    quiz_id = int(d["quiz_id"]); qid = int(d["qid"]); page = int(d["page"])
-
-    kind = None; fid = None
-    if msg.photo:
-        kind = "photo"; fid = msg.photo[-1].file_id
-    elif msg.voice:
-        kind = "voice"; fid = msg.voice.file_id
-    elif msg.audio:
-        kind = "audio"; fid = msg.audio.file_id
-
-    if not fid:
-        return await msg.reply("❌ رجاءً أرسل صورة/فويس/صوت.")
-
-    posrow = q_one("SELECT COALESCE(MAX(position),0) AS m FROM question_attachments WHERE question_id=%s", (qid,))
-    newpos = (posrow["m"] or 0) + 1
-    q_exec("INSERT INTO question_attachments(question_id,kind,file_id,position) VALUES (%s,%s,%s,%s)", (qid, kind, fid, newpos))
-    await state.clear()
-    await msg.answer("✅ تمت إضافة المرفق.")
-    # عرض الصفحة المحدثة
-    qrow = q_one("SELECT text FROM questions WHERE id=%s", (qid,))
-    atts = q_all("SELECT id,kind,file_id,position FROM question_attachments WHERE question_id=%s ORDER BY position",(qid,))
-    txt = f"❓ <b>سؤال {qid}</b> — اختبار {quiz_id}\n\n<code>{(qrow['text'] or '').strip()}</code>"
-    kb2 = InlineKeyboardBuilder()
-    kb2.button(text="➕ إضافة مرفق", callback_data=f"attadd:{quiz_id}:{qid}:{page}")
-    if atts:
-        txt += f"\n\n📎 <b>المرفقات</b>:"
-        for a in atts:
-            label = "🖼️ صورة" if a['kind']=='photo' else ("🎙️ فويس" if a['kind']=='voice' else ("🎧 صوت" if a['kind']=='audio' else a['kind']))
-            kb2.button(text=f"🔁 تبديل {label} #{a['position']}", callback_data=f"attrep:{a['id']}:{quiz_id}:{qid}:{page}")
-            kb2.button(text=f"🗑️ حذف {label} #{a['position']}", callback_data=f"attdel:{a['id']}:{quiz_id}:{qid}:{page}")
-    else:
-        txt += "\n\n(لا يوجد مرفقات)"
-    kb2.button(text="⬅️ رجوع للقائمة", callback_data=f"pgqs:{quiz_id}:{page}")
-    kb2.adjust(1)
-    try:
-        await msg.answer(txt, reply_markup=kb2.as_markup(), parse_mode=ParseMode.HTML)
-    except Exception:
-        await msg.answer(txt, reply_markup=kb2.as_markup())
-
-
-@dp.callback_query(F.data.startswith("attdel:"))
-async def attdel_confirm(cb: CallbackQuery):
-    # attdel:<att_id>:<quiz_id>:<qid>:<page>
-    if cb.from_user.id != OWNER_ID:
-        return await cb.answer("غير مصرح.", show_alert=True)
-    _, att_id, quiz_id, qid, page = cb.data.split(":")
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✅ نعم، احذف", callback_data=f"attdelc:{att_id}:{quiz_id}:{qid}:{page}")
-    kb.button(text="❌ إلغاء", callback_data=f"qview:{quiz_id}:{qid}:{page}")
-    kb.adjust(2)
-    await cb.message.edit_text("تأكيد حذف هذا المرفق؟", reply_markup=kb.as_markup())
-    await cb.answer()
-
-@dp.callback_query(F.data.startswith("attdelc:"))
-async def attdel_apply(cb: CallbackQuery):
-    if cb.from_user.id != OWNER_ID:
-        return await cb.answer("غير مصرح.", show_alert=True)
-    _, att_id, quiz_id, qid, page = cb.data.split(":")
-    att_id = int(att_id); quiz_id=int(quiz_id); qid=int(qid); page=int(page)
-    q_exec("DELETE FROM question_attachments WHERE id=%s", (att_id,))
-    # رصّ المراكز من جديد
-    rows = q_all("SELECT id FROM question_attachments WHERE question_id=%s ORDER BY position",(qid,))
-    pos = 1
-    for r in rows:
-        q_exec("UPDATE question_attachments SET position=%s WHERE id=%s", (pos, r["id"]))
-        pos += 1
-    # رجّع لعرض السؤال
-    qrow = q_one("SELECT text FROM questions WHERE id=%s", (qid,))
-    atts = q_all("SELECT id,kind,file_id,position FROM question_attachments WHERE question_id=%s ORDER BY position",(qid,))
-    txt = f"❓ <b>سؤال {qid}</b> — اختبار {quiz_id}\n\n<code>{(qrow['text'] or '').strip()}</code>"
-    kb2 = InlineKeyboardBuilder()
-    kb2.button(text="➕ إضافة مرفق", callback_data=f"attadd:{quiz_id}:{qid}:{page}")
-    if atts:
-        txt += f"\n\n📎 <b>المرفقات</b>:"
-        for a in atts:
-            label = "🖼️ صورة" if a['kind']=='photo' else ("🎙️ فويس" if a['kind']=='voice' else ("🎧 صوت" if a['kind']=='audio' else a['kind']))
-            kb2.button(text=f"🔁 تبديل {label} #{a['position']}", callback_data=f"attrep:{a['id']}:{quiz_id}:{qid}:{page}")
-            kb2.button(text=f"🗑️ حذف {label} #{a['position']}", callback_data=f"attdel:{a['id']}:{quiz_id}:{qid}:{page}")
-    else:
-        txt += "\n\n(لا يوجد مرفقات)"
-    kb2.button(text="⬅️ رجوع للقائمة", callback_data=f"pgqs:{quiz_id}:{page}")
-    kb2.adjust(1)
-    await cb.message.edit_text(txt, reply_markup=kb2.as_markup(), parse_mode=ParseMode.HTML)
-    await cb.answer()
