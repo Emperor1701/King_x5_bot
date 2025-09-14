@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import asyncio, os, json, html, re, tempfile
+import asyncio, os, json, html, re, tempfile, socket, ssl
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Tuple
 
 from dotenv import load_dotenv
-from aiogram import Bot, Dispatcher, F, types
+from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, PollType
 from aiogram.types import (
@@ -20,6 +20,7 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 
+# --- OpenAI (اختياري) ---
 try:
     from openai import OpenAI
 except Exception:
@@ -27,7 +28,7 @@ except Exception:
 
 load_dotenv()
 
-# --- Configurable delays (via .env) ---
+# --- Rate limiting (قابلة للتعديل عبر .env) ---
 POLL_BASE_DELAY = float(os.getenv('POLL_BASE_DELAY', '0.9'))
 POLL_JITTER = float(os.getenv('POLL_JITTER', '0.6'))
 ATTACH_BASE_DELAY = float(os.getenv('ATTACH_BASE_DELAY', '1.2'))
@@ -44,6 +45,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_PROJECT = os.getenv("OPENAI_PROJECT", "").strip()  # اختياري
 if not BOT_TOKEN or not OWNER_ID or not DATABASE_URL:
     raise SystemExit("Set BOT_TOKEN, OWNER_ID, DATABASE_URL")
 
@@ -148,7 +150,7 @@ def ensure_schema():
     for ddl in ddls: q_exec(ddl)
 
 def migrate_schema():
-    # يكمل أي أعمدة ناقصة لو قاعدة البيانات قديمة
+    # يكمل أعمدة ناقصة لو كانت سكيمة قديمة
     q_exec("ALTER TABLE brief_windows ADD COLUMN IF NOT EXISTS prompt_text TEXT")
     q_exec("ALTER TABLE brief_windows ADD COLUMN IF NOT EXISTS ann_message_id BIGINT")
 
@@ -257,7 +259,7 @@ async def attach_file_to_question(question_id:int, kind:str, file_id:str):
     q_exec("INSERT INTO question_attachments(question_id,kind,file_id,position) VALUES (%s,%s,%s,%s)",
            (question_id, kind, file_id, pos))
 
-# --- Callback guard for NON-owner ---
+# --- Callback guard لغير المالك ---
 @dp.callback_query(
     F.from_user.id != OWNER_ID,
     F.data.regexp(r"^(addq|editq|delq|delqconfirm|briefdur|done:|skip:|wipe:|listq:|pickq:|editqs:|pickqs:|pub:|pubdur:|scoreq:|export:|bund:|merge:|att:|attadd:|attdone:|editm:)")
@@ -773,7 +775,7 @@ async def edit_attach_shared_done(cb:CallbackQuery, state:FSMContext):
     await cb.message.answer("✅ تم إضافة المرفقات من المشتركة.", reply_markup=owner_kb())
     await cb.answer()
 
-# ---------- Brief (manual open / stop) ----------
+# ---------- Brief (يدوي بالكامل) ----------
 MANUAL_CLOSES_AT = "9999-12-31T23:59:59+00:00"
 
 def open_window_manual(chat_id:int, owner:int, prompt:str)->Tuple[int,datetime]:
@@ -801,7 +803,7 @@ async def brief_start(msg:Message, state:FSMContext):
 async def brief_got_prompt(msg:Message, state:FSMContext):
     try:
         prompt=msg.text.strip()
-        migrate_schema()  # تأكيد الأعمدة
+        migrate_schema()
         bid, _ = open_window_manual(msg.chat.id, msg.from_user.id, prompt)
         kb = InlineKeyboardBuilder()
         kb.button(text="⛔ إيقاف الاستقبال", callback_data="briefstop")
@@ -857,21 +859,23 @@ async def brief_stop(cb:CallbackQuery):
         await cb.message.answer("⛔ تم إيقاف استقبال البريفات.", reply_markup=owner_kb())
     await cb.answer("تم الإيقاف")
 
-# ---------- Collect brief submissions ----------
+# ---------- تصحيح البريف (OpenAI أو بديل تقريبي) ----------
 client=None
 if OPENAI_API_KEY and OpenAI:
-    try: client=OpenAI(api_key=OPENAI_API_KEY)
-    except Exception: client=None
+    try:
+        client=OpenAI(api_key=OPENAI_API_KEY, project=OPENAI_PROJECT or None)
+    except Exception:
+        client=None
 
 async def ai_grade(text: str) -> Tuple[int, str, Dict, bool]:
     """
-    يرجع: (score, level, details_json, used_ai_flag)
-    details_json يحتوي دائمًا على 'source' = 'openai' أو 'fallback'
+    يرجع: (score, level, details, used_ai)
+    used_ai=True يعني تم استخدام OpenAI بنجاح.
     """
     if not client:
         base = min(20, max(0, len(text) // 35))
         lvl = "Unter A2" if base<=6 else ("A2" if base<=14 else "B1")
-        return base, lvl, {"note":"fallback heuristic (no OPENAI_API_KEY)", "source":"fallback"}, False
+        return base, lvl, {"note": "fallback heuristic (no OPENAI client)"}, False
     try:
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -885,22 +889,14 @@ async def ai_grade(text: str) -> Tuple[int, str, Dict, bool]:
         raw = resp.choices[0].message.content or "{}"
         data={}
         try: data=json.loads(raw)
-        except Exception: data={}
+        except Exception: pass
         score = int(max(0, min(20, int(data.get("score", 0)))))
         lvl = "Unter A2" if score<=6 else ("A2" if score<=14 else "B1")
-        data["source"] = "openai"
         return score, lvl, data, True
     except Exception as e:
         base = min(20, max(0, len(text) // 40))
         lvl = "Unter A2" if base<=6 else ("A2" if base<=14 else "B1")
-        return base, lvl, {"error": str(e), "source":"fallback"}, False
-
-@dp.message(Command("aimode"))
-async def aimode(msg: Message):
-    if client:
-        await msg.reply("🤖 المصحّح المستخدم: OpenAI ✅\n(قد يرجع تقديرًا تقريبيًا إذا صار خطأ اتصال)")
-    else:
-        await msg.reply("🤖 المصحّح المستخدم: تقدير تقريبي ⚠️\n(أضف OPENAI_API_KEY لاستخدام OpenAI)")
+        return base, lvl, {"error": str(e)}, False
 
 @dp.message(
     StateFilter("*"),
@@ -921,19 +917,85 @@ async def collect_briefs(msg:Message, u):
     text=msg.text.strip()
     score, lvl, details, used_ai = await ai_grade(text)
     fb=html.escape(details.get("feedback","")) if isinstance(details,dict) else ""
+    src = "OpenAI ✅" if used_ai else "تقريبي ⚠️"
+
+    # Debug للمالك فقط عند فشل AI
+    err_dbg = ""
+    if not used_ai and isinstance(details, dict) and details.get("error") and msg.from_user.id == OWNER_ID:
+        err_dbg = f"\n⚠️ <i>AI error:</i> <code>{html.escape(str(details.get('error')))}</code>"
+
     q_exec("""INSERT INTO writing_submissions(origin_chat_id,quiz_id,user_id,text,score,level,evaluated_at,details_json)
               VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
            (msg.chat.id,0,msg.from_user.id,text,score,lvl,_now().isoformat(),json.dumps(details,ensure_ascii=False)))
-    src = "OpenAI ✅" if used_ai else "تقريبي ⚠️"
     await msg.reply(
         f"📮 <b>Schreiben (B1 DTZ)</b>\n"
         f"👤 {html.escape(hname(msg.from_user))}\n"
         f"📊 <b>{score}/20</b>\n"
-        f"🎯 المستوى: <b>{lvl}</b>"
-        + (f"\n📝 ملاحظات: {fb}" if fb else "")
-        + f"\n🤖 المصحّح: <b>{src}</b>",
+        f"🎯 المستوى: <b>{lvl}</b>" + (f"\n📝 ملاحظات: {fb}" if fb else "") +
+        f"\n🤖 المصحّح: <b>{src}</b>" + err_dbg,
         reply_markup=owner_kb()
     )
+
+@dp.message(Command("aimode"))
+async def aimode(msg: Message):
+    await msg.reply("🤖 المصحّح المستخدم: OpenAI ✅ (قد يرجع تقديريًا تقريبيًا إذا صار خطأ اتصال)" if client else "🤖 المصحّح المستخدم: تقديري فقط ⚠️")
+
+# ---------- تشخيص شامل ----------
+@dp.message(Command("aidiag"))
+async def aidiag(msg: Message):
+    lines = []
+    def mask(s: str) -> str:
+        if not s: return "—"
+        return f"{s[:6]}...{s[-4:]} (len={len(s)})"
+    lines.append("OPENAI_API_KEY: " + ("✅ موجود " + mask(OPENAI_API_KEY) if OPENAI_API_KEY else "❌ مفقود"))
+    lines.append("OPENAI_PROJECT: " + (OPENAI_PROJECT if OPENAI_PROJECT else "—"))
+    lines.append("مكتبة openai: " + ("✅ مستوردة" if OpenAI else "❌ غير متاحة"))
+    # DNS/TLS
+    try:
+        ip = socket.gethostbyname("api.openai.com")
+        lines.append(f"DNS: api.openai.com → {ip} ✅")
+        s = socket.create_connection((ip, 443), timeout=3)
+        ctx = ssl.create_default_context()
+        with ctx.wrap_socket(s, server_hostname="api.openai.com"):
+            pass
+        lines.append("TLS 443: اتصال ناجح ✅")
+    except Exception as e:
+        lines.append(f"اتصال OpenAI: ❌ {e}")
+    # API call
+    try:
+        if OPENAI_API_KEY and OpenAI:
+            tmp_client = OpenAI(api_key=OPENAI_API_KEY, project=OPENAI_PROJECT or None)
+            models = tmp_client.models.list()
+            first_id = (models.data[0].id if getattr(models, "data", []) else "no-models")
+            lines.append(f"API models.list(): ✅ ({first_id})")
+        else:
+            lines.append("API models.list(): ⏭️ لم يُنفّذ (مفتاح أو مكتبة مفقودة)")
+    except Exception as e:
+        lines.append(f"API models.list(): ❌ {e}")
+    # DB & schema
+    try:
+        v = q_one("SELECT version() AS v")["v"]
+        lines.append("PostgreSQL: ✅ " + (v.split()[0] if v else "unknown"))
+        cols = q_all("SELECT column_name FROM information_schema.columns WHERE table_name='brief_windows'")
+        have = {r["column_name"] for r in cols}
+        need = {"prompt_text", "ann_message_id"}
+        missing = need - have
+        if missing: lines.append("brief_windows أعمدة: ❌ مفقود → " + ", ".join(sorted(missing)))
+        else: lines.append("brief_windows أعمدة: ✅ OK")
+    except Exception as e:
+        lines.append(f"قاعدة البيانات: ❌ {e}")
+    # mode
+    lines.append("وضع المصحّح الآن: " + ("OpenAI مُفعّل ✅" if client else "تقريبي فقط ⚠️"))
+    report = "🧪 <b>تشخيص الذكاء الاصطناعي</b>\n" + "\n".join("• " + l for l in lines)
+    await msg.reply(report)
+
+@dp.message(Command("fixschema"))
+async def fixschema(msg: Message):
+    try:
+        migrate_schema()
+        await msg.reply("🛠️ تمت ترقية السكيمة: ✅")
+    except Exception as e:
+        await msg.reply(f"🛠️ ترقية السكيمة فشلت: ❌ <code>{html.escape(str(e))}</code>")
 
 # ---------- Attachments sender ----------
 async def send_question_attachments(chat_id:int, question_id:int):
@@ -941,22 +1003,15 @@ async def send_question_attachments(chat_id:int, question_id:int):
     for a in atts:
         kind=a["kind"]; fid=a["file_id"]
         try:
-            if kind=="photo":
-                await bot.send_photo(chat_id, fid)
-            elif kind=="voice":
-                await bot.send_voice(chat_id, fid)
-            elif kind=="audio":
-                await bot.send_audio(chat_id, fid)
-            try:
-                await sleep_jitter('attach')
-            except Exception:
-                await asyncio.sleep(0.8)
+            if kind=="photo": await bot.send_photo(chat_id, fid)
+            elif kind=="voice": await bot.send_voice(chat_id, fid)
+            elif kind=="audio": await bot.send_audio(chat_id, fid)
+            try: await sleep_jitter('attach')
+            except Exception: await asyncio.sleep(0.8)
         except Exception as e:
             ra = getattr(e,'retry_after',None) or getattr(e,'timeout',None)
-            try:
-                await asyncio.sleep(float(ra)+1 if ra else 2.0)
-            except Exception:
-                pass
+            try: await asyncio.sleep(float(ra)+1 if ra else 2.0)
+            except Exception: pass
 
 # ---------- Publish quiz ----------
 @dp.message(F.text==BTN_PUBLISH)
@@ -1065,7 +1120,7 @@ async def _publish_quiz_now(cb_or_dummy, quiz_id:int, hours:int):
         reply_markup=owner_kb()
     )
 
-# ---------- Auto closer loop ----------
+# ---------- إغلاق تلقائي للاستطلاعات المنتهية ----------
 async def close_expired_polls_loop():
     while True:
         try:
@@ -1113,7 +1168,7 @@ async def on_poll_answer(pa: PollAnswer):
     except Exception:
         pass
 
-# ---------- Leaderboard ----------
+# ---------- لوحة النتائج ----------
 @dp.message(F.text==BTN_SCORE)
 async def score_entry(msg:Message):
     if not await ensure_owner(msg): return
