@@ -3,7 +3,7 @@
 
 import asyncio, os, json, html, re, tempfile
 from datetime import datetime, timezone, timedelta
-from typing import Optional, List, Dict, Tuple
+from typing import List, Dict, Tuple
 
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F, types
@@ -27,14 +27,14 @@ except Exception:
 
 load_dotenv()
 
-# --- Rate limiting delays (configurable via .env) ---
+# --- Configurable delays (via .env) ---
 POLL_BASE_DELAY = float(os.getenv('POLL_BASE_DELAY', '0.9'))
 POLL_JITTER = float(os.getenv('POLL_JITTER', '0.6'))
 ATTACH_BASE_DELAY = float(os.getenv('ATTACH_BASE_DELAY', '1.2'))
 ATTACH_JITTER = float(os.getenv('ATTACH_JITTER', '0.8'))
 
 async def sleep_jitter(kind: str = 'poll'):
-    import random, asyncio
+    import random
     if kind == 'attach':
         await asyncio.sleep(ATTACH_BASE_DELAY + random.random()*ATTACH_JITTER)
     else:
@@ -146,7 +146,14 @@ def ensure_schema():
         )"""
     ]
     for ddl in ddls: q_exec(ddl)
+
+def migrate_schema():
+    # يكمل أي أعمدة ناقصة لو قاعدة البيانات قديمة
+    q_exec("ALTER TABLE brief_windows ADD COLUMN IF NOT EXISTS prompt_text TEXT")
+    q_exec("ALTER TABLE brief_windows ADD COLUMN IF NOT EXISTS ann_message_id BIGINT")
+
 ensure_schema()
+migrate_schema()
 
 # ---------- UI ----------
 BTN_NEWQUIZ="🆕 إنشاء اختبار"; BTN_ADDQ="➕ إضافة سؤال"; BTN_LISTQUIZ="📚 عرض الاختبارات"
@@ -174,11 +181,8 @@ def owner_kb()->ReplyKeyboardMarkup:
         [KeyboardButton(text=BTN_WIPE_ALL)],
     ]
     return ReplyKeyboardMarkup(
-        keyboard=rows,
-        resize_keyboard=True,
-        one_time_keyboard=True,
-        is_persistent=False,
-        input_field_placeholder="اختر أمرًا من الأزرار 👇"
+        keyboard=rows, resize_keyboard=True, one_time_keyboard=True,
+        is_persistent=False, input_field_placeholder="اختر أمرًا من الأزرار 👇"
     )
 
 ALL_BTN_TEXTS = {
@@ -242,8 +246,7 @@ async def send_long(chat_id:int, text:str):
     buf=""
     for para in text.split("\n\n"):
         if len(buf)+len(para)+2>MAX and buf:
-            await bot.send_message(chat_id, buf)
-            buf=""
+            await bot.send_message(chat_id, buf); buf=""
         buf += (("\n\n" if buf else "") + para)
     if buf:
         await bot.send_message(chat_id, buf)
@@ -254,7 +257,7 @@ async def attach_file_to_question(question_id:int, kind:str, file_id:str):
     q_exec("INSERT INTO question_attachments(question_id,kind,file_id,position) VALUES (%s,%s,%s,%s)",
            (question_id, kind, file_id, pos))
 
-# --- Callback guard for NON-owner only ---
+# --- Callback guard for NON-owner ---
 @dp.callback_query(
     F.from_user.id != OWNER_ID,
     F.data.regexp(r"^(addq|editq|delq|delqconfirm|briefdur|done:|skip:|wipe:|listq:|pickq:|editqs:|pickqs:|pub:|pubdur:|scoreq:|export:|bund:|merge:|att:|attadd:|attdone:|editm:)")
@@ -280,8 +283,6 @@ class WipeStates(StatesGroup):
 
 class BriefStates(StatesGroup):
     waiting_prompt=State()
-    waiting_duration=State()
-    waiting_custom=State()
 
 class EditQStates(StatesGroup):
     pick_quiz=State()
@@ -314,9 +315,9 @@ class PublishStates(StatesGroup):
 # ---------- Parsers ----------
 _option_line_re = re.compile(
     r"""^\s*(
-        (\d+)[\)\.\-]\s*       # 1) or 1. or 1-
-       |([A-Za-z])[)\.\-]\s*   # A) or a) etc.
-       |[\-\*\•]\s*            # - bullet or * or •
+        (\d+)[\)\.\-]\s*
+       |([A-Za-z])[)\.\-]\s*
+       |[\-\*\•]\s*
     )?(?P<txt>.+?)\s*(?P<mark>(✅|\(\*\)|\*\)|\*\s*$))?\s*$""",
     re.X | re.U
 )
@@ -388,13 +389,12 @@ async def save_quiz_title(msg:Message, state:FSMContext):
     await state.clear()
     await msg.answer(f"✅ تم إنشاء الاختبار (ID {qid}).", reply_markup=owner_kb())
 
-# ---------- List quizzes (basic) ----------
+# ---------- List quizzes ----------
 @dp.message(F.text==BTN_LISTQUIZ)
-async def list_quizzes_basic(msg:Message):
+async def list_quizzes(msg:Message):
     if not await ensure_owner(msg): return
     rows = q_all("SELECT id,title FROM quizzes ORDER BY id DESC")
-    if not rows:
-        return await msg.answer("لا يوجد اختبارات.\nأنشئ واحدًا أولاً.", reply_markup=owner_kb())
+    if not rows: return await msg.answer("لا يوجد اختبارات.\nأنشئ واحدًا أولاً.", reply_markup=owner_kb())
     kb=InlineKeyboardBuilder()
     for r in rows[:50]:
         kb.button(text=f"{r['id']} — {r['title']}", callback_data=f"listq:{r['id']}")
@@ -497,7 +497,7 @@ async def delq_apply(cb:CallbackQuery):
     await cb.message.answer("🗑️ تم حذف الاختبار.", reply_markup=owner_kb())
     await cb.answer()
 
-# ---------- Add Question (with attachment choice) ----------
+# ---------- Add Question ----------
 @dp.message(F.text==BTN_ADDQ)
 async def addq_start(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
@@ -539,8 +539,9 @@ async def got_q_block(msg:Message, state:FSMContext):
                    (new_q,i,t,1 if is_ok else 0))
             if is_ok: correct=i
         await state.update_data(question_id=new_q, opt_count=len(opts), needs_correct=(correct is None))
+        kb=attach_choice_kb()
         await state.set_state(BuildStates.waiting_attach_mode)
-        await msg.answer("اختر نوع المرفقات للسؤال:", reply_markup=attach_choice_kb())
+        await msg.answer("اختر نوع المرفقات للسؤال:", reply_markup=kb)
     except Exception as e:
         await msg.answer(f"⚠️ لم أفهم الرسالة: <code>{html.escape(str(e))}</code>")
 
@@ -617,7 +618,7 @@ async def set_correct(msg:Message, state:FSMContext):
     q_exec("UPDATE options SET is_correct=1 WHERE question_id=%s AND option_index=%s",(qid,i))
     await state.clear(); await msg.answer("✅ تم الحفظ النهائي.", reply_markup=owner_kb())
 
-# ---------- Edit single question (menu) ----------
+# ---------- Edit single question ----------
 @dp.message(F.text==BTN_EDITQUESTION)
 async def edit_question_entry(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
@@ -772,11 +773,10 @@ async def edit_attach_shared_done(cb:CallbackQuery, state:FSMContext):
     await cb.message.answer("✅ تم إضافة المرفقات من المشتركة.", reply_markup=owner_kb())
     await cb.answer()
 
-# ---------- Brief (manual open -> announce -> manual stop) ----------
+# ---------- Brief (manual open / stop) ----------
 MANUAL_CLOSES_AT = "9999-12-31T23:59:59+00:00"
 
 def open_window_manual(chat_id:int, owner:int, prompt:str)->Tuple[int,datetime]:
-    # Close any existing open window for this chat
     q_exec("UPDATE brief_windows SET is_open=0 WHERE origin_chat_id=%s AND is_open=1",(chat_id,))
     opened=_now()
     bid = insert_returning_id(
@@ -786,7 +786,8 @@ def open_window_manual(chat_id:int, owner:int, prompt:str)->Tuple[int,datetime]:
     )
     return bid, opened
 
-def close_window(chat_id:int): q_exec("UPDATE brief_windows SET is_open=0 WHERE origin_chat_id=%s AND is_open=1",(chat_id,))
+def close_window(chat_id:int):
+    q_exec("UPDATE brief_windows SET is_open=0 WHERE origin_chat_id=%s AND is_open=1",(chat_id,))
 
 @dp.message(Command("brief"))
 @dp.message(F.text==BTN_BRIEF)
@@ -800,9 +801,8 @@ async def brief_start(msg:Message, state:FSMContext):
 async def brief_got_prompt(msg:Message, state:FSMContext):
     try:
         prompt=msg.text.strip()
-        ensure_schema()
+        migrate_schema()  # للتأكد
         bid, _ = open_window_manual(msg.chat.id, msg.from_user.id, prompt)
-        # Announce with a single inline button to stop receiving
         kb = InlineKeyboardBuilder()
         kb.button(text="⛔ إيقاف الاستقبال", callback_data="briefstop")
         kb.adjust(1)
@@ -815,35 +815,28 @@ async def brief_got_prompt(msg:Message, state:FSMContext):
         q_exec("UPDATE brief_windows SET ann_message_id=%s WHERE id=%s",(m.message_id,bid))
         await state.clear()
     except Exception as e:
-        try:
-            await msg.reply(f"❌ حدث خطأ أثناء فتح نافذة البريف: <code>{html.escape(str(e))}</code>")
-        except Exception:
-            pass
+        await msg.reply(f"❌ حدث خطأ أثناء فتح نافذة البريف: <code>{html.escape(str(e))}</code>")
 
 @dp.message(Command("openbrief"))
 async def brief_open_direct(msg:Message):
-    # Owner-only shortcut: /openbrief نص السؤال
     if msg.from_user.id != OWNER_ID:
         return await msg.reply("للمالك فقط")
     parts = (msg.text or "").split(maxsplit=1)
     text = parts[1].strip() if len(parts) > 1 else ""
     if not text:
         return await msg.reply("اكتب: /openbrief نص_السؤال")
-    try:
-        ensure_schema()
-        bid, _ = open_window_manual(msg.chat.id, msg.from_user.id, text)
-        kb = InlineKeyboardBuilder()
-        kb.button(text="⛔ إيقاف الاستقبال", callback_data="briefstop")
-        kb.adjust(1)
-        m = await msg.answer(
-            f"📣 <b>سؤال البريف (B1 DTZ)</b>\n{html.escape(text)}\n\n"
-            f"✳️ الاستقبال <b>يدوي</b> — اضغط ⛔ عند الانتهاء.\n"
-            f"أرسلوا نص البريف هنا برسالة واحدة.",
-            reply_markup=kb.as_markup()
-        )
-        q_exec("UPDATE brief_windows SET ann_message_id=%s WHERE id=%s",(m.message_id,bid))
-    except Exception as e:
-        await msg.reply(f"❌ خطأ: <code>{html.escape(str(e))}</code>")
+    migrate_schema()
+    bid, _ = open_window_manual(msg.chat.id, msg.from_user.id, text)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⛔ إيقاف الاستقبال", callback_data="briefstop")
+    kb.adjust(1)
+    m = await msg.answer(
+        f"📣 <b>سؤال البريف (B1 DTZ)</b>\n{html.escape(text)}\n\n"
+        f"✳️ الاستقبال <b>يدوي</b> — اضغط ⛔ عند الانتهاء.\n"
+        f"أرسلوا نص البريف هنا برسالة واحدة.",
+        reply_markup=kb.as_markup()
+    )
+    q_exec("UPDATE brief_windows SET ann_message_id=%s WHERE id=%s",(m.message_id,bid))
 
 @dp.message(Command("briefstop"))
 async def brief_stop_cmd(msg:Message):
@@ -854,7 +847,6 @@ async def brief_stop_cmd(msg:Message):
 
 @dp.callback_query(F.data=="briefstop")
 async def brief_stop(cb:CallbackQuery):
-    # Only the owner can stop the window
     if cb.from_user.id != OWNER_ID:
         return await cb.answer("للمالك فقط", show_alert=True)
     close_window(cb.message.chat.id)
@@ -911,7 +903,6 @@ async def collect_briefs(msg:Message, u):
     row = q_one("SELECT id,closes_at FROM brief_windows WHERE origin_chat_id=%s AND is_open=1 ORDER BY id DESC LIMIT 1",(msg.chat.id,))
     if not row:
         return
-    # In manual mode, closes_at is far-future; still keep this guard
     if row["closes_at"] <= _now().isoformat():
         q_exec("UPDATE brief_windows SET is_open=0 WHERE id=%s",(row["id"],))
         return
@@ -929,36 +920,30 @@ async def collect_briefs(msg:Message, u):
         reply_markup=owner_kb()
     )
 
-# ---------- Attachments sender (fixed) ----------
+# ---------- Attachments sender ----------
 async def send_question_attachments(chat_id:int, question_id:int):
-    atts = q_all(
-        "SELECT kind,file_id FROM question_attachments WHERE question_id=%s ORDER BY position",
-        (question_id,)
-    )
+    atts = q_all("SELECT kind,file_id FROM question_attachments WHERE question_id=%s ORDER BY position",(question_id,))
     for a in atts:
-        kind = a["kind"]; fid = a["file_id"]
+        kind=a["kind"]; fid=a["file_id"]
         try:
-            if kind == "photo":
+            if kind=="photo":
                 await bot.send_photo(chat_id, fid)
-            elif kind == "voice":
+            elif kind=="voice":
                 await bot.send_voice(chat_id, fid)
-            elif kind == "audio":
+            elif kind=="audio":
                 await bot.send_audio(chat_id, fid)
-            # jitter between attachments
             try:
                 await sleep_jitter('attach')
             except Exception:
                 await asyncio.sleep(0.8)
         except Exception as e:
-            # Backoff if Telegram suggests retry_after/timeout
-            ra = getattr(e, "retry_after", None) or getattr(e, "timeout", None)
+            ra = getattr(e,'retry_after',None) or getattr(e,'timeout',None)
             try:
-                await asyncio.sleep(float(ra) + 1 if ra else 2.0)
+                await asyncio.sleep(float(ra)+1 if ra else 2.0)
             except Exception:
                 pass
-            # continue to next attachment
 
-# ---------- Publish quiz with HOURS timer ----------
+# ---------- Publish quiz ----------
 @dp.message(F.text==BTN_PUBLISH)
 async def publish_entry(msg:Message):
     if not await ensure_owner(msg): return
@@ -979,7 +964,6 @@ async def publish_pick_hours(cb:CallbackQuery, state:FSMContext):
     await cb.message.answer("اختر مؤقّت النشر (بالساعات):", reply_markup=publish_hours_kb(quiz_id))
     await cb.answer()
 
-# Arabic numerals normalize
 def normalize_arabic_digits(s:str)->str:
     DIGITS_AR = "٠١٢٣٤٥٦٧٨٩"
     return s.translate({ord(a): str(i) for i,a in enumerate(DIGITS_AR)})
@@ -1006,50 +990,32 @@ async def publish_hours_custom(msg:Message, state:FSMContext):
     hours = int(m.group(1)); hours = max(1, min(240, hours))
     quiz_id = int((await state.get_data()).get("pub_quiz_id"))
     await state.clear()
-    # simulate callback-like flow
     class Dummy: pass
     dummy = Dummy(); dummy.message = msg
     await _publish_quiz_now(dummy, quiz_id, hours)
 
-# Proper publisher implementation
 async def _publish_quiz_now(cb_or_dummy, quiz_id:int, hours:int):
     chat_id = cb_or_dummy.message.chat.id
-    # expiry handling
     expiry_iso = None
     if hours and hours > 0:
         expiry = _now() + timedelta(hours=hours)
         expiry_iso = expiry.isoformat()
 
-    # fetch questions
-    questions = q_all(
-        "SELECT id, text FROM questions WHERE quiz_id=%s ORDER BY id",
-        (quiz_id,)
-    )
+    questions = q_all("SELECT id, text FROM questions WHERE quiz_id=%s ORDER BY id",(quiz_id,))
     sent = 0
-
     for q in questions:
-        # send attachments (ignore errors inside)
         try:
             await send_question_attachments(chat_id, q["id"])
         except Exception:
-            try:
-                await cb_or_dummy.message.answer(f"⚠️ تعذّر إرسال مرفقات للسؤال {q['id']}.")
-            except Exception:
-                pass
+            try: await cb_or_dummy.message.answer(f"⚠️ تعذّر إرسال مرفقات للسؤال {q['id']}.")
+            except Exception: pass
 
-        # options
-        opts = q_all(
-            "SELECT option_index,text,is_correct FROM options WHERE question_id=%s ORDER BY option_index",
-            (q["id"],)
-        )
-        if len(opts) < 2:
-            continue
+        opts = q_all("SELECT option_index,text,is_correct FROM options WHERE question_id=%s ORDER BY option_index",(q["id"],))
+        if len(opts) < 2: continue
+        correct = next((o for o in opts if int(o.get("is_correct",0))==1), None) or opts[0]
 
-        correct = next((o for o in opts if int(o.get("is_correct", 0)) == 1), None) or opts[0]
-
-        # Telegram limit max 10 options; ensure correct is included
         if len(opts) > 10:
-            incorrect = [o for o in opts if int(o.get("is_correct", 0)) != 1]
+            incorrect = [o for o in opts if int(o.get("is_correct",0)) != 1]
             selected = [correct] + incorrect[:9]
         else:
             selected = list(opts)
@@ -1060,44 +1026,31 @@ async def _publish_quiz_now(cb_or_dummy, quiz_id:int, hours:int):
 
         try:
             m = await bot.send_poll(
-                chat_id=chat_id,
-                question=question_text,
-                options=options_text,
-                type=PollType.QUIZ,
-                correct_option_id=correct_index,
-                is_anonymous=False,
+                chat_id=chat_id, question=question_text, options=options_text,
+                type=PollType.QUIZ, correct_option_id=correct_index, is_anonymous=False,
             )
             q_exec(
                 "INSERT INTO sent_polls (chat_id,quiz_id,question_id,poll_id,message_id,expires_at,is_closed) VALUES (%s,%s,%s,%s,%s,%s,0)",
                 (chat_id, quiz_id, q["id"], m.poll.id, m.message_id, expiry_iso)
             )
             sent += 1
-            try:
-                await sleep_jitter("poll")
-            except Exception:
-                await asyncio.sleep(0.8)
+            try: await sleep_jitter("poll")
+            except Exception: await asyncio.sleep(0.8)
         except Exception as e:
-            try:
-                await cb_or_dummy.message.answer(f"⚠️ تعذّر نشر سؤال ID {q['id']}: {e}")
-            except Exception:
-                pass
+            try: await cb_or_dummy.message.answer(f"⚠️ تعذّر نشر سؤال ID {q['id']}: {e}")
+            except Exception: pass
             try:
                 ra = getattr(e, "retry_after", None) or getattr(e, "timeout", None)
-                if ra:
-                    await asyncio.sleep(float(ra) + 1)
-                else:
-                    await asyncio.sleep(2.0)
-            except Exception:
-                pass
+                await asyncio.sleep(float(ra)+1 if ra else 2.0)
+            except Exception: pass
             continue
 
     await cb_or_dummy.message.answer(
-        f"🚀 تم نشر {sent} سؤالًا من الاختبار {quiz_id}" +
-        (f" — المؤقّت: {hours} ساعة" if hours and hours>0 else " — بدون مؤقّت"),
+        f"🚀 تم نشر {sent} سؤالًا من الاختبار {quiz_id}" + (f" — المؤقّت: {hours} ساعة" if hours and hours>0 else " — بدون مؤقّت"),
         reply_markup=owner_kb()
     )
 
-# ---------- Auto closer loop for expired polls ----------
+# ---------- Auto closer loop ----------
 async def close_expired_polls_loop():
     while True:
         try:
@@ -1115,25 +1068,19 @@ async def close_expired_polls_loop():
                     pass
                 q_exec("UPDATE sent_polls SET is_closed=1 WHERE id=%s",(r["id"],))
         except Exception:
-            # keep loop alive
             pass
-        await asyncio.sleep(30)  # check every 30s
+        await asyncio.sleep(30)
 
-# ---------- Handle Poll answers (confetti/X reaction, no text) ----------
+# ---------- Poll answers ----------
 @dp.poll_answer()
 async def on_poll_answer(pa: PollAnswer):
     poll_id = pa.poll_id
     chosen = pa.option_ids[0] if pa.option_ids else -1
     u = pa.user
     sp = q_one("SELECT chat_id, quiz_id, question_id, message_id, expires_at, is_closed FROM sent_polls WHERE poll_id=%s",(poll_id,))
-    if not sp:
-        return
-    # ignore late answers if manually closed
-    if sp["is_closed"]:
-        return
-    # ignore after expiry
-    if sp["expires_at"] and sp["expires_at"] <= _now().isoformat():
-        return
+    if not sp: return
+    if sp["is_closed"]: return
+    if sp["expires_at"] and sp["expires_at"] <= _now().isoformat(): return
     chat_id = sp["chat_id"]; quiz_id=sp["quiz_id"]; qid=sp["question_id"]; message_id=sp["message_id"]
     opt = q_one("SELECT is_correct FROM options WHERE question_id=%s AND option_index=%s",(qid,chosen))
     is_ok = int(opt["is_correct"]) if opt else 0
@@ -1145,10 +1092,8 @@ async def on_poll_answer(pa: PollAnswer):
     try:
         emoji = "🎉" if is_ok else "❌"
         await bot.set_message_reaction(
-            chat_id=chat_id,
-            message_id=message_id,
-            reaction=[ReactionTypeEmoji(emoji=emoji)],
-            is_big=True
+            chat_id=chat_id, message_id=message_id,
+            reaction=[ReactionTypeEmoji(emoji=emoji)], is_big=True
         )
     except Exception:
         pass
@@ -1186,7 +1131,7 @@ async def show_score(cb:CallbackQuery):
     await cb.message.answer(text, reply_markup=owner_kb())
     await cb.answer()
 
-# ---------- Export / Import (files + text) ----------
+# ---------- Export / Import ----------
 @dp.message(F.text==BTN_EXPORT)
 async def export_entry(msg:Message):
     if not await ensure_owner(msg): return
@@ -1205,10 +1150,7 @@ async def do_export(cb:CallbackQuery):
     if not qrow:
         await cb.message.answer("❌ لم يتم العثور على الاختبار."); return await cb.answer()
     qs = q_all("SELECT id,text FROM questions WHERE quiz_id=%s ORDER BY id",(quiz_id,))
-    payload = {
-        "title": qrow["title"],
-        "questions": []
-    }
+    payload = {"title": qrow["title"], "questions": []}
     for q in qs:
         opts = q_all("SELECT option_index,text,is_correct FROM options WHERE question_id=%s ORDER BY option_index",(q["id"],))
         payload["questions"].append({
@@ -1280,7 +1222,7 @@ async def _import_payload_create_quiz(data:dict, creator_id:int)->int:
                    (qid, i, t, ok))
     return quiz_id
 
-# ---------- Shared Attachments (Bundles) ----------
+# ---------- Shared Attachments ----------
 @dp.message(F.text==BTN_BUNDLES)
 async def bundles_entry(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
@@ -1398,7 +1340,7 @@ async def merge_pick_dest(cb:CallbackQuery, state:FSMContext):
     dest=int(cb.data.split(":")[2])
     await state.update_data(merge_dest=dest)
     rows=q_all("SELECT id,title FROM quizzes WHERE id<>%s ORDER BY id DESC",(dest,))
-    if not rows: 
+    if not rows:
         await cb.message.answer("لا يوجد مصدر للدمج.", reply_markup=owner_kb()); return await cb.answer()
     kb=InlineKeyboardBuilder()
     for r in rows[:50]:
@@ -1451,18 +1393,7 @@ async def wipe_all_decide(cb:CallbackQuery, state:FSMContext):
         q_exec(f"DELETE FROM {tbl}")
     await state.clear(); await cb.message.answer("🧹 تم حذف كل شيء.", reply_markup=owner_kb()); await cb.answer()
 
-# ---------- Runner ----------
-async def main():
-    # spawn closer loop
-    asyncio.create_task(close_expired_polls_loop())
-    await dp.start_polling(bot, allowed_updates=["message","callback_query","poll_answer"])
-
-if __name__=="__main__":
-    try: asyncio.run(main())
-    except (KeyboardInterrupt,SystemExit): pass
-
-
-# ---------- حذف سؤال ----------
+# ---------- حذف سؤال (صفحات) ----------
 def paginated_questions_kb(quiz_id:int, page:int=0, per_page:int=10, mode:str="del")->InlineKeyboardBuilder:
     rows = q_all("SELECT id, text FROM questions WHERE quiz_id=%s ORDER BY id ASC", (quiz_id,))
     kb = InlineKeyboardBuilder()
@@ -1471,12 +1402,9 @@ def paginated_questions_kb(quiz_id:int, page:int=0, per_page:int=10, mode:str="d
     for r in chunk:
         label = f"🗑️ حذف Q{r['id']}"
         kb.button(text=label, callback_data=f"{mode}:{quiz_id}:{r['id']}")
-    # pagination
     total = len(rows); pages = (total + per_page - 1)//per_page
-    if page>0:
-        kb.button(text="⬅️ السابق", callback_data=f"pgq:{mode}:{quiz_id}:{page-1}")
-    if page<pages-1:
-        kb.button(text="التالي ➡️", callback_data=f"pgq:{mode}:{quiz_id}:{page+1}")
+    if page>0: kb.button(text="⬅️ السابق", callback_data=f"pgq:{mode}:{quiz_id}:{page-1}")
+    if page<pages-1: kb.button(text="التالي ➡️", callback_data=f"pgq:{mode}:{quiz_id}:{page+1}")
     kb.adjust(1)
     return kb
 
@@ -1498,10 +1426,7 @@ async def del_question_pick(cb:CallbackQuery):
         return await cb.answer("غير مصرح.", show_alert=True)
     _, quiz_id, page = cb.data.split(":"); quiz_id=int(quiz_id); page=int(page)
     kb = paginated_questions_kb(quiz_id, page, mode="del")
-    await cb.message.edit_text(
-        f"🗑️ اختر سؤالًا للحذف — اختبار {quiz_id}\nصفحة {page+1}",
-        reply_markup=kb.as_markup()
-    )
+    await cb.message.answer(f"🗑️ اختر سؤالًا للحذف — اختبار {quiz_id}\nصفحة {page+1}", reply_markup=kb.as_markup())
     await cb.answer()
 
 @dp.callback_query(F.data.startswith("pgq:"))
@@ -1511,10 +1436,7 @@ async def del_question_page(cb:CallbackQuery):
     _, mode, quiz_id, page = cb.data.split(":"); quiz_id=int(quiz_id); page=int(page)
     kb = paginated_questions_kb(quiz_id, page, mode=mode)
     title = "🗑️ اختر سؤالًا للحذف" if mode=="del" else "✏️ اختر سؤالًا للتعديل"
-    await cb.message.edit_text(
-        f"{title} — اختبار {quiz_id}\nصفحة {page+1}",
-        reply_markup=kb.as_markup()
-    )
+    await cb.message.answer(f"{title} — اختبار {quiz_id}\nصفحة {page+1}", reply_markup=kb.as_markup())
     await cb.answer()
 
 @dp.callback_query(F.data.startswith("del:"))
@@ -1526,7 +1448,7 @@ async def del_question_confirm(cb:CallbackQuery):
     kb.button(text="✅ نعم، احذف", callback_data=f"delc:{qid}")
     kb.button(text="❌ إلغاء", callback_data=f"delpick:{quiz_id}:0")
     kb.adjust(2)
-    await cb.message.edit_text(f"تأكيد حذف السؤال {qid}؟", reply_markup=kb.as_markup())
+    await cb.message.answer(f"تأكيد حذف السؤال {qid}؟", reply_markup=kb.as_markup())
     await cb.answer()
 
 @dp.callback_query(F.data.startswith("delc:"))
@@ -1534,9 +1456,17 @@ async def del_question_apply(cb:CallbackQuery):
     if cb.from_user.id != OWNER_ID:
         return await cb.answer("غير مصرح.", show_alert=True)
     _, qid = cb.data.split(":"); qid=int(qid)
-    # احذف الخيارات والمرفقات ثم السؤال
     q_exec("DELETE FROM options WHERE question_id=%s", (qid,))
     q_exec("DELETE FROM question_attachments WHERE question_id=%s", (qid,))
     q_exec("DELETE FROM questions WHERE id=%s", (qid,))
-    await cb.message.edit_text(f"✅ تم حذف السؤال {qid}.", reply_markup=owner_kb())
+    await cb.message.answer(f"✅ تم حذف السؤال {qid}.", reply_markup=owner_kb())
     await cb.answer()
+
+# ---------- Runner ----------
+async def main():
+    asyncio.create_task(close_expired_polls_loop())
+    await dp.start_polling(bot, allowed_updates=["message","callback_query","poll_answer"])
+
+if __name__=="__main__":
+    try: asyncio.run(main())
+    except (KeyboardInterrupt,SystemExit): pass
