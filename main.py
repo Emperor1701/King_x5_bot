@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import asyncio, os, json, html, re, tempfile
+import asyncio, os, json, html, re, tempfile, math
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Tuple
 
@@ -254,10 +254,10 @@ async def attach_file_to_question(question_id:int, kind:str, file_id:str):
     q_exec("INSERT INTO question_attachments(question_id,kind,file_id,position) VALUES (%s,%s,%s,%s)",
            (question_id, kind, file_id, pos))
 
-# --- حارس أزرار لغير المالك ---
+# --- حارس أزرار لغير المالك (توسعة لأنماط التصفح) ---
 @dp.callback_query(
     F.from_user.id != OWNER_ID,
-    F.data.regexp(r"^(addq|editq|delq|delqconfirm|briefdur|done:|skip:|wipe:|listq:|pickq:|editqs:|pickqs:|pub:|pubdur:|scoreq:|export:|bund:|merge:|att:|attadd:|attdone:|editm:)")
+    F.data.regexp(r"^(addq|editq|delq|delqconfirm|briefstop|done:|skip:|wipe:|listq:|pgql:|pgqs:|delpick:|del:|delc:|pickq:|editqs:|pickqs:|pub:|pubdur:|scoreq:|export:|bund:|merge:|att:|attadd:|attdone:|editm:)")
 )
 async def admin_cb_guard(cb: CallbackQuery):
     await cb.answer("🚫 هذا الزر خاص بالمالك.", show_alert=True)
@@ -386,63 +386,143 @@ async def save_quiz_title(msg:Message, state:FSMContext):
     await state.clear()
     await msg.answer(f"✅ تم إنشاء الاختبار (ID {qid}).", reply_markup=owner_kb())
 
-# ---------- عرض الاختبارات ----------
-@dp.message(F.text==BTN_LISTQUIZ)
-async def list_quizzes(msg:Message):
-    if not await ensure_owner(msg): return
+# =========================================================
+# ===== Pagination v2 (5-per-page) — unified navigation ===
+# =========================================================
+PER_PAGE = 5
+
+def _paginate(rows: List[dict], page: int, per_page: int = PER_PAGE):
+    total = len(rows)
+    pages = max(1, math.ceil(total / per_page))
+    page = max(0, min(page, pages-1))
+    start = page * per_page
+    end = start + per_page
+    return rows[start:end], page, pages, total
+
+def _quizzes_page(mode: str, page: int = 0):
+    """
+    mode ∈ {'ql_view','ql_edit','ql_delete','ql_pick_editq','ql_pick_delq'}
+    """
     rows = q_all("SELECT id,title FROM quizzes ORDER BY id DESC")
-    if not rows: return await msg.answer("لا يوجد اختبارات.\nأنشئ واحدًا أولاً.", reply_markup=owner_kb())
-    kb=InlineKeyboardBuilder()
-    for r in rows[:50]:
-        kb.button(text=f"{r['id']} — {r['title']}", callback_data=f"listq:{r['id']}")
-    kb.adjust(1)
-    await msg.answer("اختر اختبارًا لعرض تفاصيله:", reply_markup=kb.as_markup())
+    chunk, page, pages, total = _paginate(rows, page)
 
-# ---------- عرض أسئلة الاختبار (كامل) ----------
-@dp.message(F.text==BTN_LISTQUESTIONS)
-async def list_questions_entry(msg:Message):
+    kb = InlineKeyboardBuilder()
+    for r in chunk:
+        title = (r['title'] or '')[:40]
+        if mode == "ql_view":
+            kb.button(text=f"📦 {r['id']} — {title}", callback_data=f"listq:{r['id']}")
+        elif mode == "ql_edit":
+            kb.button(text=f"✏️ {r['id']} — {title}", callback_data=f"editq:{r['id']}")
+        elif mode == "ql_delete":
+            kb.button(text=f"🗑️ {r['id']} — {title}", callback_data=f"delq:{r['id']}")
+        elif mode == "ql_pick_editq":
+            kb.button(text=f"❓ {r['id']} — {title}", callback_data=f"editqs:{r['id']}")
+        elif mode == "ql_pick_delq":
+            kb.button(text=f"🗑️ أسئلة {r['id']} — {title}", callback_data=f"delpick:{r['id']}:0")
+    if page > 0:
+        kb.button(text="⬅️ السابق", callback_data=f"pgql:{mode}:{page-1}")
+    if page < pages-1:
+        kb.button(text="التالي ➡️", callback_data=f"pgql:{mode}:{page+1}")
+    kb.adjust(1)
+    return kb.as_markup(), total, pages, page
+
+def _qs_page_text_header(prefix_emoji: str, title: str, total: int, page: int, pages: int):
+    return f"{prefix_emoji} <b>{title}</b> (الإجمالي: {total}) — صفحة {page+1}/{pages}"
+
+def _questions_page(quiz_id: int, mode: str, page: int = 0):
+    """
+    mode ∈ {'q_view','q_pick_edit','q_pick_delete'}
+    - يعرض نص السؤال كاملاً داخل الرسالة
+    """
+    rows = q_all("SELECT id,text FROM questions WHERE quiz_id=%s ORDER BY id ASC", (quiz_id,))
+    chunk, page, pages, total = _paginate(rows, page)
+
+    blocks = [_qs_page_text_header("📝", f"أسئلة الاختبار {quiz_id}", total, page, pages), ""]
+    for r in chunk:
+        blocks.append(f"❓ <b>Q{r['id']}</b>\n<code>{html.escape((r['text'] or '').strip())}</code>")
+        blocks.append("")
+    text = "\n".join(blocks).strip()
+
+    kb = InlineKeyboardBuilder()
+    for r in chunk:
+        if mode == "q_view":
+            kb.button(text=f"👁️ Q{r['id']}", callback_data=f"qview:{quiz_id}:{r['id']}:{page}")
+        elif mode == "q_pick_edit":
+            kb.button(text=f"✏️ تعديل Q{r['id']}", callback_data=f"pickqs:{r['id']}")
+        elif mode == "q_pick_delete":
+            kb.button(text=f"🗑️ حذف Q{r['id']}", callback_data=f"del:{quiz_id}:{r['id']}")
+    if page > 0:
+        kb.button(text="⬅️ السابق", callback_data=f"pgqs:{mode}:{quiz_id}:{page-1}")
+    if page < pages-1:
+        kb.button(text="التالي ➡️", callback_data=f"pgqs:{mode}:{quiz_id}:{page+1}")
+    kb.adjust(1)
+    return text, kb.as_markup(), total, pages, page
+# =========================================================
+
+# ================== عرض الاختبارات ==================
+@dp.message(F.text==BTN_LISTQUIZ)
+async def list_quizzes_cmd(msg: Message):
     if not await ensure_owner(msg): return
-    rows=q_all("SELECT id,title FROM quizzes ORDER BY id DESC")
-    if not rows: return await msg.answer("لا يوجد اختبارات.", reply_markup=owner_kb())
-    kb=InlineKeyboardBuilder()
-    for r in rows[:50]:
-        kb.button(text=f"📝 {r['id']} — {r['title']}", callback_data=f"listq:{r['id']}")
-    kb.adjust(1)
-    await msg.answer("اختر اختبارًا لعرض أسئلته كاملة:", reply_markup=kb.as_markup())
+    kb, total, pages, page = _quizzes_page("ql_view", 0)
+    await msg.answer(_qs_page_text_header("📚", "الاختبارات", total, page, pages), reply_markup=kb)
 
-@dp.callback_query(F.data.startswith("listq:"))
-async def show_quiz_details(cb:CallbackQuery):
-    qid=int(cb.data.split(":")[1])
-    title_row = q_one("SELECT title FROM quizzes WHERE id=%s",(qid,))
-    title = title_row["title"] if title_row else f"ID {qid}"
-    qs=q_all("SELECT id,text FROM questions WHERE quiz_id=%s ORDER BY id ASC",(qid,))
-    if not qs:
-        await cb.message.answer(f"📚 \"{html.escape(title)}\" بلا أسئلة بعد.", reply_markup=owner_kb()); return await cb.answer()
-    chunks=[]
-    current=f"📝 <b>أسئلة الاختبار:</b> {html.escape(title)}\n"
-    for q in qs:
-        opts=q_all("SELECT option_index,text,is_correct FROM options WHERE question_id=%s ORDER BY option_index",(q["id"],))
-        block=f"\n<b>Q{q['id']}:</b> {html.escape(q['text'])}\n" + "\n".join([f"{o['option_index']+1}) {html.escape(o['text'])} {'✅' if o['is_correct'] else ''}" for o in opts])
-        if len(current)+len(block) > 3500:
-            chunks.append(current); current=""
-        current += block
-    if current: chunks.append(current)
-    for part in chunks:
-        await cb.message.answer(part)
+# زر "عرض الأسئلة" يفتح نفس قائمة الاختبارات (استعراض)
+@dp.message(F.text==BTN_LISTQUESTIONS)
+async def list_questions_via_quizzes(msg: Message):
+    if not await ensure_owner(msg): return
+    kb, total, pages, page = _quizzes_page("ql_view", 0)
+    await msg.answer(_qs_page_text_header("📚", "الاختبارات", total, page, pages), reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("pgql:"))
+async def list_quizzes_nav(cb: CallbackQuery):
+    # pgql:<mode>:<page>
+    _, mode, page = cb.data.split(":")
+    page = int(page)
+    kb, total, pages, page = _quizzes_page(mode, page)
+    titles = {
+        "ql_view": ("📚", "الاختبارات"),
+        "ql_edit": ("🛠️", "تعديل اختبار — اختر اختبارًا"),
+        "ql_delete": ("🗑️", "حذف اختبار — اختر اختبارًا"),
+        "ql_pick_editq": ("✏️", "تعديل سؤال — اختر اختبارًا"),
+        "ql_pick_delq": ("🗑️", "حذف سؤال — اختر اختبارًا"),
+    }
+    emoji, ttl = titles.get(mode, ("📚", "الاختبارات"))
+    try:
+        await cb.message.edit_text(_qs_page_text_header(emoji, ttl, total, page, pages), reply_markup=kb)
+    except Exception:
+        await cb.message.answer(_qs_page_text_header(emoji, ttl, total, page, pages), reply_markup=kb)
     await cb.answer()
 
-# ---------- تعديل عنوان اختبار ----------
+# عند اختيار اختبار من عرض الاختبارات: اعرض أسئلته بصفحات (مشاهدة)
+@dp.callback_query(F.data.startswith("listq:"))
+async def list_quiz_questions_view(cb: CallbackQuery):
+    quiz_id = int(cb.data.split(":")[1])
+    text, kb, total, pages, page = _questions_page(quiz_id, "q_view", 0)
+    try:
+        await cb.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await cb.message.answer(text, reply_markup=kb)
+    await cb.answer()
+
+@dp.callback_query(F.data.startswith("pgqs:"))
+async def questions_nav(cb: CallbackQuery):
+    # pgqs:<mode>:<quiz_id>:<page>
+    _, mode, quiz_id, page = cb.data.split(":")
+    quiz_id = int(quiz_id); page = int(page)
+    text, kb, total, pages, page = _questions_page(quiz_id, mode, page)
+    try:
+        await cb.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await cb.message.answer(text, reply_markup=kb)
+    await cb.answer()
+
+# ================== تعديل عنوان اختبار ==================
 @dp.message(F.text==BTN_EDITQUIZ)
-async def editquiz(msg:Message, state:FSMContext):
+async def editquiz_start(msg: Message, state: FSMContext):
     if not await ensure_owner(msg): return
-    rows=q_all("SELECT id,title FROM quizzes ORDER BY id DESC")
-    if not rows: return await msg.answer("لا يوجد اختبارات.", reply_markup=owner_kb())
-    kb=InlineKeyboardBuilder()
-    for r in rows[:50]:
-        kb.button(text=f"✏️ {r['id']} — {r['title'][:30]}", callback_data=f"editq:{r['id']}")
-    kb.adjust(1)
     await state.set_state(BuildStates.waiting_pick_for_edit)
-    await msg.answer("اختر اختبارًا لتعديل العنوان:", reply_markup=kb.as_markup())
+    kb, total, pages, page = _quizzes_page("ql_edit", 0)
+    await msg.answer(_qs_page_text_header("🛠️", "تعديل اختبار — اختر اختبارًا", total, page, pages), reply_markup=kb)
 
 @dp.callback_query(BuildStates.waiting_pick_for_edit, F.data.startswith("editq:"))
 async def pick_for_edit(cb:CallbackQuery, state:FSMContext):
@@ -459,18 +539,13 @@ async def apply_edit(msg:Message, state:FSMContext):
     await state.clear()
     await msg.answer("✅ تم تعديل العنوان.", reply_markup=owner_kb())
 
-# ---------- حذف اختبار ----------
+# ================== حذف اختبار ==================
 @dp.message(F.text==BTN_DELQUIZ)
-async def delquiz(msg:Message, state:FSMContext):
+async def delquiz_start(msg: Message, state: FSMContext):
     if not await ensure_owner(msg): return
-    rows=q_all("SELECT id,title FROM quizzes ORDER BY id DESC")
-    if not rows: return await msg.answer("لا يوجد اختبارات.", reply_markup=owner_kb())
-    kb=InlineKeyboardBuilder()
-    for r in rows[:50]:
-        kb.button(text=f"🗑️ {r['id']} — {r['title'][:30]}", callback_data=f"delq:{r['id']}")
-    kb.adjust(1)
     await state.set_state(BuildStates.waiting_pick_for_delete)
-    await msg.answer("اختر اختبارًا للحذف:", reply_markup=kb.as_markup())
+    kb, total, pages, page = _quizzes_page("ql_delete", 0)
+    await msg.answer(_qs_page_text_header("🗑️", "حذف اختبار — اختر اختبارًا", total, page, pages), reply_markup=kb)
 
 @dp.callback_query(BuildStates.waiting_pick_for_delete, F.data.startswith("delq:"))
 async def delq_confirm(cb:CallbackQuery, state:FSMContext):
@@ -494,7 +569,7 @@ async def delq_apply(cb:CallbackQuery):
     await cb.message.answer("🗑️ تم حذف الاختبار.", reply_markup=owner_kb())
     await cb.answer()
 
-# ---------- إضافة سؤال ----------
+# ================== إضافة سؤال ==================
 @dp.message(F.text==BTN_ADDQ)
 async def addq_start(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
@@ -615,31 +690,20 @@ async def set_correct(msg:Message, state:FSMContext):
     q_exec("UPDATE options SET is_correct=1 WHERE question_id=%s AND option_index=%s",(qid,i))
     await state.clear(); await msg.answer("✅ تم الحفظ النهائي.", reply_markup=owner_kb())
 
-# ---------- تعديل سؤال واحد ----------
+# ================== تعديل سؤال ==================
 @dp.message(F.text==BTN_EDITQUESTION)
-async def edit_question_entry(msg:Message, state:FSMContext):
+async def edit_question_pick_quiz(msg: Message, state: FSMContext):
     if not await ensure_owner(msg): return
-    rows=q_all("SELECT id,title FROM quizzes ORDER BY id DESC")
-    if not rows: return await msg.answer("لا يوجد اختبارات.", reply_markup=owner_kb())
-    kb=InlineKeyboardBuilder()
-    for r in rows[:50]:
-        kb.button(text=f"{r['id']} — {r['title']}", callback_data=f"editqs:{r['id']}")
-    kb.adjust(1)
     await state.set_state(EditQStates.pick_quiz)
-    await msg.answer("اختر الاختبار لاختيار سؤال:", reply_markup=kb.as_markup())
+    kb, total, pages, page = _quizzes_page("ql_pick_editq", 0)
+    await msg.answer(_qs_page_text_header("✏️", "تعديل سؤال — اختر اختبارًا", total, page, pages), reply_markup=kb)
 
 @dp.callback_query(EditQStates.pick_quiz, F.data.startswith("editqs:"))
-async def pick_quiz_for_question(cb:CallbackQuery, state:FSMContext):
-    qz=int(cb.data.split(":")[1])
-    qs=q_all("SELECT id,text FROM questions WHERE quiz_id=%s ORDER BY id ASC",(qz,))
-    if not qs:
-        await cb.message.answer("لا يوجد أسئلة.", reply_markup=owner_kb()); return await cb.answer()
-    kb=InlineKeyboardBuilder()
-    for q in qs[:80]:
-        preview = (q['text'][:40] + "…") if len(q['text'])>40 else q['text']
-        kb.button(text=f"Q{q['id']} — {preview}", callback_data=f"pickqs:{q['id']}")
-    kb.adjust(1)
-    await cb.message.answer("اختر سؤالًا للتعديل:", reply_markup=kb.as_markup())
+async def pick_quiz_then_pick_question(cb: CallbackQuery, state: FSMContext):
+    qz = int(cb.data.split(":")[1])
+    await state.set_state(EditQStates.edit_menu)  # سنحدد لاحقًا بعد اختيار السؤال
+    text, kb, *_ = _questions_page(qz, "q_pick_edit", 0)
+    await cb.message.edit_text(text, reply_markup=kb)
     await cb.answer()
 
 @dp.callback_query(F.data.startswith("pickqs:"))
@@ -770,7 +834,7 @@ async def edit_attach_shared_done(cb:CallbackQuery, state:FSMContext):
     await cb.message.answer("✅ تم إضافة المرفقات من المشتركة.", reply_markup=owner_kb())
     await cb.answer()
 
-# ---------- بريف — يدوي بالكامل ----------
+# ================== بريف — يدوي بالكامل ==================
 MANUAL_CLOSES_AT = "9999-12-31T23:59:59+00:00"
 
 def open_window_manual(chat_id:int, owner:int, prompt:str)->Tuple[int,datetime]:
@@ -825,7 +889,6 @@ def free_b1_grade(text: str) -> Tuple[int, str, Dict]:
     sents = [s.strip() for s in sents if s.strip()]
     scount = len(sents)
 
-    # طول مناسب ~80-120 كلمة
     if 70 <= wc <= 140: length_score = 3
     elif 55 <= wc < 70 or 140 < wc <= 170: length_score = 2
     elif 40 <= wc < 55 or 170 < wc <= 220: length_score = 1
@@ -839,7 +902,7 @@ def free_b1_grade(text: str) -> Tuple[int, str, Dict]:
     last_block = " ".join(lines[-3:]).strip() if lines else raw
     has_name_like = bool(re.search(r"[A-ZÄÖÜ][a-zäöüß]{2,}\s+[A-ZÄÖÜ][a-zäöüß]{2,}", last_block))
 
-    structure_score = (2 if has_greet else 0) + (1 if has_close else 0) + (1 if has_name_like else 0)  # /4
+    structure_score = (2 if has_greet else 0) + (1 if has_close else 0) + (1 if has_name_like else 0)
 
     months = ["januar","februar","märz","maerz","april","mai","juni","juli","august","september","oktober","november","dezember","dez."]
     move_rx = r"(umzug|einzug|auszug|ab dem|ab\s+[\d\.]+\s+(%s)|am\s+[\d\.]+\s+(%s))" % ("|".join(months),"|".join(months))
@@ -892,7 +955,6 @@ def free_b1_grade(text: str) -> Tuple[int, str, Dict]:
     feedback = "جيد جدًا، استمرّ." if not tips else "؛ ".join(tips)
     return total, lvl, {"wc": wc, "sentences": scount, "coverage": cover, "feedback": feedback}
 
-# ---------- استقبال البريفات (بدون إظهار نتيجة مباشرة) ----------
 @dp.message(
     StateFilter("*"),
     F.text,
@@ -909,43 +971,36 @@ async def collect_briefs(msg:Message, u):
     if row["closes_at"] <= _now().isoformat():
         q_exec("UPDATE brief_windows SET is_open=0 WHERE id=%s",(row["id"],))
         return
-    # صحّح وخزّن فقط — لا ترسل نتيجة الآن
     text=msg.text.strip()
     score, lvl, details = free_b1_grade(text)
     q_exec("""INSERT INTO writing_submissions(origin_chat_id,quiz_id,user_id,username,text,score,level,evaluated_at,details_json,window_id)
               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
            (msg.chat.id,0,msg.from_user.id,(msg.from_user.username or ""),text,score,lvl,_now().isoformat(),json.dumps(details,ensure_ascii=False),row["id"]))
 
-# ---------- زر إيقاف الاستقبال + تقرير النتائج ----------
 @dp.callback_query(F.data=="briefstop")
 async def brief_stop(cb:CallbackQuery):
     if cb.from_user.id != OWNER_ID:
         return await cb.answer("للمالك فقط", show_alert=True)
 
-    # احضر النافذة المفتوحة الآن
     w = q_one("SELECT id,prompt_text FROM brief_windows WHERE origin_chat_id=%s AND is_open=1 ORDER BY id DESC LIMIT 1",(cb.message.chat.id,))
     if not w:
         return await cb.message.answer("لا توجد نافذة استقبال مفتوحة.", reply_markup=owner_kb())
 
-    # أغلقها
     close_window(cb.message.chat.id)
 
-    # اجمع آخر محاولة لكل مستخدم ضمن هذه النافذة
     rows = q_all("""SELECT user_id, COALESCE(NULLIF(username,''),'مجهول') AS uname, score, level, details_json, evaluated_at
                     FROM writing_submissions
                     WHERE origin_chat_id=%s AND window_id=%s
                     ORDER BY evaluated_at ASC""", (cb.message.chat.id, w["id"]))
     by_user: Dict[int, dict] = {}
     for r in rows:
-        by_user[r["user_id"]] = r  # آخر سجل (لأننا مرتبين تصاعديًا)
+        by_user[r["user_id"]] = r  # آخر محاولة
 
     if not by_user:
         return await cb.message.answer("⛔ تم الإيقاف — لم تصل أي مشاركات.", reply_markup=owner_kb())
 
-    # نظّم حسب الدرجة تنازليًا
     results = sorted(by_user.values(), key=lambda x: (-int(x["score"]), x["uname"]))
 
-    # ابني التقرير
     lines = []
     for i, r in enumerate(results, 1):
         fb = ""
@@ -1407,50 +1462,23 @@ async def merge_apply(cb:CallbackQuery, state:FSMContext):
     await cb.message.answer(f"🔗 تم الدمج: نُسخ {copied} سؤالًا من {src} إلى {dest}.", reply_markup=owner_kb())
     await cb.answer()
 
-# ---------- حذف سؤال (مع صفحات) ----------
-def paginated_questions_kb(quiz_id:int, page:int=0, per_page:int=10, mode:str="del")->InlineKeyboardBuilder:
-    rows = q_all("SELECT id, text FROM questions WHERE quiz_id=%s ORDER BY id ASC", (quiz_id,))
-    kb = InlineKeyboardBuilder()
-    start = page*per_page
-    chunk = rows[start:start+per_page]
-    for r in chunk:
-        label = f"🗑️ حذف Q{r['id']}"
-        kb.button(text=label, callback_data=f"{mode}:{quiz_id}:{r['id']}")
-    total = len(rows); pages = (total + per_page - 1)//per_page
-    if page>0: kb.button(text="⬅️ السابق", callback_data=f"pgq:{mode}:{quiz_id}:{page-1}")
-    if page<pages-1: kb.button(text="التالي ➡️", callback_data=f"pgq:{mode}:{quiz_id}:{page+1}")
-    kb.adjust(1)
-    return kb
-
+# ---------- حذف سؤال (نص كامل + صفحات 5) ----------
 @dp.message(F.text==BTN_DELQUESTION)
-async def del_question_start(msg:Message):
+async def del_question_pick_quiz(msg: Message):
     if not await ensure_owner(msg): return
-    rows = q_all("SELECT id,title FROM quizzes ORDER BY id DESC")
-    if not rows:
-        return await msg.answer("لا يوجد اختبارات.", reply_markup=owner_kb())
-    kb = InlineKeyboardBuilder()
-    for r in rows[:50]:
-        kb.button(text=f"🗑️ حذف أسئلة: {r['id']} — {(r['title'] or '')[:16]}", callback_data=f"delpick:{r['id']}:0")
-    kb.adjust(1)
-    await msg.answer("اختر اختبارًا لحذف أسئلته:", reply_markup=kb.as_markup())
+    kb, total, pages, page = _quizzes_page("ql_pick_delq", 0)
+    await msg.answer(_qs_page_text_header("🗑️", "حذف سؤال — اختر اختبارًا", total, page, pages), reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("delpick:"))
-async def del_question_pick(cb:CallbackQuery):
-    if cb.from_user.id != OWNER_ID:
-        return await cb.answer("غير مصرح.", show_alert=True)
-    _, quiz_id, page = cb.data.split(":"); quiz_id=int(quiz_id); page=int(page)
-    kb = paginated_questions_kb(quiz_id, page, mode="del")
-    await cb.message.answer(f"🗑️ اختر سؤالًا للحذف — اختبار {quiz_id}\nصفحة {page+1}", reply_markup=kb.as_markup())
-    await cb.answer()
-
-@dp.callback_query(F.data.startswith("pgq:"))
-async def del_question_page(cb:CallbackQuery):
-    if cb.from_user.id != OWNER_ID:
-        return await cb.answer("غير مصرح.", show_alert=True)
-    _, mode, quiz_id, page = cb.data.split(":"); quiz_id=int(quiz_id); page=int(page)
-    kb = paginated_questions_kb(quiz_id, page, mode=mode)
-    title = "🗑️ اختر سؤالًا للحذف" if mode=="del" else "✏️ اختر سؤالًا للتعديل"
-    await cb.message.answer(f"{title} — اختبار {quiz_id}\nصفحة {page+1}", reply_markup=kb.as_markup())
+async def del_question_pick_page(cb: CallbackQuery):
+    # delpick:<quiz_id>:<page>
+    _, quiz_id, page = cb.data.split(":")
+    quiz_id = int(quiz_id); page = int(page)
+    text, kb, *_ = _questions_page(quiz_id, "q_pick_delete", page)
+    try:
+        await cb.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await cb.message.answer(text, reply_markup=kb)
     await cb.answer()
 
 @dp.callback_query(F.data.startswith("del:"))
@@ -1475,6 +1503,25 @@ async def del_question_apply(cb:CallbackQuery):
     q_exec("DELETE FROM questions WHERE id=%s", (qid,))
     await cb.message.answer(f"✅ تم حذف السؤال {qid}.", reply_markup=owner_kb())
     await cb.answer()
+
+# ---------- مسح كل شيء ----------
+@dp.message(F.text==BTN_WIPE_ALL)
+async def wipe_all_confirm(msg:Message, state:FSMContext):
+    if not await ensure_owner(msg): return
+    kb=InlineKeyboardBuilder()
+    kb.button(text="✅ تأكيد", callback_data="wipe:yes")
+    kb.button(text="❌ إلغاء", callback_data="wipe:no")
+    kb.adjust(2)
+    await state.set_state(WipeStates.waiting_confirm)
+    await msg.answer("⚠️ هل تريد حذف كل البيانات؟ لا يمكن التراجع.", reply_markup=kb.as_markup())
+
+@dp.callback_query(WipeStates.waiting_confirm, F.data.in_({"wipe:yes","wipe:no"}))
+async def wipe_all_decide(cb:CallbackQuery, state:FSMContext):
+    if cb.data=="wipe:no":
+        await state.clear(); await cb.message.answer("تم الإلغاء ✅", reply_markup=owner_kb()); return await cb.answer()
+    for tbl in ["options","question_attachments","questions","sent_polls","writing_submissions","quiz_responses","brief_windows","shared_attachments","quizzes"]:
+        q_exec(f"DELETE FROM {tbl}")
+    await state.clear(); await cb.message.answer("🧹 تم حذف كل شيء.", reply_markup=owner_kb()); await cb.answer()
 
 # ---------- Runner ----------
 async def main():
