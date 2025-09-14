@@ -798,20 +798,59 @@ async def brief_start(msg:Message, state:FSMContext):
 
 @dp.message(BriefStates.waiting_prompt, F.text)
 async def brief_got_prompt(msg:Message, state:FSMContext):
-    prompt=msg.text.strip()
-    bid, _ = open_window_manual(msg.chat.id, msg.from_user.id, prompt)
-    # Announce with a single inline button to stop receiving
-    kb = InlineKeyboardBuilder()
-    kb.button(text="⛔ إيقاف الاستقبال", callback_data="briefstop")
-    kb.adjust(1)
-    m = await msg.answer(
-        f"📣 <b>سؤال البريف (B1 DTZ)</b>\n{html.escape(prompt)}\n\n"
-        f"✳️ الاستقبال <b>يدوي</b> — اضغط ⛔ عند الانتهاء.\n"
-        f"أرسلوا نص البريف هنا برسالة واحدة.",
-        reply_markup=kb.as_markup()
-    )
-    q_exec("UPDATE brief_windows SET ann_message_id=%s WHERE id=%s",(m.message_id,bid))
-    await state.clear()
+    try:
+        prompt=msg.text.strip()
+        ensure_schema()
+        bid, _ = open_window_manual(msg.chat.id, msg.from_user.id, prompt)
+        # Announce with a single inline button to stop receiving
+        kb = InlineKeyboardBuilder()
+        kb.button(text="⛔ إيقاف الاستقبال", callback_data="briefstop")
+        kb.adjust(1)
+        m = await msg.answer(
+            f"📣 <b>سؤال البريف (B1 DTZ)</b>\n{html.escape(prompt)}\n\n"
+            f"✳️ الاستقبال <b>يدوي</b> — اضغط ⛔ عند الانتهاء.\n"
+            f"أرسلوا نص البريف هنا برسالة واحدة.",
+            reply_markup=kb.as_markup()
+        )
+        q_exec("UPDATE brief_windows SET ann_message_id=%s WHERE id=%s",(m.message_id,bid))
+        await state.clear()
+    except Exception as e:
+        try:
+            await msg.reply(f"❌ حدث خطأ أثناء فتح نافذة البريف: <code>{html.escape(str(e))}</code>")
+        except Exception:
+            pass
+
+@dp.message(Command("openbrief"))
+async def brief_open_direct(msg:Message):
+    # Owner-only shortcut: /openbrief نص السؤال
+    if msg.from_user.id != OWNER_ID:
+        return await msg.reply("للمالك فقط")
+    parts = (msg.text or "").split(maxsplit=1)
+    text = parts[1].strip() if len(parts) > 1 else ""
+    if not text:
+        return await msg.reply("اكتب: /openbrief نص_السؤال")
+    try:
+        ensure_schema()
+        bid, _ = open_window_manual(msg.chat.id, msg.from_user.id, text)
+        kb = InlineKeyboardBuilder()
+        kb.button(text="⛔ إيقاف الاستقبال", callback_data="briefstop")
+        kb.adjust(1)
+        m = await msg.answer(
+            f"📣 <b>سؤال البريف (B1 DTZ)</b>\n{html.escape(text)}\n\n"
+            f"✳️ الاستقبال <b>يدوي</b> — اضغط ⛔ عند الانتهاء.\n"
+            f"أرسلوا نص البريف هنا برسالة واحدة.",
+            reply_markup=kb.as_markup()
+        )
+        q_exec("UPDATE brief_windows SET ann_message_id=%s WHERE id=%s",(m.message_id,bid))
+    except Exception as e:
+        await msg.reply(f"❌ خطأ: <code>{html.escape(str(e))}</code>")
+
+@dp.message(Command("briefstop"))
+async def brief_stop_cmd(msg:Message):
+    if msg.from_user.id != OWNER_ID:
+        return await msg.reply("للمالك فقط")
+    close_window(msg.chat.id)
+    await msg.reply("⛔ تم إيقاف استقبال البريفات.")
 
 @dp.callback_query(F.data=="briefstop")
 async def brief_stop(cb:CallbackQuery):
@@ -1500,260 +1539,4 @@ async def del_question_apply(cb:CallbackQuery):
     q_exec("DELETE FROM question_attachments WHERE question_id=%s", (qid,))
     q_exec("DELETE FROM questions WHERE id=%s", (qid,))
     await cb.message.edit_text(f"✅ تم حذف السؤال {qid}.", reply_markup=owner_kb())
-    await cb.answer()
-
-
-# ---------- عرض اختبارات/أسئلة بترقيم صفحات ----------
-def paginated_quizzes_kb(page:int=0, per_page:int=10):
-    rows = q_all("SELECT id,title FROM quizzes ORDER BY id DESC")
-    kb = InlineKeyboardBuilder()
-    start = page*per_page
-    chunk = rows[start:start+per_page]
-    for r in chunk:
-        title = (r['title'] or '')[:32]
-        kb.button(text=f"📦 {r['id']} — {title}", callback_data=f"qlist:{r['id']}")
-    if page>0: kb.button(text="⬅️ السابق", callback_data=f"pgql:{page-1}")
-    pages = (len(rows)+per_page-1)//per_page
-    if page<pages-1: kb.button(text="التالي ➡️", callback_data=f"pgql:{page+1}")
-    kb.adjust(1)
-    return kb, len(rows), pages
-
-@dp.callback_query(F.data.startswith("pgql:"))
-async def list_quizzes_page(cb:CallbackQuery):
-    if cb.from_user.id != OWNER_ID:
-        return await cb.answer("غير مصرح.", show_alert=True)
-    _, page = cb.data.split(":"); page=int(page)
-    kb, total, pages = paginated_quizzes_kb(page)
-    await cb.message.edit_text(f"📚 الاختبارات (الإجمالي: {total}) — صفحة {page+1}/{max(pages,1)}", reply_markup=kb.as_markup())
-    await cb.answer()
-
-def paginated_questions_view_kb(quiz_id:int, page:int=0, per_page:int=10):
-    rows = q_all("SELECT id,text FROM questions WHERE quiz_id=%s ORDER BY id ASC", (quiz_id,))
-    kb = InlineKeyboardBuilder()
-    start = page*per_page
-    chunk = rows[start:start+per_page]
-    for r in chunk:
-        label = (r['text'] or '')[:40].replace('\n',' ')
-        kb.button(text=f"❓Q{r['id']} — {label}", callback_data=f"qview:{quiz_id}:{r['id']}:{page}")
-    total = len(rows); pages=(total+per_page-1)//per_page
-    if page>0: kb.button(text="⬅️ السابق", callback_data=f"pgqs:{quiz_id}:{page-1}")
-    if page<pages-1: kb.button(text="التالي ➡️", callback_data=f"pgqs:{quiz_id}:{page+1}")
-    kb.adjust(1)
-    return kb, len(rows), pages
-
-@dp.callback_query(F.data.startswith("qlist:"))
-async def list_questions_of_quiz(cb:CallbackQuery):
-    if cb.from_user.id != OWNER_ID:
-        return await cb.answer("غير مصرح.", show_alert=True)
-    _, quiz_id = cb.data.split(":"); quiz_id=int(quiz_id)
-    kb, total, pages = paginated_questions_view_kb(quiz_id, 0)
-    await cb.message.edit_text(f"📝 أسئلة الاختبار {quiz_id} (الإجمالي: {total}) — صفحة 1/{max(pages,1)}", reply_markup=kb.as_markup())
-    await cb.answer()
-
-@dp.callback_query(F.data.startswith("pgqs:"))
-async def list_questions_page(cb:CallbackQuery):
-    if cb.from_user.id != OWNER_ID:
-        return await cb.answer("غير مصرح.", show_alert=True)
-    _, quiz_id, page = cb.data.split(":"); quiz_id=int(quiz_id); page=int(page)
-    kb, total, pages = paginated_questions_view_kb(quiz_id, page)
-    await cb.message.edit_text(f"📝 أسئلة الاختبار {quiz_id} (الإجمالي: {total}) — صفحة {page+1}/{max(pages,1)}", reply_markup=kb.as_markup())
-    await cb.answer()
-
-
-@dp.callback_query(F.data.startswith("qview:"))
-async def qview_question(cb: CallbackQuery):
-    # qview:<quiz_id>:<qid>:<page>
-    try:
-        _, quiz_id, qid, page = cb.data.split(":"); quiz_id=int(quiz_id); qid=int(qid); page=int(page)
-    except Exception:
-        # fallback if page not provided
-        parts = cb.data.split(":")
-        quiz_id = int(parts[1]); qid = int(parts[2]); page = 0
-    if cb.from_user.id != OWNER_ID:
-        return await cb.answer("غير مصرح.", show_alert=True)
-
-    qrow = q_one("SELECT text FROM questions WHERE id=%s", (qid,))
-    if not qrow:
-        await cb.message.edit_text("السؤال غير موجود.", reply_markup=owner_kb()); return
-
-    # fetch attachments
-    atts = q_all("SELECT id,kind,file_id,position FROM question_attachments WHERE question_id=%s ORDER BY position",(qid,))
-    # Build view text
-    txt = f"❓ <b>سؤال {qid}</b> — اختبار {quiz_id}\n\n<code>{(qrow['text'] or '').strip()}</code>"
-    kb = InlineKeyboardBuilder()
-    # زر إضافة مرفق جديد
-    kb.button(text="➕ إضافة مرفق", callback_data=f"attadd:{quiz_id}:{qid}:{page}")
-    if atts:
-        txt += f"\n\n📎 <b>المرفقات</b>:"
-        for a in atts:
-            label = "🖼️ صورة" if a['kind']=='photo' else ("🎙️ فويس" if a['kind']=='voice' else ("🎧 صوت" if a['kind']=='audio' else a['kind']))
-            kb.button(text=f"🔁 تبديل {label} #{a['position']}", callback_data=f"attrep:{a['id']}:{quiz_id}:{qid}:{page}")
-            kb.button(text=f"🗑️ حذف {label} #{a['position']}", callback_data=f"attdel:{a['id']}:{quiz_id}:{qid}:{page}")
-    else:
-        txt += "\n\n(لا يوجد مرفقات)"
-    # nav buttons
-    kb.button(text="⬅️ رجوع للقائمة", callback_data=f"pgqs:{quiz_id}:{page}")
-    kb.adjust(1)
-    try:
-        await cb.message.edit_text(txt, reply_markup=kb.as_markup(), parse_mode=ParseMode.HTML)
-    except Exception:
-        await cb.message.edit_caption(txt, reply_markup=kb.as_markup(), parse_mode=ParseMode.HTML)
-    await cb.answer()
-
-
-class AttReplaceStates(StatesGroup):
-    waiting_file = State()
-
-@dp.callback_query(F.data.startswith("attrep:"))
-async def attrep_prompt(cb: CallbackQuery, state: FSMContext):
-    # attrep:<att_id>:<quiz_id>:<qid>:<page>
-    _, att_id, quiz_id, qid, page = cb.data.split(":")
-    await state.update_data(att_id=int(att_id), quiz_id=int(quiz_id), qid=int(qid), page=int(page))
-    await state.set_state(AttReplaceStates.waiting_file)
-    await cb.message.answer("📎 أرسل المرفق الجديد لهذا السؤال (صورة/فويس/صوت).")
-    await cb.answer()
-
-@dp.message(AttReplaceStates.waiting_file)
-async def attrep_receive(msg: Message, state: FSMContext):
-    d = await state.get_data()
-    att_id = int(d["att_id"]); quiz_id = int(d["quiz_id"]); qid = int(d["qid"]); page = int(d["page"])
-
-    # detect kind and file_id
-    kind = None; fid = None
-    if msg.photo:
-        kind = "photo"; fid = msg.photo[-1].file_id
-    elif msg.voice:
-        kind = "voice"; fid = msg.voice.file_id
-    elif msg.audio:
-        kind = "audio"; fid = msg.audio.file_id
-
-    if not fid:
-        return await msg.reply("❌ رجاءً أرسل صورة أو فويس أو ملف صوتي لتبديل المرفق.")
-
-    # update in DB
-    q_exec("UPDATE question_attachments SET kind=%s, file_id=%s WHERE id=%s", (kind, fid, att_id))
-    await state.clear()
-    # Refresh the view
-    await msg.answer("✅ تم تبديل المرفق بنجاح.")
-    # send updated detail view
-    qrow = q_one("SELECT text FROM questions WHERE id=%s", (qid,))
-    atts = q_all("SELECT id,kind,file_id,position FROM question_attachments WHERE question_id=%s ORDER BY position",(qid,))
-    txt = f"❓ <b>سؤال {qid}</b> — اختبار {quiz_id}\n\n<code>{(qrow['text'] or '').strip()}</code>"
-    kb2 = InlineKeyboardBuilder()
-    kb2.button(text="➕ إضافة مرفق", callback_data=f"attadd:{quiz_id}:{qid}:{page}")
-    if atts:
-        txt += f"\n\n📎 <b>المرفقات</b>:"
-        for a in atts:
-            label = "🖼️ صورة" if a['kind']=='photo' else ("🎙️ فويس" if a['kind']=='voice' else ("🎧 صوت" if a['kind']=='audio' else a['kind']))
-            kb2.button(text=f"🔁 تبديل {label} #{a['position']}", callback_data=f"attrep:{a['id']}:{quiz_id}:{qid}:{page}")
-            kb2.button(text=f"🗑️ حذف {label} #{a['position']}", callback_data=f"attdel:{a['id']}:{quiz_id}:{qid}:{page}")
-    else:
-        txt += "\n\n(لا يوجد مرفقات)"
-    kb2.button(text="⬅️ رجوع للقائمة", callback_data=f"pgqs:{quiz_id}:{page}")
-    kb2.adjust(1)
-    try:
-        await msg.answer(txt, reply_markup=kb2.as_markup(), parse_mode=ParseMode.HTML)
-    except Exception:
-        await msg.answer(txt, reply_markup=kb2.as_markup())
-
-
-class AttAddStates(StatesGroup):
-    waiting_file = State()
-    pending_quiz_id = State()
-
-@dp.callback_query(F.data.startswith("attadd:"))
-async def attadd_prompt(cb: CallbackQuery, state: FSMContext):
-    # attadd:<quiz_id>:<qid>:<page>
-    _, quiz_id, qid, page = cb.data.split(":")
-    await state.update_data(mode="add", quiz_id=int(quiz_id), qid=int(qid), page=int(page))
-    await state.set_state(AttAddStates.waiting_file)
-    await cb.message.answer("📎 أرسل صورة/فويس/صوت لإضافته كمرفق جديد لهذا السؤال.")
-    await cb.answer()
-
-@dp.message(AttAddStates.waiting_file)
-async def attadd_receive(msg: Message, state: FSMContext):
-    d = await state.get_data()
-    quiz_id = int(d["quiz_id"]); qid = int(d["qid"]); page = int(d["page"])
-
-    kind = None; fid = None
-    if msg.photo:
-        kind = "photo"; fid = msg.photo[-1].file_id
-    elif msg.voice:
-        kind = "voice"; fid = msg.voice.file_id
-    elif msg.audio:
-        kind = "audio"; fid = msg.audio.file_id
-
-    if not fid:
-        return await msg.reply("❌ رجاءً أرسل صورة/فويس/صوت.")
-
-    posrow = q_one("SELECT COALESCE(MAX(position),0) AS m FROM question_attachments WHERE question_id=%s", (qid,))
-    newpos = (posrow["m"] or 0) + 1
-    q_exec("INSERT INTO question_attachments(question_id,kind,file_id,position) VALUES (%s,%s,%s,%s)", (qid, kind, fid, newpos))
-    await state.clear()
-    await msg.answer("✅ تمت إضافة المرفق.")
-    # عرض الصفحة المحدثة
-    qrow = q_one("SELECT text FROM questions WHERE id=%s", (qid,))
-    atts = q_all("SELECT id,kind,file_id,position FROM question_attachments WHERE question_id=%s ORDER BY position",(qid,))
-    txt = f"❓ <b>سؤال {qid}</b> — اختبار {quiz_id}\n\n<code>{(qrow['text'] or '').strip()}</code>"
-    kb2 = InlineKeyboardBuilder()
-    kb2.button(text="➕ إضافة مرفق", callback_data=f"attadd:{quiz_id}:{qid}:{page}")
-    if atts:
-        txt += f"\n\n📎 <b>المرفقات</b>:"
-        for a in atts:
-            label = "🖼️ صورة" if a['kind']=='photo' else ("🎙️ فويس" if a['kind']=='voice' else ("🎧 صوت" if a['kind']=='audio' else a['kind']))
-            kb2.button(text=f"🔁 تبديل {label} #{a['position']}", callback_data=f"attrep:{a['id']}:{quiz_id}:{qid}:{page}")
-            kb2.button(text=f"🗑️ حذف {label} #{a['position']}", callback_data=f"attdel:{a['id']}:{quiz_id}:{qid}:{page}")
-    else:
-        txt += "\n\n(لا يوجد مرفقات)"
-    kb2.button(text="⬅️ رجوع للقائمة", callback_data=f"pgqs:{quiz_id}:{page}")
-    kb2.adjust(1)
-    try:
-        await msg.answer(txt, reply_markup=kb2.as_markup(), parse_mode=ParseMode.HTML)
-    except Exception:
-        await msg.answer(txt, reply_markup=kb2.as_markup())
-
-
-@dp.callback_query(F.data.startswith("attdel:"))
-async def attdel_confirm(cb: CallbackQuery):
-    # attdel:<att_id>:<quiz_id>:<qid>:<page>
-    if cb.from_user.id != OWNER_ID:
-        return await cb.answer("غير مصرح.", show_alert=True)
-    _, att_id, quiz_id, qid, page = cb.data.split(":")
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✅ نعم، احذف", callback_data=f"attdelc:{att_id}:{quiz_id}:{qid}:{page}")
-    kb.button(text="❌ إلغاء", callback_data=f"qview:{quiz_id}:{qid}:{page}")
-    kb.adjust(2)
-    await cb.message.edit_text("تأكيد حذف هذا المرفق؟", reply_markup=kb.as_markup())
-    await cb.answer()
-
-@dp.callback_query(F.data.startswith("attdelc:"))
-async def attdel_apply(cb: CallbackQuery):
-    if cb.from_user.id != OWNER_ID:
-        return await cb.answer("غير مصرح.", show_alert=True)
-    _, att_id, quiz_id, qid, page = cb.data.split(":")
-    att_id = int(att_id); quiz_id=int(quiz_id); qid=int(qid); page=int(page)
-    q_exec("DELETE FROM question_attachments WHERE id=%s", (att_id,))
-    # رصّ المراكز من جديد
-    rows = q_all("SELECT id FROM question_attachments WHERE question_id=%s ORDER BY position",(qid,))
-    pos = 1
-    for r in rows:
-        q_exec("UPDATE question_attachments SET position=%s WHERE id=%s", (pos, r["id"]))
-        pos += 1
-    # رجّع لعرض السؤال
-    qrow = q_one("SELECT text FROM questions WHERE id=%s", (qid,))
-    atts = q_all("SELECT id,kind,file_id,position FROM question_attachments WHERE question_id=%s ORDER BY position",(qid,))
-    txt = f"❓ <b>سؤال {qid}</b> — اختبار {quiz_id}\n\n<code>{(qrow['text'] or '').strip()}</code>"
-    kb2 = InlineKeyboardBuilder()
-    kb2.button(text="➕ إضافة مرفق", callback_data=f"attadd:{quiz_id}:{qid}:{page}")
-    if atts:
-        txt += f"\n\n📎 <b>المرفقات</b>:"
-        for a in atts:
-            label = "🖼️ صورة" if a['kind']=='photo' else ("🎙️ فويس" if a['kind']=='voice' else ("🎧 صوت" if a['kind']=='audio' else a['kind']))
-            kb2.button(text=f"🔁 تبديل {label} #{a['position']}", callback_data=f"attrep:{a['id']}:{quiz_id}:{qid}:{page}")
-            kb2.button(text=f"🗑️ حذف {label} #{a['position']}", callback_data=f"attdel:{a['id']}:{quiz_id}:{qid}:{page}")
-    else:
-        txt += "\n\n(لا يوجد مرفقات)"
-    kb2.button(text="⬅️ رجوع للقائمة", callback_data=f"pgqs:{quiz_id}:{page}")
-    kb2.adjust(1)
-    await cb.message.edit_text(txt, reply_markup=kb2.as_markup(), parse_mode=ParseMode.HTML)
     await cb.answer()
