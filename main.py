@@ -152,7 +152,6 @@ def ensure_schema():
     for ddl in ddls: q_exec(ddl)
 
 def migrate_schema():
-    # أعمدة لضمان التوافق
     q_exec("ALTER TABLE sent_polls ADD COLUMN IF NOT EXISTS run_id INTEGER")
     q_exec("ALTER TABLE quiz_responses ADD COLUMN IF NOT EXISTS run_id INTEGER")
     q_exec("ALTER TABLE brief_windows ADD COLUMN IF NOT EXISTS prompt_text TEXT")
@@ -420,9 +419,6 @@ def _paginate(rows: List[dict], page: int, per_page: int = PER_PAGE):
     return rows[start:end], page, pages, total
 
 def _quizzes_page(mode: str, page: int = 0):
-    """
-    mode ∈ {'ql_view','ql_edit','ql_delete','ql_pick_editq','ql_pick_delq','ql_pick_score'}
-    """
     rows = q_all("SELECT id,title FROM quizzes ORDER BY id DESC")
     chunk, page, pages, total = _paginate(rows, page)
 
@@ -452,10 +448,6 @@ def _qs_page_text_header(prefix_emoji: str, title: str, total: int, page: int, p
     return f"{prefix_emoji} <b>{title}</b> (الإجمالي: {total}) — صفحة {page+1}/{pages}"
 
 def _questions_page(quiz_id: int, mode: str, page: int = 0):
-    """
-    mode ∈ {'q_view','q_pick_edit','q_pick_delete'}
-    - يعرض نص السؤال كامل بدون Q**
-    """
     rows = q_all("SELECT id,text FROM questions WHERE quiz_id=%s ORDER BY id ASC", (quiz_id,))
     chunk, page, pages, total = _paginate(rows, page)
 
@@ -490,7 +482,6 @@ async def list_quizzes_cmd(msg: Message):
     kb, total, pages, page = _quizzes_page("ql_view", 0)
     await msg.answer(_qs_page_text_header("📚", "الاختبارات", total, page, pages), reply_markup=kb)
 
-# زر "عرض الأسئلة" يفتح نفس قائمة الاختبارات (استعراض)
 @dp.message(F.text==BTN_LISTQUESTIONS)
 async def list_questions_via_quizzes(msg: Message):
     if not await ensure_owner(msg): return
@@ -518,7 +509,6 @@ async def list_quizzes_nav(cb: CallbackQuery):
         await cb.message.answer(_qs_page_text_header(emoji, ttl, total, page, pages), reply_markup=kb)
     await cb.answer()
 
-# عند اختيار اختبار من عرض الاختبارات: اعرض أسئلته بصفحات (مشاهدة)
 @dp.callback_query(F.data.startswith("listq:"))
 async def list_quiz_questions_view(cb: CallbackQuery):
     quiz_id = int(cb.data.split(":")[1])
@@ -539,6 +529,39 @@ async def questions_nav(cb: CallbackQuery):
         await cb.message.edit_text(text, reply_markup=kb)
     except Exception:
         await cb.message.answer(text, reply_markup=kb)
+    await cb.answer()
+
+# =========== عرض سؤال واحد مع الخيارات + إرسال المرفقات ===========
+@dp.callback_query(F.data.startswith("qview:"))
+async def qview_question(cb: CallbackQuery):
+    # qview:<quiz_id>:<qid>:<page>
+    parts = cb.data.split(":")
+    quiz_id = int(parts[1]); qid = int(parts[2]); page = int(parts[3]) if len(parts) > 3 else 0
+
+    qrow = q_one("SELECT text FROM questions WHERE id=%s", (qid,))
+    if not qrow:
+        await cb.message.answer("السؤال غير موجود.", reply_markup=owner_kb()); return await cb.answer()
+    opts = q_all("SELECT option_index,text,is_correct FROM options WHERE question_id=%s ORDER BY option_index",(qid,))
+
+    txt = f"❓ <b>سؤال — اختبار {quiz_id}</b>\n\n<code>{html.escape((qrow['text'] or '').strip())}</code>\n\n"
+    if opts:
+        txt += "<b>الخيارات:</b>\n" + "\n".join([f"{o['option_index']+1}) {html.escape(o['text'])} {'✅' if int(o['is_correct'])==1 else ''}" for o in opts])
+    else:
+        txt += "(لا يوجد خيارات)"
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⬅️ رجوع", callback_data=f"pgqs:q_view:{quiz_id}:{page}")
+    kb.adjust(1)
+
+    try:
+        await cb.message.edit_text(txt, reply_markup=kb.as_markup())
+    except Exception:
+        await cb.message.answer(txt, reply_markup=kb.as_markup())
+
+    # أرسل المرفقات (إن وجدت) كرسائل لاحقة
+    try:
+        await send_question_attachments(cb.message.chat.id, qid)
+    except Exception:
+        pass
     await cb.answer()
 
 # ================== تعديل عنوان اختبار ==================
@@ -735,17 +758,30 @@ async def pick_quiz_then_pick_question(cb: CallbackQuery, state: FSMContext):
 async def picked_question(cb:CallbackQuery, state:FSMContext):
     qid=int(cb.data.split(":")[1])
     await state.update_data(edit_question_id=qid)
-    row=q_one("SELECT text FROM questions WHERE id=%s",(qid,))
+    row=q_one("SELECT text,quiz_id FROM questions WHERE id=%s",(qid,))
     opts=q_all("SELECT option_index,text,is_correct FROM options WHERE question_id=%s ORDER BY option_index",(qid,))
-    txt="<b>السؤال الحالي:</b>\n" + f"<code>{html.escape(row['text'])}</code>" + "\n" + "\n".join([f"{o['option_index']+1}) {html.escape(o['text'])} {'✅' if o['is_correct'] else ''}" for o in opts])
+
+    txt="<b>السؤال الحالي:</b>\n" + f"<code>{html.escape(row['text'])}</code>" + "\n\n"
+    if opts:
+        txt += "<b>الخيارات:</b>\n" + "\n".join([f"{o['option_index']+1}) {html.escape(o['text'])} {'✅' if int(o['is_correct'])==1 else ''}" for o in opts])
+    else:
+        txt += "(لا يوجد خيارات)"
     kb=InlineKeyboardBuilder()
     kb.button(text="✏️ تعديل السؤال + الخيارات (معًا)", callback_data="editm:text")
     kb.button(text="🧩 تعديل الخيارات فقط", callback_data="editm:opts")
     kb.button(text="📎 إضافة/تبديل مرفقات", callback_data="editm:att_add")
     kb.button(text="🗑️ إزالة كل المرفقات", callback_data="editm:att_clear")
     kb.adjust(1)
+
     await state.set_state(EditQStates.edit_menu)
-    await cb.message.answer(txt + "\n\nاختر العملية:", reply_markup=kb.as_markup())
+    await cb.message.answer(txt, reply_markup=kb.as_markup())
+
+    # أرسل المرفقات الحالية (إن وجدت)
+    try:
+        await send_question_attachments(cb.message.chat.id, qid)
+    except Exception:
+        pass
+
     await cb.answer()
 
 @dp.callback_query(EditQStates.edit_menu, F.data=="editm:text")
@@ -859,7 +895,7 @@ async def edit_attach_shared_done(cb:CallbackQuery, state:FSMContext):
     await cb.message.answer("✅ تم إضافة المرفقات من المشتركة.", reply_markup=owner_kb())
     await cb.answer()
 
-# ================== بريف — يدوي بالكامل (كما طلبت سابقًا) ==================
+# ================== بريف — يدوي ==================
 MANUAL_CLOSES_AT = "9999-12-31T23:59:59+00:00"
 
 def open_window_manual(chat_id:int, owner:int, prompt:str)->Tuple[int,datetime]:
@@ -1105,7 +1141,6 @@ async def _publish_quiz_now(cb_or_dummy, quiz_id:int, hours:int):
         expiry = _now() + timedelta(hours=hours)
         expiry_iso = expiry.isoformat()
 
-    # أنشئ جلسة نشر (run)
     run_id = insert_returning_id(
         "INSERT INTO quiz_runs(chat_id,quiz_id,published_at) VALUES (%s,%s,%s)",
         (chat_id, quiz_id, _now().isoformat())
@@ -1197,7 +1232,6 @@ async def on_poll_answer(pa: PollAnswer):
               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
            (chat_id,quiz_id,qid,u.id, u.username or (u.full_name or ""), chosen, is_ok, _now().isoformat(), run_id))
 
-    # ردة فعل مرئية
     try:
         emoji = "🎉" if is_ok else "❌"
         await bot.set_message_reaction(
@@ -1207,7 +1241,6 @@ async def on_poll_answer(pa: PollAnswer):
     except Exception:
         pass
 
-    # إذا أكمل الطالب جميع أسئلة جلسة النشر -> أعلن نتيجته فوراً
     try:
         total_polls = q_one("SELECT COUNT(*) AS c FROM sent_polls WHERE run_id=%s",(run_id,))["c"]
         answered = q_one("SELECT COUNT(DISTINCT question_id) AS c FROM quiz_responses WHERE run_id=%s AND user_id=%s",(run_id,u.id))["c"]
@@ -1235,7 +1268,6 @@ async def score_pick_quiz(cb:CallbackQuery, state:FSMContext):
     quiz_id=int(quiz_id)
     await state.update_data(score_quiz_id=quiz_id)
 
-    # اعرض جلسات النشر لهذا الاختبار في هذا الكروب
     runs = q_all("""SELECT r.id, r.published_at, COUNT(sp.id)::int AS qcount
                     FROM quiz_runs r
                     LEFT JOIN sent_polls sp ON sp.run_id=r.id
@@ -1467,7 +1499,7 @@ async def bundles_attach_apply(cb:CallbackQuery, state:FSMContext):
     await cb.message.answer("✅ تم ربط المرفق بالسؤال.", reply_markup=owner_kb())
     await cb.answer()
 
-# ---------- حذف سؤال (عرض النص كامل + صفحات 5) ----------
+# ---------- حذف سؤال ----------
 @dp.message(F.text==BTN_DELQUESTION)
 async def del_question_pick_quiz(msg: Message):
     if not await ensure_owner(msg): return
