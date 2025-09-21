@@ -277,7 +277,11 @@ def publish_eval_kb(quiz_id:int, hours:int):
     return kb.as_markup()
 
 # ---------- Helpers ----------
-def _now()->datetime:BERLIN_TZ = ZoneInfo("Europe/Berlin")
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+# توقيت برلين + دالة تنسيق
+BERLIN_TZ = ZoneInfo("Europe/Berlin")
 
 def fmt_berlin(iso_str_or_dt) -> str:
     """
@@ -293,106 +297,136 @@ def fmt_berlin(iso_str_or_dt) -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(BERLIN_TZ).strftime("%Y-%m-%d %H:%M:%S")
- return datetime.now(timezone.utc)
-def is_owner(uid:int)->bool: return uid==OWNER_ID
-async def ensure_owner(msg:Message)->bool:
+
+def is_owner(uid: int) -> bool:
+    return uid == OWNER_ID
+
+async def ensure_owner(msg: Message) -> bool:
     if not is_owner(msg.from_user.id):
-        await msg.reply("🚫 هذا الزر/الأمر خاص بالمالك.", reply_markup=owner_kb()); return False
+        await msg.reply("🚫 هذا الزر/الأمر خاص بالمالك.", reply_markup=owner_kb())
+        return False
     return True
-def hname(u)->str:
-    nm=" ".join([x for x in [getattr(u,"first_name",None),getattr(u,"last_name",None)] if x]).strip()
-    if not nm and getattr(u,"username",None): nm=f"@{u.username}"
+
+def hname(u) -> str:
+    nm = " ".join([x for x in [getattr(u, "first_name", None), getattr(u, "last_name", None)] if x]).strip()
+    if not nm and getattr(u, "username", None):
+        nm = f"@{u.username}"
     return nm or f"UID {u.id}"
 
-def mention_html(user_id:int, name:str)->str:
-async def get_chat_label(chat_id:int)->str:
+def mention_html(user_id: int, name: str) -> str:
+    safe = html.escape(name or "مستخدم")
+    return f'<a href="tg://user?id={user_id}">{safe}</a>'
+
+# كاش لأسماء المجموعات
+async def get_chat_label(chat_id: int) -> str:
     row = q_one("SELECT title FROM chats_cache WHERE chat_id=%s", (chat_id,))
     if row and row.get("title"):
         return row["title"]
     try:
         ch = await bot.get_chat(chat_id)
         title = getattr(ch, "title", None) or getattr(ch, "full_name", None) or str(chat_id)
-        q_exec("""INSERT INTO chats_cache(chat_id,title,type,updated_at)
-                  VALUES (%s,%s,%s,%s)
-                  ON CONFLICT (chat_id) DO UPDATE SET title=EXCLUDED.title, type=EXCLUDED.type, updated_at=EXCLUDED.updated_at""",
-               (chat_id, title, getattr(ch,"type",""), _now().isoformat()))
+        q_exec(
+            """INSERT INTO chats_cache(chat_id,title,type,updated_at)
+               VALUES (%s,%s,%s,%s)
+               ON CONFLICT (chat_id) DO UPDATE
+               SET title=EXCLUDED.title, type=EXCLUDED.type, updated_at=EXCLUDED.updated_at""",
+            (chat_id, title, getattr(ch, "type", ""), _now().isoformat()),
+        )
         return title
     except Exception:
         return str(chat_id)
 
-    safe = html.escape(name or "مستخدم")
-    return f'<a href="tg://user?id={user_id}">{safe}</a>'
+# --- Single-Instance Lease helpers ---
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
-def _utcnow(): return datetime.now(timezone.utc)
-def _lease_until_iso(): return (_utcnow() + timedelta(seconds=LOCK_TTL_SECONDS)).isoformat()
+def _lease_until_iso() -> str:
+    return (_utcnow() + timedelta(seconds=LOCK_TTL_SECONDS)).isoformat()
 
-def try_acquire_lock(holder:str)->bool:
+def try_acquire_lock(holder: str) -> bool:
     now = _utcnow().isoformat()
     until = _lease_until_iso()
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            # جدّد لو منتهي أو إذا نحنا نفس الحامل
-            cur.execute("""
+            # جدد لو منتهي أو إذا كنا نفس الحامل
+            cur.execute(
+                """
                 UPDATE bot_lock
                    SET instance_id=%s, holder=%s, lease_until=%s, updated_at=%s
                  WHERE (lease_until <= %s) OR (holder=%s)
                 RETURNING id
-            """, (INSTANCE_ID, holder, until, now, now, holder))
+                """,
+                (INSTANCE_ID, holder, until, now, now, holder),
+            )
             row = cur.fetchone()
             if not row:
                 cur.execute("SELECT COUNT(*) FROM bot_lock WHERE lease_until > %s", (now,))
                 active = (cur.fetchone() or (0,))[0]
-                if int(active)==0:
-                    cur.execute("""INSERT INTO bot_lock(instance_id,holder,lease_until,updated_at)
-                                   VALUES (%s,%s,%s,%s) RETURNING id""",
-                                (INSTANCE_ID, holder, until, now))
+                if int(active) == 0:
+                    cur.execute(
+                        """
+                        INSERT INTO bot_lock(instance_id, holder, lease_until, updated_at)
+                        VALUES (%s, %s, %s, %s)
+                        RETURNING id
+                        """,
+                        (INSTANCE_ID, holder, until, now),
+                    )
                     row = cur.fetchone()
         conn.commit()
     return bool(row)
 
-def renew_lock(holder:str)->bool:
+def renew_lock(holder: str) -> bool:
     now = _utcnow().isoformat()
     until = _lease_until_iso()
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
+            cur.execute(
+                """
                 UPDATE bot_lock
                    SET lease_until=%s, updated_at=%s
                  WHERE holder=%s AND lease_until > %s
                 RETURNING id
-            """, (until, now, holder, now))
+                """,
+                (until, now, holder, now),
+            )
             ok = cur.fetchone()
         conn.commit()
     return bool(ok)
 
-async def lock_renew_loop(holder:str):
+async def lock_renew_loop(holder: str):
     while True:
         await asyncio.sleep(LOCK_RENEW_EVERY)
         try:
             if not renew_lock(holder):
-                try: await bot.close()
-                except Exception: pass
+                try:
+                    await bot.close()
+                except Exception:
+                    pass
                 print("LOCK LOST — another instance took the lease. Exiting.", flush=True)
                 os._exit(0)
         except Exception as e:
             print(f"LOCK RENEW ERROR: {e}", flush=True)
+# --- end Single-Instance Lease helpers ---
 
-async def send_long(chat_id:int, text:str):
-    MAX=3800
-    buf=""
+async def send_long(chat_id: int, text: str):
+    MAX = 3800
+    buf = ""
     for para in text.split("\n\n"):
-        if len(buf)+len(para)+2>MAX and buf:
+        if len(buf) + len(para) + 2 > MAX and buf:
             await bot.send_message(chat_id, buf)
-            buf=""
+            buf = ""
         buf += (("\n\n" if buf else "") + para)
     if buf:
         await bot.send_message(chat_id, buf)
 
-async def attach_file_to_question(question_id:int, kind:str, file_id:str):
-    pos_row = q_one("SELECT COALESCE(MAX(position),-1) AS p FROM question_attachments WHERE question_id=%s",(question_id,))
+async def attach_file_to_question(question_id: int, kind: str, file_id: str):
+    pos_row = q_one("SELECT COALESCE(MAX(position),-1) AS p FROM question_attachments WHERE question_id=%s", (question_id,))
     pos = int(pos_row["p"]) + 1
-    q_exec("INSERT INTO question_attachments(question_id,kind,file_id,position) VALUES (%s,%s,%s,%s)",
-           (question_id, kind, file_id, pos))
+    q_exec(
+        "INSERT INTO question_attachments(question_id,kind,file_id,position) VALUES (%s,%s,%s,%s)",
+        (question_id, kind, file_id, pos),
+    )
+
 
 # --- منع ضغط الأزرار لغير المالك ---
 @dp.callback_query(
