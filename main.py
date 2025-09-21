@@ -1,30 +1,16 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-import asyncio, os, json, html, re, tempfile, math
+import os, asyncio, html, re, json, tempfile, math, uuid
 from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Tuple
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, CallbackQuery
+from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode, PollType
-from aiogram.types import (
-    Message, CallbackQuery, PollAnswer,
-    ReplyKeyboardMarkup, KeyboardButton, FSInputFile, File,
-    ReactionTypeEmoji
-)
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.filters import Command, StateFilter
-from aiogram.fsm.state import StatesGroup, State
-from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
-
-from dotenv import load_dotenv
-from zoneinfo import ZoneInfo   # للتوقيت (برلين)
-import uuid                     # لتوليد INSTANCE_ID
-import os
-import asyncio
+from aiogram.fsm.state import StatesGroup, State
+import psycopg
+from psycopg_pool import ConnectionPool
 
 load_dotenv()
 
@@ -53,46 +39,36 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 if not BOT_TOKEN or not OWNER_ID or not DATABASE_URL:
     raise SystemExit("Set BOT_TOKEN, OWNER_ID, DATABASE_URL")
 
-# توقيت برلين (يُستخدم لاحقًا في fmt_berlin)
+# توقيت برلين
 BERLIN_TZ = ZoneInfo("Europe/Berlin")
 
 # --- إنشاء البوت والديزباشر ---
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 
-# ---------- Postgres ----------
-import psycopg
-from psycopg.rows import dict_row
-from psycopg_pool import ConnectionPool
-pool = ConnectionPool(conninfo=DATABASE_URL, kwargs={"row_factory": dict_row})
+# --- PostgreSQL pool ---
+pool = ConnectionPool(conninfo=DATABASE_URL, open=True)
 
-def q_exec(sql:str, params:tuple|list|None=None):
+# --- DB Helpers ---
+def q_exec(sql: str, params: tuple = ()):
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, params or ())
+            cur.execute(sql, params)
         conn.commit()
 
-def q_one(sql:str, params:tuple|list|None=None):
+def q_one(sql: str, params: tuple = ()):
     with pool.connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, params or ())
+        with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+            cur.execute(sql, params)
             return cur.fetchone()
 
-def q_all(sql:str, params:tuple|list|None=None)->List[dict]:
+def q_all(sql: str, params: tuple = ()):
     with pool.connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, params or ())
+        with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+            cur.execute(sql, params)
             return cur.fetchall()
 
-def insert_returning_id(sql:str, params:tuple|list|None=None)->int:
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql + " RETURNING id", params or ())
-            row = cur.fetchone()
-        conn.commit()
-    return int(row["id"] if isinstance(row, dict) else row[0])
-
-# ---------- Schema + Migrations ----------
+# --- DB Schema ---
 def ensure_schema():
     ddls = [
         """CREATE TABLE IF NOT EXISTS quizzes(
@@ -167,7 +143,7 @@ def ensure_schema():
         )"""
     ]
 
-    # جداول إضافية (خارج الليست لتجنب أخطاء الفواصل)
+    # إضافات جديدة
     ddls.append(
         """CREATE TABLE IF NOT EXISTS chats_cache(
             chat_id BIGINT PRIMARY KEY,
@@ -190,109 +166,9 @@ def ensure_schema():
     for ddl in ddls:
         q_exec(ddl)
 
-def migrate_schema():
-    q_exec("ALTER TABLE sent_polls ADD COLUMN IF NOT EXISTS run_id INTEGER")
-    q_exec("ALTER TABLE quiz_responses ADD COLUMN IF NOT EXISTS run_id INTEGER")
-    q_exec("ALTER TABLE brief_windows ADD COLUMN IF NOT EXISTS prompt_text TEXT")
-    q_exec("ALTER TABLE brief_windows ADD COLUMN IF NOT EXISTS ann_message_id BIGINT")
-    q_exec("ALTER TABLE writing_submissions ADD COLUMN IF NOT EXISTS username TEXT")
-    q_exec("ALTER TABLE writing_submissions ADD COLUMN IF NOT EXISTS window_id INTEGER")
-    q_exec("ALTER TABLE quiz_runs ADD COLUMN IF NOT EXISTS grade_enabled INTEGER NOT NULL DEFAULT 0")
-
-ensure_schema()
-migrate_schema()
-
-# ---------- UI ----------
-BTN_NEWQUIZ="🆕 إنشاء اختبار"; BTN_ADDQ="➕ إضافة سؤال"; BTN_LISTQUIZ="📚 عرض الاختبارات"
-BTN_EDITQUIZ="🛠️ تعديل اختبار"; BTN_DELQUIZ="🗑️ حذف اختبار"
-BTN_BUNDLES="📎 مرفقات مشتركة"; BTN_MERGE="🔗 دمج الاختبارات"
-BTN_EXPORT="📤 تصدير اختبار"; BTN_IMPORT="📥 استيراد دفعة"
-BTN_PUBLISH="🚀 نشر اختبار"; BTN_WIPE_ALL="🧹 حذف كل الاختبارات"
-BTN_SCORE="🏆 لوحة النتائج"; BTN_BACK_HOME="↩️ العودة للبداية"; BTN_BACK_STEP="⬅️ رجوع للخلف"
-BTN_BRIEF="✉️ زر إرسال البريف"
-BTN_LISTQUESTIONS="📝 عرض الأسئلة"
-BTN_EDITQUESTION="✏️ تعديل سؤال"
-BTN_DELQUESTION="🗑️ حذف سؤال"
-BTN_BRIEF_RESULTS = "📊 نتائج البريف"
-
-def owner_kb()->ReplyKeyboardMarkup:
-    rows=[
-        [KeyboardButton(text=BTN_BACK_HOME), KeyboardButton(text=BTN_BACK_STEP)],
-        [KeyboardButton(text=BTN_NEWQUIZ), KeyboardButton(text=BTN_ADDQ)],
-        [KeyboardButton(text=BTN_LISTQUIZ), KeyboardButton(text=BTN_EDITQUIZ)],
-        [KeyboardButton(text=BTN_LISTQUESTIONS), KeyboardButton(text=BTN_EDITQUESTION)],
-        [KeyboardButton(text=BTN_DELQUESTION)],
-        [KeyboardButton(text=BTN_DELQUIZ), KeyboardButton(text=BTN_BRIEF)],
-        [KeyboardButton(text=BTN_PUBLISH), KeyboardButton(text=BTN_SCORE)],
-        [KeyboardButton(text=BTN_EXPORT), KeyboardButton(text=BTN_IMPORT)],
-        [KeyboardButton(text=BTN_BUNDLES), KeyboardButton(text=BTN_MERGE)],
-        [KeyboardButton(text=BTN_WIPE_ALL)],
-[KeyboardButton(text=BTN_BRIEF_RESULTS)],
-
-    ]
-    return ReplyKeyboardMarkup(
-        keyboard=rows, resize_keyboard=True, one_time_keyboard=True,
-        is_persistent=False, input_field_placeholder="اختر أمرًا من الأزرار 👇"
-    )
-
-ALL_BTN_TEXTS = {
-    BTN_BACK_HOME, BTN_BACK_STEP, BTN_NEWQUIZ, BTN_ADDQ, BTN_LISTQUIZ, BTN_EDITQUIZ,
-    BTN_DELQUIZ, BTN_BRIEF, BTN_WIPE_ALL, BTN_SCORE, BTN_PUBLISH, BTN_BUNDLES,
-    BTN_MERGE, BTN_EXPORT, BTN_IMPORT, BTN_LISTQUESTIONS, BTN_EDITQUESTION, BTN_DELQUESTION, BTN_BRIEF_RESULTS,
-
-}
-
-def done_button_kb(tag: str):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✔️ تم", callback_data=f"done:{tag}")
-    kb.button(text="❌ بدون مرفقات", callback_data=f"skip:{tag}")
-    kb.adjust(2); return kb.as_markup()
-
-def inline_confirm_kb(tag:str):
-    kb=InlineKeyboardBuilder()
-    kb.button(text="✅ تأكيد", callback_data=f"{tag}:yes")
-    kb.button(text="❌ إلغاء", callback_data=f"{tag}:no")
-    kb.adjust(2); return kb.as_markup()
-
-def attach_choice_kb():
-    kb=InlineKeyboardBuilder()
-    kb.button(text="📎 مرفقات خاصة", callback_data="att:upload")
-    kb.button(text="📎 من المشتركة", callback_data="att:shared")
-    kb.button(text="❌ بدون مرفقات", callback_data="att:none")
-    kb.adjust(2,1); return kb.as_markup()
-
-def shared_list_kb(question_id:int):
-    rows = q_all("SELECT id,kind,title FROM shared_attachments ORDER BY id DESC LIMIT 100")
-    kb=InlineKeyboardBuilder()
-    for r in rows:
-        label=f"{r['id']} — {r['kind']} — {(r['title'] or '')[:20]}"
-        kb.button(text=label, callback_data=f"attadd:{question_id}:{r['id']}")
-    kb.button(text="✔️ تم", callback_data=f"attdone:{question_id}")
-    kb.adjust(1)
-    return kb.as_markup()
-
-def publish_hours_kb(quiz_id:int):
-    kb=InlineKeyboardBuilder()
-    for h in (1,2,4,8,24):
-        kb.button(text=f"⏳ {h} ساعة", callback_data=f"pubdur:{quiz_id}:{h}")
-    kb.button(text="⌨️ رقم مخصص", callback_data=f"pubdur:{quiz_id}:custom")
-    kb.button(text="♾️ بدون مؤقّت", callback_data=f"pubdur:{quiz_id}:0")
-    kb.adjust(2,2,1)
-    return kb.as_markup()
-
-def publish_eval_kb(quiz_id:int, hours:int):
-    kb=InlineKeyboardBuilder()
-    kb.button(text="✅ فعّل التقييم", callback_data=f"pubeval:{quiz_id}:{hours}:1")
-    kb.button(text="❌ بدون تقييم", callback_data=f"pubeval:{quiz_id}:{hours}:0")
-    kb.adjust(2)
-    return kb.as_markup()
-
 # ---------- Helpers ----------
 def _now() -> datetime:
     return datetime.now(timezone.utc)
-
-# توقيت برلين + دالة تنسيق
-BERLIN_TZ = ZoneInfo("Europe/Berlin")
 
 def fmt_berlin(iso_str_or_dt) -> str:
     """
@@ -328,7 +204,7 @@ def mention_html(user_id: int, name: str) -> str:
     safe = html.escape(name or "مستخدم")
     return f'<a href="tg://user?id={user_id}">{safe}</a>'
 
-# كاش لأسماء المجموعات
+# كاش أسماء المجموعات
 async def get_chat_label(chat_id: int) -> str:
     row = q_one("SELECT title FROM chats_cache WHERE chat_id=%s", (chat_id,))
     if row and row.get("title"):
@@ -359,7 +235,6 @@ def try_acquire_lock(holder: str) -> bool:
     until = _lease_until_iso()
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            # جدد لو منتهي أو إذا كنا نفس الحامل
             cur.execute(
                 """
                 UPDATE bot_lock
@@ -438,1473 +313,103 @@ async def attach_file_to_question(question_id: int, kind: str, file_id: str):
         (question_id, kind, file_id, pos),
     )
 
-
-# --- منع ضغط الأزرار لغير المالك ---
-@dp.callback_query(
-    F.from_user.id != OWNER_ID,
-    F.data.regexp(r"^(addq|editq|delq|delqconfirm|briefstop|done:|skip:|wipe:|listq:|pgql:|pgqs:|delpick:|del:|delc:|editqs:|pickqs:|qview:|pub:|pubdur:|pubeval:|scorepick:|scorerun:|export:|bund:|merge:|att:|attadd:|attdone:|editm:)")
-)
-async def admin_cb_guard(cb: CallbackQuery):
-    await cb.answer("🚫 هذا الزر خاص بالمالك.", show_alert=True)
-
-# ---------- States ----------
-class BuildStates(StatesGroup):
-    waiting_title=State()
-    waiting_pick_quiz_for_addq=State()
-    waiting_q_block=State()
-    waiting_correct_index=State()
-    waiting_pick_for_edit=State()
-    waiting_new_title=State()
-    waiting_pick_for_delete=State()
-    waiting_attach_mode=State()
-    waiting_q_attachments_upload=State()
-    waiting_q_attachments_shared=State()
-
-class WipeStates(StatesGroup):
-    waiting_confirm=State()
+# --- FSM States ---
+class QuizStates(StatesGroup):
+    waiting_title = State()
+    waiting_question = State()
+    waiting_option = State()
 
 class BriefStates(StatesGroup):
-    waiting_prompt=State()
+    waiting_brief = State()
 
-class EditQStates(StatesGroup):
-    pick_quiz=State()
-    edit_menu=State()
-    edit_text=State()
-    edit_options=State()
-    correct_index=State()
-    attach_mode=State()
-    attach_upload=State()
-    attach_shared=State()
-
-class ImportStates(StatesGroup):
-    waiting_json=State()
-
-class BundleStates(StatesGroup):
-    idle=State()
-    add_wait_file=State()
-    attach_pick_quiz=State()
-    attach_pick_question=State()
-    attach_pick_bundle=State()
-
-class MergeStates(StatesGroup):
-    pick_dest=State()
-    pick_source=State()
-
-class PublishStates(StatesGroup):
-    waiting_hours_custom=State()
-
-class ScoreStates(StatesGroup):
- class ScoreByGroupStates(StatesGroup):
+class ScoreByGroupStates(StatesGroup):
     pick_group = State()
-    pick_quiz = State()
-    pick_run = State()
 
-class BriefResultStates(StatesGroup):
+class BriefScoreStates(StatesGroup):
     pick_group = State()
-    pick_window = State()
 
+# --- منع ضغط الأزرار لغير المالك ---
+@dp.callback_query()
+async def admin_cb_guard(cb: CallbackQuery):
+    if cb.from_user.id != OWNER_ID and re.match(r"^(addq|editq|delq|...)", cb.data or ""):
+        await cb.answer("🚫 هذا الزر خاص بالكنغ فقط.", show_alert=True)
 
-# ---------- Parsers ----------
-_option_line_re = re.compile(
-    r"""^\s*(
-        (\d+)[\)\.\-]\s*
-       |([A-Za-z])[)\.\-]\s*
-       |[\-\*\•]\s*
-    )?(?P<txt>.+?)\s*(?P<mark>(✅|\(\*\)|\*\)|\*\s*$))?\s*$""",
-    re.X | re.U
-)
+# --- أوامر أساسية ---
+@dp.message(F.text == "/start")
+async def cmd_start(msg: Message):
+    await msg.answer("👋 أهلا بك! هذا البوت جاهز للاختبارات والتمارين.")
 
-def parse_q_block(text:str)->Tuple[str, List[Tuple[str,bool]]]:
-    lines=[l for l in (text.replace("\r","").split("\n")) if l.strip()]
-    if not lines: raise ValueError("نص فارغ.")
-    qline=lines[0].strip()
-    opts=[]
-    for l in lines[1:]:
-        m=_option_line_re.match(l)
-        if not m: continue
-        t=m.group("txt").strip()
-        if not t: continue
-        is_correct=bool(m.group("mark"))
-        opts.append((t,is_correct))
-    if len(opts)<2 or len(opts)>10:
-        raise ValueError("الرجاء إدخال 2 إلى 10 خيارات ضمن الرسالة.")
-    return qline, opts
-
-def parse_options_only(text:str)->List[Tuple[str,bool]]:
-    lines=[l for l in (text.replace("\r","").split("\n")) if l.strip()]
-    opts=[]
-    for l in lines:
-        m=_option_line_re.match(l)
-        if not m: continue
-        t=m.group("txt").strip()
-        if not t: continue
-        is_correct=bool(m.group("mark"))
-        opts.append((t,is_correct))
-    if len(opts)<2 or len(opts)>10:
-        raise ValueError("أدخل 2 إلى 10 خيارات.")
-    return opts
-
-# ---------- /start & back ----------
-@dp.message(Command("start"))
-async def start(msg:Message):
-    if is_owner(msg.from_user.id):
-        await msg.answer("لوحة التحكم جاهزة — اختر من الأزرار:", reply_markup=owner_kb())
-    else:
-        await msg.answer("أهلاً! هذا بوت اختبارات بإدارة المعلم.")
-
-@dp.message(F.text==BTN_BACK_HOME)
-async def back_home(msg:Message, state:FSMContext):
+@dp.message(F.text == "/newquiz")
+async def cmd_newquiz(msg: Message, state):
     if not await ensure_owner(msg): return
-    await state.clear()
-    await msg.answer("تم الرجوع للبداية.", reply_markup=owner_kb())
+    await msg.answer("أدخل عنوان الاختبار:")
+    await state.set_state(QuizStates.waiting_title)
 
-@dp.message(F.text==BTN_BACK_STEP)
-async def back_step(msg:Message, state:FSMContext):
-    if not await ensure_owner(msg): return
-    await state.clear()
-    await msg.answer("رجعنا خطوة (تمت إعادة الضبط).", reply_markup=owner_kb())
-
-# ---------- إنشاء اختبار ----------
-@dp.message(F.text==BTN_NEWQUIZ)
-async def new_quiz(msg:Message, state:FSMContext):
-    if not await ensure_owner(msg): return
-    await state.set_state(BuildStates.waiting_title)
-    await msg.answer("أرسل عنوان الاختبار:")
-
-@dp.message(BuildStates.waiting_title, F.text)
-async def save_quiz_title(msg:Message, state:FSMContext):
+@dp.message(QuizStates.waiting_title)
+async def quiz_title(msg: Message, state):
     title = msg.text.strip()
-    qid = insert_returning_id(
-        "INSERT INTO quizzes(title,created_by,created_at) VALUES (%s,%s,%s)",
-        (title, msg.from_user.id, _now().isoformat())
-    )
+    q_exec("INSERT INTO quizzes(title, created_by, created_at) VALUES (%s,%s,%s)",
+           (title, msg.from_user.id, _now().isoformat()))
+    await msg.answer(f"✅ تم إنشاء اختبار: {title}")
     await state.clear()
-    await msg.answer(f"✅ تم إنشاء الاختبار (ID {qid}).", reply_markup=owner_kb())
 
-# =========================================================
-# ===== Pagination (5-per-page) — موحّد ===================
-# =========================================================
-PER_PAGE = 5
-
-def _paginate(rows: List[dict], page: int, per_page: int = PER_PAGE):
-    total = len(rows)
-    pages = max(1, math.ceil(total / per_page))
-    page = max(0, min(page, pages-1))
-    start = page * per_page
-    end = start + per_page
-    return rows[start:end], page, pages, total
-
-def _quizzes_page(mode: str, page: int = 0):
-    """
-    mode ∈ {'ql_view','ql_edit','ql_delete','ql_pick_editq','ql_pick_delq','ql_pick_score'}
-    """
-    rows = q_all("SELECT id,title FROM quizzes ORDER BY id DESC")
-    chunk, page, pages, total = _paginate(rows, page)
-
-    kb = InlineKeyboardBuilder()
-    for r in chunk:
-        title = (r['title'] or '')[:40]
-        if mode == "ql_view":
-            kb.button(text=f"📦 {r['id']} — {title}", callback_data=f"listq:{r['id']}")
-        elif mode == "ql_edit":
-            kb.button(text=f"✏️ {r['id']} — {title}", callback_data=f"editq:{r['id']}")
-        elif mode == "ql_delete":
-            kb.button(text=f"🗑️ {r['id']} — {title}", callback_data=f"delq:{r['id']}")
-        elif mode == "ql_pick_editq":
-            kb.button(text=f"❓ {r['id']} — {title}", callback_data=f"editqs:{r['id']}")
-        elif mode == "ql_pick_delq":
-            kb.button(text=f"🗑️ أسئلة {r['id']} — {title}", callback_data=f"delpick:{r['id']}:0")
-        elif mode == "ql_pick_score":
-            kb.button(text=f"🏁 نتائج {r['id']} — {title}", callback_data=f"scorepick:{r['id']}:0")
-    if page > 0:
-        kb.button(text="⬅️ السابق", callback_data=f"pgql:{mode}:{page-1}")
-    if page < pages-1:
-        kb.button(text="التالي ➡️", callback_data=f"pgql:{mode}:{page+1}")
-    kb.adjust(1)
-    return kb.as_markup(), total, pages, page
-
-def _qs_page_text_header(prefix_emoji: str, title: str, total: int, page: int, pages: int):
-    return f"{prefix_emoji} <b>{title}</b> (الإجمالي: {total}) — صفحة {page+1}/{pages}"
-
-def _questions_page(quiz_id: int, mode: str, page: int = 0):
-    """
-    mode ∈ {'q_view','q_pick_edit','q_pick_delete'}
-    - يعرض نص السؤال كامل بدون Q**
-    """
-    rows = q_all("SELECT id,text FROM questions WHERE quiz_id=%s ORDER BY id ASC", (quiz_id,))
-    chunk, page, pages, total = _paginate(rows, page)
-
-    blocks = [_qs_page_text_header("📝", f"أسئلة الاختبار {quiz_id}", total, page, pages), ""]
-    for r in chunk:
-        qtxt = (r['text'] or '').strip()
-        blocks.append(f"<code>{html.escape(qtxt)}</code>")
-        blocks.append("— — —")
-    text = "\n".join(blocks).strip()
-
-    kb = InlineKeyboardBuilder()
-    for r in chunk:
-        preview = (r['text'] or '').replace("\n"," ")[:40]
-        if mode == "q_view":
-            kb.button(text=f"👁️ {preview}", callback_data=f"qview:{quiz_id}:{r['id']}:{page}")
-        elif mode == "q_pick_edit":
-            kb.button(text=f"✏️ {preview}", callback_data=f"pickqs:{quiz_id}:{r['id']}:{page}")
-        elif mode == "q_pick_delete":
-            kb.button(text=f"🗑️ {preview}", callback_data=f"del:{quiz_id}:{r['id']}")
-    if page > 0:
-        kb.button(text="⬅️ السابق", callback_data=f"pgqs:{mode}:{quiz_id}:{page-1}")
-    if page < pages-1:
-        kb.button(text="التالي ➡️", callback_data=f"pgqs:{mode}:{quiz_id}:{page+1}")
-    kb.adjust(1)
-    return text, kb.as_markup(), total, pages, page
-# =========================================================
-
-# ================== عرض الاختبارات ==================
-@dp.message(F.text==BTN_LISTQUIZ)
-async def list_quizzes_cmd(msg: Message):
-    if not await ensure_owner(msg): return
-    kb, total, pages, page = _quizzes_page("ql_view", 0)
-    await msg.answer(_qs_page_text_header("📚", "الاختبارات", total, page, pages), reply_markup=kb)
-
-@dp.message(F.text==BTN_LISTQUESTIONS)
-async def list_questions_via_quizzes(msg: Message):
-    if not await ensure_owner(msg): return
-    kb, total, pages, page = _quizzes_page("ql_view", 0)
-    await msg.answer(_qs_page_text_header("📚", "الاختبارات", total, page, pages), reply_markup=kb)
-
-@dp.callback_query(F.data.startswith("pgql:"))
-async def list_quizzes_nav(cb: CallbackQuery):
-    # pgql:<mode>:<page>
-    _, mode, page = cb.data.split(":")
-    page = int(page)
-    kb, total, pages, page = _quizzes_page(mode, page)
-    titles = {
-        "ql_view": ("📚", "الاختبارات"),
-        "ql_edit": ("🛠️", "تعديل اختبار — اختر اختبارًا"),
-        "ql_delete": ("🗑️", "حذف اختبار — اختر اختبارًا"),
-        "ql_pick_editq": ("✏️", "تعديل سؤال — اختر اختبارًا"),
-        "ql_pick_delq": ("🗑️", "حذف سؤال — اختر اختبارًا"),
-        "ql_pick_score": ("🏁", "نتائج — اختر اختبارًا"),
-    }
-    emoji, ttl = titles.get(mode, ("📚", "الاختبارات"))
-    try:
-        await cb.message.edit_text(_qs_page_text_header(emoji, ttl, total, page, pages), reply_markup=kb)
-    except Exception:
-        await cb.message.answer(_qs_page_text_header(emoji, ttl, total, page, pages), reply_markup=kb)
-    await cb.answer()
-
-@dp.callback_query(F.data.startswith("listq:"))
-async def list_quiz_questions_view(cb: CallbackQuery):
-    quiz_id = int(cb.data.split(":")[1])
-    text, kb, total, pages, page = _questions_page(quiz_id, "q_view", 0)
-    try:
-        await cb.message.edit_text(text, reply_markup=kb)
-    except Exception:
-        await cb.message.answer(text, reply_markup=kb)
-    await cb.answer()
-
-@dp.callback_query(F.data.startswith("pgqs:"))
-async def questions_nav(cb: CallbackQuery):
-    # pgqs:<mode>:<quiz_id>:<page>
-    _, mode, quiz_id, page = cb.data.split(":")
-    quiz_id = int(quiz_id); page = int(page)
-    text, kb, total, pages, page = _questions_page(quiz_id, mode, page)
-    try:
-        await cb.message.edit_text(text, reply_markup=kb)
-    except Exception:
-        await cb.message.answer(text, reply_markup=kb)
-    await cb.answer()
-
-# ---------- عرض سؤال معيّن (مع الخيارات والمرفقات) ----------
-async def show_question_details(chat_id:int, quiz_id:int, qid:int, page:int, for_edit:bool):
-    qrow = q_one("SELECT text FROM questions WHERE id=%s", (qid,))
-    if not qrow:
-        return await bot.send_message(chat_id, "السؤال غير موجود.", reply_markup=owner_kb())
-
-    # أرسل المرفقات إن وجدت
-    try:
-        await send_question_attachments(chat_id, qid)
-    except Exception:
-        pass
-
-    # اجلب الخيارات
-    opts = q_all("SELECT option_index,text,is_correct FROM options WHERE question_id=%s ORDER BY option_index",(qid,))
-    lines = [f"• {i+1}) {html.escape(o['text'])} {'✅' if int(o['is_correct'])==1 else ''}" for i,o in enumerate(opts)]
-    text = f"❓ <b>سؤال</b> — اختبار {quiz_id}\n\n<code>{html.escape((qrow['text'] or '').strip())}</code>\n\n" + "\n".join(lines)
-
-    kb = InlineKeyboardBuilder()
-    if for_edit:
-        kb.button(text="✏️ تعديل السؤال + الخيارات", callback_data="editm:text")
-        kb.button(text="🧩 تعديل الخيارات فقط", callback_data="editm:opts")
-        kb.button(text="📎 إضافة/تبديل مرفقات", callback_data="editm:att_add")
-        kb.button(text="🗑️ إزالة كل المرفقات", callback_data="editm:att_clear")
-        kb.button(text="⬅️ رجوع للقائمة", callback_data=f"pgqs:q_pick_edit:{quiz_id}:{page}")
-    else:
-        kb.button(text="⬅️ رجوع للقائمة", callback_data=f"pgqs:q_view:{quiz_id}:{page}")
-    kb.adjust(1)
-    await bot.send_message(chat_id, text, reply_markup=kb.as_markup())
-
-@dp.callback_query(F.data.startswith("qview:"))
-async def qview_handler(cb: CallbackQuery):
-    _, quiz_id, qid, page = cb.data.split(":")
-    await show_question_details(cb.message.chat.id, int(quiz_id), int(qid), int(page), for_edit=False)
-    await cb.answer()
-
-# ================== تعديل عنوان اختبار ==================
-@dp.message(F.text==BTN_EDITQUIZ)
-async def editquiz_start(msg: Message, state: FSMContext):
-    if not await ensure_owner(msg): return
-    await state.set_state(BuildStates.waiting_pick_for_edit)
-    kb, total, pages, page = _quizzes_page("ql_edit", 0)
-    await msg.answer(_qs_page_text_header("🛠️", "تعديل اختبار — اختر اختبارًا", total, page, pages), reply_markup=kb)
-
-@dp.callback_query(BuildStates.waiting_pick_for_edit, F.data.startswith("editq:"))
-async def pick_for_edit(cb:CallbackQuery, state:FSMContext):
-    qid=int(cb.data.split(":")[1])
-    await state.update_data(edit_id=qid)
-    await state.set_state(BuildStates.waiting_new_title)
-    await cb.message.answer("أرسل العنوان الجديد:")
-    await cb.answer()
-
-@dp.message(BuildStates.waiting_new_title, F.text)
-async def apply_edit(msg:Message, state:FSMContext):
-    qid=(await state.get_data()).get("edit_id")
-    q_exec("UPDATE quizzes SET title=%s WHERE id=%s", (msg.text.strip(), qid))
-    await state.clear()
-    await msg.answer("✅ تم تعديل العنوان.", reply_markup=owner_kb())
-
-# ================== حذف اختبار ==================
-@dp.message(F.text==BTN_DELQUIZ)
-async def delquiz_start(msg: Message, state: FSMContext):
-    if not await ensure_owner(msg): return
-    await state.set_state(BuildStates.waiting_pick_for_delete)
-    kb, total, pages, page = _quizzes_page("ql_delete", 0)
-    await msg.answer(_qs_page_text_header("🗑️", "حذف اختبار — اختر اختبارًا", total, page, pages), reply_markup=kb)
-
-@dp.callback_query(BuildStates.waiting_pick_for_delete, F.data.startswith("delq:"))
-async def delq_confirm(cb:CallbackQuery, state:FSMContext):
-    qid=int(cb.data.split(":")[1])
-    kb=inline_confirm_kb(f"delqconfirm:{qid}")
-    await cb.message.answer(f"⚠️ تأكيد حذف الاختبار ID {qid}؟", reply_markup=kb)
-    await cb.answer()
-
-@dp.callback_query(F.data.regexp(r"^delqconfirm:(\d+):(yes|no)$"))
-async def delq_apply(cb:CallbackQuery):
-    _, rest = cb.data.split("delqconfirm:")
-    qid, decision = rest.split(":")
-    qid=int(qid)
-    if decision=="no":
-        await cb.message.answer("تم الإلغاء ✅", reply_markup=owner_kb()); return await cb.answer()
-    q_exec("DELETE FROM options WHERE question_id IN (SELECT id FROM questions WHERE quiz_id=%s)", (qid,))
-    q_exec("DELETE FROM question_attachments WHERE question_id IN (SELECT id FROM questions WHERE quiz_id=%s)", (qid,))
-    q_exec("DELETE FROM questions WHERE quiz_id=%s", (qid,))
-    q_exec("DELETE FROM sent_polls WHERE quiz_id=%s", (qid,))
-    q_exec("DELETE FROM quizzes WHERE id=%s", (qid,))
-    await cb.message.answer("🗑️ تم حذف الاختبار.", reply_markup=owner_kb())
-    await cb.answer()
-
-# ================== إضافة سؤال ==================
-@dp.message(F.text==BTN_ADDQ)
-async def addq_start(msg:Message, state:FSMContext):
-    if not await ensure_owner(msg): return
-    rows=q_all("SELECT id,title FROM quizzes ORDER BY id DESC")
-    if not rows: return await msg.answer("لا يوجد اختبارات.\nأنشئ واحدًا أولاً.", reply_markup=owner_kb())
-    kb=InlineKeyboardBuilder()
-    for r in rows[:30]:
-        kb.button(text=f"✅ {r['id']} — {r['title']}", callback_data=f"addq:{r['id']}")
-    kb.adjust(1)
-    await state.set_state(BuildStates.waiting_pick_quiz_for_addq)
-    await msg.answer("اختر الاختبار لإضافة سؤال:", reply_markup=kb.as_markup())
-
-@dp.callback_query(BuildStates.waiting_pick_quiz_for_addq, F.data.startswith("addq:"))
-async def addq_pick(cb:CallbackQuery, state:FSMContext):
-    qid=int(cb.data.split(":")[1])
-    await state.update_data(quiz_id=qid)
-    await state.set_state(BuildStates.waiting_q_block)
-    await cb.message.answer(
-        "أرسل <b>رسالة واحدة</b>:\n"
-        "السطر الأول السؤال، ثم كل خيار بسطر جديد (2..10).\n"
-        "مثال:\n"
-        "ما عاصمة ألمانيا؟\n1) هامبورغ\n2) برلين ✅\n3) ميونخ\n\n"
-        "يمكنك وضع ✅ أو (*) على الخيار الصحيح."
-    )
-    await cb.answer()
-
-@dp.message(BuildStates.waiting_q_block, F.text)
-async def got_q_block(msg:Message, state:FSMContext):
-    try:
-        sel=(await state.get_data()); quiz_id=sel["quiz_id"]
-        qtext, opts = parse_q_block(msg.text)
-        new_q = insert_returning_id(
-            "INSERT INTO questions(quiz_id,text,created_at) VALUES (%s,%s,%s)",
-            (quiz_id, qtext, _now().isoformat())
-        )
-        correct=None
-        for i,(t,is_ok) in enumerate(opts):
-            q_exec("INSERT INTO options(question_id,option_index,text,is_correct) VALUES (%s,%s,%s,%s)",
-                   (new_q,i,t,1 if is_ok else 0))
-            if is_ok: correct=i
-        await state.update_data(question_id=new_q, opt_count=len(opts), needs_correct=(correct is None))
-        kb=attach_choice_kb()
-        await state.set_state(BuildStates.waiting_attach_mode)
-        await msg.answer("اختر نوع المرفقات للسؤال:", reply_markup=kb)
-    except Exception as e:
-        await msg.answer(f"⚠️ لم أفهم الرسالة: <code>{html.escape(str(e))}</code>")
-
-@dp.callback_query(BuildStates.waiting_attach_mode, F.data.startswith("att:"))
-async def addq_attach_mode(cb:CallbackQuery, state:FSMContext):
-    mode = cb.data.split(":")[1]
-    d=await state.get_data()
-    qid = int(d["question_id"])
-    if mode=="upload":
-        await state.set_state(BuildStates.waiting_q_attachments_upload)
-        await cb.message.answer("أرسل صور/فويس/أوديو كمرفقات خاصة. ثم اضغط ✔️ تم.", reply_markup=done_button_kb("qatt"))
-    elif mode=="shared":
-        rows = q_all("SELECT id FROM shared_attachments ORDER BY id DESC LIMIT 1")
-        if not rows:
-            await cb.message.answer("لا توجد مرفقات مشتركة بعد. أضف من زر 📎 مرفقات مشتركة.", reply_markup=owner_kb())
-            await cb.message.answer("اختر نوع المرفقات:", reply_markup=attach_choice_kb())
-            await cb.answer(); return
-        await state.set_state(BuildStates.waiting_q_attachments_shared)
-        await cb.message.answer("اختر من المرفقات المشتركة (يمكن اختيار أكثر من واحد) ثم اضغط ✔️ تم.", reply_markup=shared_list_kb(qid))
-    elif mode=="none":
-        if d.get("needs_correct", True):
-            await state.set_state(BuildStates.waiting_correct_index)
-            await cb.message.answer(f"أرسل رقم الخيار الصحيح (1..{int(d['opt_count'])}):")
-        else:
-            await state.clear(); await cb.message.answer("✅ تم الحفظ النهائي.", reply_markup=owner_kb())
-    await cb.answer()
-
-@dp.message(BuildStates.waiting_q_attachments_upload, F.photo | F.voice | F.audio)
-async def addq_attach_upload(msg:Message, state:FSMContext):
-    d=await state.get_data(); qid=int(d["question_id"])
-    if msg.photo:
-        await attach_file_to_question(qid, "photo", msg.photo[-1].file_id)
-    elif msg.voice:
-        await attach_file_to_question(qid, "voice", msg.voice.file_id)
-    elif msg.audio:
-        await attach_file_to_question(qid, "audio", msg.audio.file_id)
-
-@dp.callback_query(F.data=="done:qatt")
-async def addq_attach_done(cb:CallbackQuery, state:FSMContext):
-    d=await state.get_data()
-    if d.get("needs_correct", True):
-        await state.set_state(BuildStates.waiting_correct_index)
-        await cb.message.answer(f"أرسل رقم الخيار الصحيح (1..{int(d['opt_count'])}):")
-    else:
-        await state.clear(); await cb.message.answer("✅ تم الحفظ النهائي.", reply_markup=owner_kb())
-    await cb.answer()
-
-@dp.callback_query(BuildStates.waiting_q_attachments_shared, F.data.startswith("attadd:"))
-async def addq_attach_shared_add(cb:CallbackQuery):
-    _, qid_str, bid_str = cb.data.split(":")
-    question_id = int(qid_str); bundle_id = int(bid_str)
-    b = q_one("SELECT kind,file_id FROM shared_attachments WHERE id=%s",(bundle_id,))
-    if not b:
-        await cb.answer("غير موجود.", show_alert=True); return
-    await attach_file_to_question(question_id, b["kind"], b["file_id"])
-    await cb.answer("تم ربط مرفق.", show_alert=False)
-
-@dp.callback_query(BuildStates.waiting_q_attachments_shared, F.data.startswith("attdone:"))
-async def addq_attach_shared_done(cb:CallbackQuery, state:FSMContext):
-    d=await state.get_data()
-    if d.get("needs_correct", True):
-        await state.set_state(BuildStates.waiting_correct_index)
-        await cb.message.answer(f"أرسل رقم الخيار الصحيح (1..{int(d['opt_count'])}):")
-    else:
-        await state.clear(); await cb.message.answer("✅ تم الحفظ النهائي.", reply_markup=owner_kb())
-    await cb.answer()
-
-@dp.message(BuildStates.waiting_correct_index, F.text.regexp(r"^\d+$"))
-async def set_correct(msg:Message, state:FSMContext):
-    d=await state.get_data(); qid=int(d["question_id"]); cnt=int(d.get("opt_count",0))
-    i=int(msg.text)-1
-    if not (0<=i<cnt): return await msg.answer("خارج النطاق.")
-    q_exec("UPDATE options SET is_correct=0 WHERE question_id=%s",(qid,))
-    q_exec("UPDATE options SET is_correct=1 WHERE question_id=%s AND option_index=%s",(qid,i))
-    await state.clear(); await msg.answer("✅ تم الحفظ النهائي.", reply_markup=owner_kb())
-
-# ================== تعديل سؤال ==================
-@dp.message(F.text==BTN_EDITQUESTION)
-async def edit_question_pick_quiz(msg: Message, state: FSMContext):
-    if not await ensure_owner(msg): return
-    await state.set_state(EditQStates.pick_quiz)
-    kb, total, pages, page = _quizzes_page("ql_pick_editq", 0)
-    await msg.answer(_qs_page_text_header("✏️", "تعديل سؤال — اختر اختبارًا", total, page, pages), reply_markup=kb)
-
-@dp.callback_query(EditQStates.pick_quiz, F.data.startswith("editqs:"))
-async def pick_quiz_then_pick_question(cb: CallbackQuery, state: FSMContext):
-    qz = int(cb.data.split(":")[1])
-    await state.set_state(EditQStates.edit_menu)
-    text, kb, *_ = _questions_page(qz, "q_pick_edit", 0)
-    await cb.message.edit_text(text, reply_markup=kb)
-    await cb.answer()
-
-@dp.callback_query(F.data.startswith("pickqs:"))
-async def picked_question(cb:CallbackQuery, state:FSMContext):
-    _, quiz_id, qid, page = cb.data.split(":")
-    quiz_id = int(quiz_id); qid=int(qid); page=int(page)
-    await show_question_details(cb.message.chat.id, quiz_id, qid, page, for_edit=True)
-    await state.update_data(edit_question_id=qid)
-    await cb.answer()
-
-@dp.callback_query(F.data=="editm:text")
-async def editm_text(cb:CallbackQuery, state:FSMContext):
-    await state.set_state(EditQStates.edit_text)
-    await cb.message.answer("أرسل الصيغة الجديدة كاملة (سطر سؤال + خيارات).")
-    await cb.answer()
-
-@dp.callback_query(F.data=="editm:opts")
-async def editm_opts(cb:CallbackQuery, state:FSMContext):
-    await state.set_state(EditQStates.edit_options)
-    await cb.message.answer("أرسل الخيارات فقط، كل خيار بسطر، ضع ✅ على الصحيح.")
-    await cb.answer()
-
-@dp.callback_query(F.data=="editm:att_add")
-async def editm_att_add(cb:CallbackQuery, state:FSMContext):
-    await state.set_state(EditQStates.attach_mode)
-    kb=InlineKeyboardBuilder()
-    kb.button(text="📎 مرفقات خاصة (أرسل ملفات)", callback_data="att:upload")
-    kb.button(text="📎 من المشتركة", callback_data="att:shared")
-    kb.adjust(1)
-    await cb.message.answer("اختر طريقة إضافة المرفقات:", reply_markup=kb.as_markup())
-    await cb.answer()
-
-@dp.callback_query(F.data=="editm:att_clear")
-async def editm_att_clear(cb:CallbackQuery, state:FSMContext):
-    qid=(await state.get_data()).get("edit_question_id")
-    q_exec("DELETE FROM question_attachments WHERE question_id=%s",(qid,))
-    await state.clear()
-    await cb.message.answer("🗑️ تم إزالة جميع المرفقات.", reply_markup=owner_kb())
-    await cb.answer()
-
-@dp.message(EditQStates.edit_text, F.text)
-async def apply_question_edit_full(msg:Message, state:FSMContext):
-    qid=(await state.get_data()).get("edit_question_id")
-    if not qid: return
-    qtext, opts = parse_q_block(msg.text)
-    q_exec("UPDATE questions SET text=%s WHERE id=%s",(qtext,qid))
-    q_exec("DELETE FROM options WHERE question_id=%s",(qid,))
-    for i,(t,is_ok) in enumerate(opts):
-        q_exec("INSERT INTO options(question_id,option_index,text,is_correct) VALUES (%s,%s,%s,%s)",(qid,i,t,1 if is_ok else 0))
-    await state.clear()
-    await msg.answer("✅ تم تحديث السؤال وخياراته.", reply_markup=owner_kb())
-
-@dp.message(EditQStates.edit_options, F.text)
-async def apply_options_only(msg:Message, state:FSMContext):
-    qid=(await state.get_data()).get("edit_question_id")
-    if not qid: return
-    opts=parse_options_only(msg.text)
-    correct = next((i for i,(_,ok) in enumerate(opts) if ok), None)
-    q_exec("DELETE FROM options WHERE question_id=%s",(qid,))
-    for i,(t,is_ok) in enumerate(opts):
-        q_exec("INSERT INTO options(question_id,option_index,text,is_correct) VALUES (%s,%s,%s,%s)",(qid,i,t,1 if is_ok else 0))
-    if correct is None:
-        await state.update_data(opt_count=len(opts))
-        await state.set_state(EditQStates.correct_index)
-        await msg.answer(f"أرسل رقم الخيار الصحيح (1..{len(opts)}):")
-    else:
-        await state.clear(); await msg.answer("✅ تم تحديث الخيارات.", reply_markup=owner_kb())
-
-@dp.message(EditQStates.correct_index, F.text.regexp(r"^\d+$"))
-async def apply_options_correct_index(msg:Message, state:FSMContext):
-    d=await state.get_data(); qid=int(d.get("edit_question_id")); cnt=int(d.get("opt_count",0))
-    i=int(msg.text)-1
-    if not (0<=i<cnt): return await msg.answer("خارج النطاق.")
-    q_exec("UPDATE options SET is_correct=0 WHERE question_id=%s",(qid,))
-    q_exec("UPDATE options SET is_correct=1 WHERE question_id=%s AND option_index=%s",(qid,i))
-    await state.clear(); await msg.answer("✅ تم تحديد الإجابة الصحيحة.", reply_markup=owner_kb())
-
-@dp.callback_query(EditQStates.attach_mode, F.data.startswith("att:"))
-async def edit_attach_mode(cb:CallbackQuery, state:FSMContext):
-    mode=cb.data.split(":")[1]
-    if mode=="upload":
-        await state.set_state(EditQStates.attach_upload)
-        await cb.message.answer("أرسل صور/فويس/أوديو لإرفاقها، ثم اضغط ✔️ تم.", reply_markup=done_button_kb("qatt"))
-    elif mode=="shared":
-        qid=(await state.get_data()).get("edit_question_id")
-        await state.set_state(EditQStates.attach_shared)
-        await cb.message.answer("اختر من المرفقات المشتركة ثم اضغط ✔️ تم.", reply_markup=shared_list_kb(qid))
-    await cb.answer()
-
-@dp.message(EditQStates.attach_upload, F.photo | F.voice | F.audio)
-async def edit_attach_upload(msg:Message, state:FSMContext):
-    qid=(await state.get_data()).get("edit_question_id")
-    if msg.photo:
-        await attach_file_to_question(qid, "photo", msg.photo[-1].file_id)
-    elif msg.voice:
-        await attach_file_to_question(qid, "voice", msg.voice.file_id)
-    elif msg.audio:
-        await attach_file_to_question(qid, "audio", msg.audio.file_id)
-
-@dp.callback_query(EditQStates.attach_upload, F.data=="done:qatt")
-async def edit_attach_upload_done(cb:CallbackQuery, state:FSMContext):
-    await state.clear()
-    await cb.message.answer("✅ تم إضافة المرفقات.", reply_markup=owner_kb())
-    await cb.answer()
-
-@dp.callback_query(EditQStates.attach_shared, F.data.startswith("attadd:"))
-async def edit_attach_shared_add(cb:CallbackQuery, state:FSMContext):
-    _, qid_str, bid_str = cb.data.split(":")
-    question_id = int(qid_str); bundle_id = int(bid_str)
-    b = q_one("SELECT kind,file_id FROM shared_attachments WHERE id=%s",(bundle_id,))
-    if not b:
-        await cb.answer("غير موجود.", show_alert=True); return
-    await attach_file_to_question(question_id, b["kind"], b["file_id"])
-    await cb.answer("تم ربط مرفق.", show_alert=False)
-
-@dp.callback_query(EditQStates.attach_shared, F.data.startswith("attdone:"))
-async def edit_attach_shared_done(cb:CallbackQuery, state:FSMContext):
-    await state.clear()
-    await cb.message.answer("✅ تم إضافة المرفقات من المشتركة.", reply_markup=owner_kb())
-    await cb.answer()
-
-# ================== بريف — يدوي بالكامل ==================
-MANUAL_CLOSES_AT = "9999-12-31T23:59:59+00:00"
-
-def open_window_manual(chat_id:int, owner:int, prompt:str)->Tuple[int,datetime]:
-    q_exec("UPDATE brief_windows SET is_open=0 WHERE origin_chat_id=%s AND is_open=1",(chat_id,))
-    opened=_now()
-    bid = insert_returning_id(
-        """INSERT INTO brief_windows(origin_chat_id,opened_by,opened_at,closes_at,is_open,prompt_text)
-              VALUES (%s,%s,%s,%s,1,%s)""",
-        (chat_id,owner,opened.isoformat(),MANUAL_CLOSES_AT,prompt)
-    )
-    return bid, opened
-
-def close_window(chat_id:int):
-    q_exec("UPDATE brief_windows SET is_open=0 WHERE origin_chat_id=%s AND is_open=1",(chat_id,))
-
-@dp.message(Command("brief"))
-@dp.message(F.text==BTN_BRIEF)
-async def brief_start(msg:Message, state:FSMContext):
-    if not await ensure_owner(msg): return
-    await state.clear()
-    await state.set_state(BriefStates.waiting_prompt)
-    await msg.answer("✍️ أرسل نص سؤال البريف/الإيميل (B1 DTZ):", reply_markup=owner_kb())
-
-@dp.message(BriefStates.waiting_prompt, F.text)
-async def brief_got_prompt(msg:Message, state:FSMContext):
-    try:
-        prompt=msg.text.strip()
-        migrate_schema()
-        bid, _ = open_window_manual(msg.chat.id, msg.from_user.id, prompt)
-        kb = InlineKeyboardBuilder()
-        kb.button(text="⛔ إيقاف الاستقبال", callback_data="briefstop")
-        kb.adjust(1)
-        m = await msg.answer(
-            f"📣 <b>سؤال البريف (B1 DTZ)</b>\n{html.escape(prompt)}\n\n"
-            f"✳️ الاستقبال <b>يدوي</b> — اضغط ⛔ عند الانتهاء.\n"
-            f"أرسلوا نص البريف هنا برسالة واحدة.",
-            reply_markup=kb.as_markup()
-        )
-        q_exec("UPDATE brief_windows SET ann_message_id=%s WHERE id=%s",(m.message_id,bid))
-        await state.clear()
-    except Exception as e:
-        await msg.reply(f"❌ حدث خطأ أثناء فتح نافذة البريف: <code>{html.escape(str(e))}</code>")
-
-# ---------- مصحّح مجاني بسيط ----------
-def free_b1_grade(text: str) -> Tuple[int, Dict]:
-    raw = text.strip()
-    t = raw.lower()
-
-    words = re.findall(r"[A-Za-zÄÖÜäöüß]+", raw)
-    wc = len(words)
-    sents = re.split(r"[.!?؟!]+", raw)
-    sents = [s.strip() for s in sents if s.strip()]
-    scount = len(sents)
-
-    if 70 <= wc <= 140: length_score = 3
-    elif 55 <= wc < 70 or 140 < wc <= 170: length_score = 2
-    elif 40 <= wc < 55 or 170 < wc <= 220: length_score = 1
-    else: length_score = 0
-
-    greeting_patterns = [r"sehr geehrte", r"guten tag", r"hallo"]
-    closing_patterns = [r"mit freundlichen grüßen", r"mit freundlichen gru[e|ß]en", r"\bmfg\b"]
-    has_greet = any(re.search(p, t) for p in greeting_patterns)
-    has_close = any(re.search(p, t) for p in closing_patterns)
-    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
-    last_block = " ".join(lines[-3:]).strip() if lines else raw
-    has_name_like = bool(re.search(r"[A-ZÄÖÜ][a-zäöüß]{2,}\s+[A-ZÄÖÜ][a-zäöüß]{2,}", last_block))
-
-    structure_score = (2 if has_greet else 0) + (1 if has_close else 0) + (1 if has_name_like else 0)
-
-    months = ["januar","februar","märz","maerz","april","mai","juni","juli","august","september","oktober","november","dezember","dez."]
-    move_rx = r"(umzug|einzug|auszug|ab dem|ab\s+[\d\.]+\s+(%s)|am\s+[\d\.]+\s+(%s))" % ("|".join(months),"|".join(months))
-    reason_rx = r"(ich\s+(möchte|will|muss)\s+.*(schreiben|melden)|wegen|grund|anzeige|ich\s+schreibe)"
-    apt_rx = r"(wohnung|zimmer|balkon|küche|bad|hell|groß|gross|ruhig|familie)"
-    cost_rx = r"(miete|kaltmiete|warmmiete|nebenkosten|kosten|€|euro|\b\d+\s*€)"
-
-    cover = {
-        "reason": bool(re.search(reason_rx, t)),
-        "apartment": bool(re.search(apt_rx, t)),
-        "costs": bool(re.search(cost_rx, t)),
-        "date": bool(re.search(move_rx, t)),
-    }
-
-    coverage_score = 0
-    for k, ok in cover.items():
-        if ok: coverage_score += 2
-        else:
-            if k == "reason" and ("suche" in t or "interesse" in t): coverage_score += 1
-            elif k == "apartment" and ("lage" in t or "qm" in t): coverage_score += 1
-            elif k == "costs" and re.search(r"\b\d+\b", t): coverage_score += 1
-            elif k == "date" and ("sofort" in t or "ab sofort" in t): coverage_score += 1
-
-    connectors = ["weil","dass","deshalb","außerdem","ausserdem","dann","damit","obwohl","aber","oder","und"]
-    conn_used = sum(1 for c in connectors if re.search(r"\b"+c+r"\b", t))
-    if conn_used >= 4: cohesion_score = 3
-    elif conn_used >= 2: cohesion_score = 2
-    elif conn_used == 1: cohesion_score = 1
-    else: cohesion_score = 0
-
-    avg_len = (wc / scount) if scount else wc
-    if scount >= 5 and 8 <= avg_len <= 20: sentence_score = 2
-    elif scount >= 3: sentence_score = 1
-    else: sentence_score = 0
-
-    total = structure_score + coverage_score + length_score + cohesion_score + sentence_score
-    total = max(0, min(20, int(round(total))))
-
-    tips = []
-    if not has_greet: tips.append("أضف تحية رسمية مثل: <i>Sehr geehrte Damen und Herren,</i>")
-    if not has_close: tips.append("اختم بـ <i>Mit freundlichen Grüßen</i> واسمك.")
-    if not cover["reason"]: tips.append("اذكر سبب الكتابة بوضوح.")
-    if not cover["apartment"]: tips.append("صف الشقة (الغرف/النور/البلكون).")
-    if not cover["costs"]: tips.append("اذكر الإيجار والتكاليف الجانبية بالأرقام.")
-    if not cover["date"]: tips.append("حدّد تاريخ الإتاحة (z.B. ab dem 1. Oktober).")
-    if conn_used < 2: tips.append("استخدم روابط: weil, deshalb, außerdem, damit…")
-
-    feedback = "جيد جدًا، استمرّ." if not tips else "؛ ".join(tips)
-    return total, {"feedback": feedback}
-
-def brief_level(score: int) -> str:
-    if score <= 6: return "Unter A2"
-    if score <= 14: return "A2"
-    return "B1"
-
-@dp.message(
-    StateFilter("*"),
-    F.text,
-    ~F.text.in_(ALL_BTN_TEXTS),
-    ~F.text.startswith("/"),
-    F.from_user.as_('u')
-)
-async def collect_briefs(msg:Message, u):
-    if getattr(u, "is_bot", False):
-        return
-    row = q_one("SELECT id,closes_at FROM brief_windows WHERE origin_chat_id=%s AND is_open=1 ORDER BY id DESC LIMIT 1",(msg.chat.id,))
-    if not row:
-        return
-    if row["closes_at"] <= _now().isoformat():
-        q_exec("UPDATE brief_windows SET is_open=0 WHERE id=%s",(row["id"],))
-        return
-    text=msg.text.strip()
-    score, details = free_b1_grade(text)
-    lvl = brief_level(score)
-    q_exec("""INSERT INTO writing_submissions(origin_chat_id,quiz_id,user_id,username,text,score,level,evaluated_at,details_json,window_id)
-              VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-           (msg.chat.id,0,msg.from_user.id,(msg.from_user.username or ""),text,score,lvl,_now().isoformat(),json.dumps(details,ensure_ascii=False),row["id"]))
-
-@dp.callback_query(F.data=="briefstop")
-async def brief_stop(cb:CallbackQuery):
-    if cb.from_user.id != OWNER_ID:
-        return await cb.answer("للمالك فقط", show_alert=True)
-    w = q_one("SELECT id,prompt_text FROM brief_windows WHERE origin_chat_id=%s AND is_open=1 ORDER BY id DESC LIMIT 1",(cb.message.chat.id,))
-    if not w:
-        return await cb.message.answer("لا توجد نافذة استقبال مفتوحة.", reply_markup=owner_kb())
-    close_window(cb.message.chat.id)
-    rows = q_all("""SELECT user_id, COALESCE(NULLIF(username,''),'مجهول') AS uname, score, level, details_json, evaluated_at
-                    FROM writing_submissions
-                    WHERE origin_chat_id=%s AND window_id=%s
-                    ORDER BY evaluated_at ASC""", (cb.message.chat.id, w["id"]))
-    by_user: Dict[int, dict] = {}
-    for r in rows:
-        by_user[r["user_id"]] = r
-    if not by_user:
-        return await cb.message.answer("⛔ تم الإيقاف — لم تصل أي مشاركات.", reply_markup=owner_kb())
-    results = sorted(by_user.values(), key=lambda x: (-int(x["score"]), x["uname"]))
-    lines = []
-    for i, r in enumerate(results, 1):
-        fb = ""
-        try:
-            det = json.loads(r["details_json"] or "{}"); fb = det.get("feedback","")
-        except Exception:
-            pass
-        fb_short = (fb[:120] + "…") if len(fb) > 120 else fb
-        lines.append(f"{i:>2}. {html.escape(r['uname'])} — <b>{int(r['score'])}/20</b> — {html.escape(r['level'])}" + (f"\n    📝 {fb_short}" if fb_short else ""))
-    header = f"⛔ <b>تم إيقاف الاستقبال</b>\n📣 <b>سؤال البريف:</b> {html.escape(w.get('prompt_text') or '')}\n\n<b>النتائج:</b>"
-    await send_long(cb.message.chat.id, header + "\n" + "\n".join(lines))
-
-# ---------- إرسال مرفقات السؤال ----------
-async def send_question_attachments(chat_id:int, question_id:int):
-    atts = q_all("SELECT kind,file_id FROM question_attachments WHERE question_id=%s ORDER BY position",(question_id,))
-    for a in atts:
-        kind=a["kind"]; fid=a["file_id"]
-        try:
-            if kind=="photo": await bot.send_photo(chat_id, fid)
-            elif kind=="voice": await bot.send_voice(chat_id, fid)
-            elif kind=="audio": await bot.send_audio(chat_id, fid)
-            try: await sleep_jitter('attach')
-            except Exception: await asyncio.sleep(0.8)
-        except Exception as e:
-            ra = getattr(e,'retry_after',None) or getattr(e,'timeout',None)
-            try: await asyncio.sleep(float(ra)+1 if ra else 2.0)
-            except Exception: pass
-
-# ---------- نشر الاختبار + اختيار تفعيل التقييم ----------
-@dp.message(F.text==BTN_PUBLISH)
-async def publish_entry(msg:Message):
-    if not await ensure_owner(msg): return
-    rows=q_all("SELECT id,title FROM quizzes ORDER BY id DESC")
-    if not rows: return await msg.answer("لا يوجد اختبارات لنشرها.", reply_markup=owner_kb())
-    kb=InlineKeyboardBuilder()
-    for r in rows[:50]:
-        kb.button(text=f"🚀 نشر {r['id']} — {r['title']}", callback_data=f"pub:{r['id']}")
-    kb.adjust(1)
-    await msg.answer("اختر اختبارًا للنشر كـ Quiz Polls:", reply_markup=kb.as_markup())
-
-@dp.callback_query(F.data.startswith("pub:"))
-async def publish_pick_hours(cb:CallbackQuery, state:FSMContext):
-    if cb.from_user.id != OWNER_ID:
-        return await cb.answer("للمالك فقط", show_alert=True)
-    quiz_id = int(cb.data.split(":")[1])
-    await state.update_data(pub_quiz_id=quiz_id)
-    await cb.message.answer("اختر مؤقّت النشر (بالساعات):", reply_markup=publish_hours_kb(quiz_id))
-    await cb.answer()
-
-def normalize_arabic_digits(s:str)->str:
-    DIGITS_AR = "٠١٢٣٤٥٦٧٨٩"
-    return s.translate({ord(a): str(i) for i,a in enumerate(DIGITS_AR)})
-
-@dp.callback_query(F.data.startswith("pubdur:"))
-async def publish_with_hours_decide(cb:CallbackQuery, state:FSMContext):
-    _, qid_str, token = cb.data.split(":")
-    quiz_id = int(qid_str)
-    if token == "custom":
-        await state.set_state(PublishStates.waiting_hours_custom)
-        await state.update_data(pub_quiz_id=quiz_id)
-        await cb.message.answer("اكتب عدد الساعات (مثال: 2 أو ٢).")
-        return await cb.answer()
-    hours = int(token)
-    await state.update_data(pub_hours=hours, pub_quiz_id=quiz_id)
-    await cb.message.answer("هل تريد تفعيل تقييم الطالب حسب علامته؟", reply_markup=publish_eval_kb(quiz_id, hours))
-    await cb.answer()
-
-@dp.message(PublishStates.waiting_hours_custom, F.text)
-async def publish_hours_custom(msg:Message, state:FSMContext):
-    raw = normalize_arabic_digits(msg.text)
-    m = re.search(r"(\d{1,3})", raw)
-    if not m:
-        return await msg.reply("اكتب رقم الساعات فقط (1..240).")
-    hours = int(m.group(1)); hours = max(1, min(240, hours))
-    quiz_id = int((await state.get_data()).get("pub_quiz_id"))
-    await state.update_data(pub_hours=hours, pub_quiz_id=quiz_id)
-    await msg.answer("هل تريد تفعيل تقييم الطالب حسب علامته؟", reply_markup=publish_eval_kb(quiz_id, hours))
-
-@dp.callback_query(F.data.startswith("pubeval:"))
-async def publish_eval_choice(cb: CallbackQuery, state: FSMContext):
-    _, quiz_id, hours, flag = cb.data.split(":")
-    quiz_id = int(quiz_id); hours = int(hours); grade_enabled = int(flag)==1
-    await _publish_quiz_now(cb, quiz_id, hours, grade_enabled)
-    await state.clear()
-    await cb.answer()
-
-async def _publish_quiz_now(cb_or_dummy, quiz_id:int, hours:int, grade_enabled:bool):
-    chat_id = cb_or_dummy.message.chat.id
-    expiry_iso = None
-    if hours and hours > 0:
-        expiry = _now() + timedelta(hours=hours)
-        expiry_iso = expiry.isoformat()
-
-    # أنشئ جلسة نشر (run)
-    run_id = insert_returning_id(
-        "INSERT INTO quiz_runs(chat_id,quiz_id,published_at,grade_enabled) VALUES (%s,%s,%s,%s)",
-        (chat_id, quiz_id, _now().isoformat(), 1 if grade_enabled else 0)
-    )
-
-    questions = q_all("SELECT id, text FROM questions WHERE quiz_id=%s ORDER BY id",(quiz_id,))
-    sent = 0
-    for q in questions:
-        try:
-            await send_question_attachments(chat_id, q["id"])
-        except Exception:
-            try: await cb_or_dummy.message.answer(f"⚠️ تعذّر إرسال مرفقات للسؤال {q['id']}.")
-            except Exception: pass
-
-        opts = q_all("SELECT option_index,text,is_correct FROM options WHERE question_id=%s ORDER BY option_index",(q["id"],))
-        if len(opts) < 2: continue
-        correct = next((o for o in opts if int(o.get("is_correct",0))==1), None) or opts[0]
-        selected = list(opts[:10]) if len(opts) <= 10 else [correct] + [o for o in opts if int(o.get("is_correct",0))!=1][:9]
-        question_text = str(q["text"])[:295]
-        options_text = [str(o["text"])[:100] for o in selected]
-        correct_index = selected.index(correct)
-
-        try:
-            m = await bot.send_poll(
-                chat_id=chat_id, question=question_text, options=options_text,
-                type=PollType.QUIZ, correct_option_id=correct_index, is_anonymous=False,
-            )
-            q_exec(
-                "INSERT INTO sent_polls (chat_id,quiz_id,question_id,poll_id,message_id,expires_at,is_closed,run_id) VALUES (%s,%s,%s,%s,%s,%s,0,%s)",
-                (chat_id, quiz_id, q["id"], m.poll.id, m.message_id, expiry_iso, run_id)
-            )
-            sent += 1
-            try: await sleep_jitter("poll")
-            except Exception: await asyncio.sleep(0.8)
-        except Exception as e:
-            try: await cb_or_dummy.message.answer(f"⚠️ تعذّر نشر سؤال ID {q['id']}: {e}")
-            except Exception: pass
-            try:
-                ra = getattr(e, "retry_after", None) or getattr(e, "timeout", None)
-                await asyncio.sleep(float(ra)+1 if ra else 2.0)
-            except Exception: pass
-            continue
-
-    await cb_or_dummy.message.answer(
-        f"🚀 تم نشر {sent} سؤالًا من الاختبار {quiz_id}"
-        + (f" — المؤقّت: {hours} ساعة" if hours and hours>0 else " — بدون مؤقّت")
-        + (", التقييم مُفعّل ✅" if grade_enabled else ", بدون تقييم ❌"),
-        reply_markup=owner_kb()
-    )
-
-# ---------- إغلاق تلقائي للاستطلاعات المنتهية ----------
-async def close_expired_polls_loop():
-    while True:
-        try:
-            rows = q_all("""
-                SELECT chat_id, message_id, id
-                FROM sent_polls
-                WHERE is_closed=0 AND expires_at IS NOT NULL AND expires_at <= %s
-                ORDER BY id ASC
-                LIMIT 20
-            """, (_now().isoformat(),))
-            for r in rows:
-                try:
-                    await bot.stop_poll(chat_id=r["chat_id"], message_id=r["message_id"])
-                except Exception:
-                    pass
-                q_exec("UPDATE sent_polls SET is_closed=1 WHERE id=%s",(r["id"],))
-        except Exception:
-            pass
-        await asyncio.sleep(30)
-
-# ---------- تفاعل مع Poll + إعلان نتيجة الطالب عند إكمال كل الأسئلة ----------
-def quiz_level_from_score(correct:int, total:int) -> str:
-    # تحويل العلامة إلى مقياس من 45 ثم تصنيف
-    if total <= 0: return "-"
-    scaled = int(round((correct / total) * 45))
-    if scaled <= 19: return "Unter A2"
-    if scaled <= 32: return "A2"
-    return "B1"
-
-@dp.poll_answer()
-async def on_poll_answer(pa: PollAnswer):
-    poll_id = pa.poll_id
-    chosen = pa.option_ids[0] if pa.option_ids else -1
-    u = pa.user
-    sp = q_one("SELECT chat_id, quiz_id, question_id, message_id, expires_at, is_closed, run_id FROM sent_polls WHERE poll_id=%s",(poll_id,))
-    if not sp: return
-    if sp["is_closed"]: return
-    if sp["expires_at"] and sp["expires_at"] <= _now().isoformat(): return
-
-    chat_id = sp["chat_id"]; quiz_id=sp["quiz_id"]; qid=sp["question_id"]; message_id=sp["message_id"]; run_id=sp.get("run_id")
-
-    opt = q_one("SELECT is_correct FROM options WHERE question_id=%s AND option_index=%s",(qid,chosen))
-    is_ok = int(opt["is_correct"]) if opt else 0
-
-    q_exec("""INSERT INTO quiz_responses(chat_id,quiz_id,question_id,user_id,username,option_index,is_correct,answered_at,run_id)
-              VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-           (chat_id,quiz_id,qid,u.id, u.username or (u.full_name or ""), chosen, is_ok, _now().isoformat(), run_id))
-
-    try:
-        emoji = "🎉" if is_ok else "❌"
-        await bot.set_message_reaction(chat_id=chat_id, message_id=message_id, reaction=[ReactionTypeEmoji(emoji=emoji)], is_big=True)
-    except Exception:
-        pass
-
-    # عند إكمال جميع أسئلة الجلسة أعلن النتيجة (مع المستوى إذا التقييم مُفعّل)
-    try:
-        total_polls = q_one("SELECT COUNT(*) AS c FROM sent_polls WHERE run_id=%s",(run_id,))["c"]
-        answered = q_one("SELECT COUNT(DISTINCT question_id) AS c FROM quiz_responses WHERE run_id=%s AND user_id=%s",(run_id,u.id))["c"]
-        if answered == total_polls and total_polls > 0:
-            correct = q_one("SELECT COALESCE(SUM(is_correct),0) AS s FROM quiz_responses WHERE run_id=%s AND user_id=%s",(run_id,u.id))["s"]
-            run = q_one("SELECT grade_enabled FROM quiz_runs WHERE id=%s",(run_id,))
-            msg = f"📊 نتيجة {mention_html(u.id, u.full_name or u.username or 'طالب')}: <b>{int(correct)}/{int(total_polls)}</b>"
-            if run and int(run["grade_enabled"])==1:
-                lvl = quiz_level_from_score(int(correct), int(total_polls))
-                msg += f"\n🎯 المستوى: <b>{lvl}</b>"
-            await bot.send_message(chat_id, msg, parse_mode=ParseMode.HTML)
-    except Exception:
-        pass
-
-# ================== لوحة النتائج مع اختيار جلسة النشر ==================
-@dp.message(F.text==BTN_SCORE)
-async def score_entry_by_group(msg:Message, state:FSMContext):
-    if not await ensure_owner(msg): return
-    rows = q_all("""SELECT chat_id, MAX(published_at) AS last_pub, COUNT(*)::int AS runs
-                    FROM quiz_runs GROUP BY chat_id ORDER BY last_pub DESC""")
+@dp.message(F.text == "/quizzes")
+async def cmd_quizzes(msg: Message):
+    rows = q_all("SELECT * FROM quizzes WHERE is_archived=0")
     if not rows:
-        return await msg.answer("لا توجد جلسات نشر سابقة.", reply_markup=owner_kb())
-    kb = InlineKeyboardBuilder()
-    for r in rows[:50]:
-        title = await get_chat_label(int(r["chat_id"]))
-        kb.button(text=f"👥 {title} — {r['runs']} جلسة", callback_data=f"scoregrp:{r['chat_id']}")
-    kb.adjust(1)
-    await state.set_state(ScoreByGroupStates.pick_group)
-    await msg.answer("اختر المجموعة:", reply_markup=kb.as_markup())
+        await msg.answer("لا يوجد اختبارات حاليا.")
+        return
+    text = "\n".join([f"{r['id']}: {r['title']}" for r in rows])
+    await send_long(msg.chat.id, f"📋 قائمة الاختبارات:\n{text}")
 
-@dp.callback_query(ScoreByGroupStates.pick_group, F.data.startswith("scoregrp:"))
-async def score_pick_group(cb:CallbackQuery, state:FSMContext):
+@dp.message(F.text == "/brief")
+async def cmd_brief(msg: Message, state):
+    await msg.answer("✍️ أرسل لي البريف الآن:")
+    await state.set_state(BriefStates.waiting_brief)
+
+@dp.message(BriefStates.waiting_brief)
+async def handle_brief(msg: Message, state):
+    q_exec(
+        "INSERT INTO writing_submissions(origin_chat_id,user_id,username,text,score,level,evaluated_at) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+        (msg.chat.id, msg.from_user.id, msg.from_user.username, msg.text, 0, "غير مصحح", _now().isoformat()),
+    )
+    await msg.answer("✅ تم استلام البريف.")
+    await state.clear()
+
+@dp.message(F.text == "/briefscores")
+async def cmd_briefs(msg: Message, state):
+    chats = q_all("SELECT DISTINCT origin_chat_id FROM writing_submissions ORDER BY origin_chat_id")
+    if not chats:
+        await msg.answer("لا يوجد بريفات مستلمة.")
+        return
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"مجموعة {c['origin_chat_id']}", callback_data=f"briefgrp:{c['origin_chat_id']}")] for c in chats])
+    await msg.answer("اختر المجموعة لعرض نتائج البريف:", reply_markup=markup)
+    await state.set_state(BriefScoreStates.pick_group)
+
+@dp.callback_query(BriefScoreStates.pick_group, F.data.startswith("briefgrp:"))
+async def cb_briefs(cb: CallbackQuery, state):
     chat_id = int(cb.data.split(":")[1])
-    await state.update_data(score_group_chat_id=chat_id)
-    rows = q_all("""SELECT q.id, q.title, COUNT(r.id)::int AS rcnt
-                    FROM quizzes q JOIN quiz_runs r ON r.quiz_id=q.id
-                    WHERE r.chat_id=%s
-                    GROUP BY q.id, q.title
-                    ORDER BY q.id DESC""", (chat_id,))
+    rows = q_all("SELECT * FROM writing_submissions WHERE origin_chat_id=%s", (chat_id,))
     if not rows:
-        await cb.message.answer("لا توجد اختبارات منشورة في هذه المجموعة.", reply_markup=owner_kb()); return await cb.answer()
-    kb = InlineKeyboardBuilder()
-    for r in rows[:50]:
-        kb.button(text=f"📦 {r['id']} — {r['title']} ({r['rcnt']} جلسة)", callback_data=f"scorepick:{r['id']}")
-    kb.adjust(1)
-    await state.set_state(ScoreByGroupStates.pick_quiz)
-    await cb.message.answer("اختر الاختبار:", reply_markup=kb.as_markup())
-    await cb.answer()
-
-@dp.callback_query(ScoreByGroupStates.pick_quiz, F.data.startswith("scorepick:"))
-async def score_pick_quiz(cb:CallbackQuery, state:FSMContext):
-    quiz_id = int(cb.data.split(":")[1])
-    sel = await state.get_data()
-    chat_id = int(sel.get("score_group_chat_id"))
-    await state.update_data(score_quiz_id=quiz_id)
-
-    runs = q_all("""SELECT r.id, r.published_at, r.grade_enabled, COUNT(sp.id)::int AS qcount
-                    FROM quiz_runs r LEFT JOIN sent_polls sp ON sp.run_id=r.id
-                    WHERE r.chat_id=%s AND r.quiz_id=%s
-                    GROUP BY r.id, r.published_at, r.grade_enabled
-                    ORDER BY r.id DESC""", (chat_id, quiz_id))
-    if not runs:
-        await cb.message.answer("لا توجد جلسات نشر لهذا الاختبار هنا.", reply_markup=owner_kb()); return await cb.answer()
-
-    kb=InlineKeyboardBuilder()
-    for r in runs[:50]:
-        dt = fmt_berlin(r["published_at"])
-        tag = "✅ تقييم" if int(r["grade_enabled"])==1 else "❌ بدون تقييم"
-        kb.button(text=f"🕒 {dt} — {r['qcount']} س. — {tag}", callback_data=f"scorerun:{r['id']}")
-    kb.adjust(1)
-    await state.set_state(ScoreByGroupStates.pick_run)
-    await cb.message.answer("اختر جلسة النشر:", reply_markup=kb.as_markup())
-    await cb.answer()
-
-@dp.callback_query(F.data.startswith("scorerun:"))
-async def score_show_run(cb:CallbackQuery, state:FSMContext):
-    run_id=int(cb.data.split(":")[1])
-
-    total_q = q_one("SELECT COUNT(*) AS c FROM sent_polls WHERE run_id=%s",(run_id,))["c"]
-    if total_q == 0:
-        await cb.message.answer("لا توجد أسئلة في هذه الجلسة.", reply_markup=owner_kb()); return await cb.answer()
-
-    grade_enabled = int(q_one("SELECT grade_enabled FROM quiz_runs WHERE id=%s",(run_id,))["grade_enabled"])
-    rows = q_all("""
-        SELECT user_id, COALESCE(NULLIF(username,''),'مجهول') AS uname, SUM(is_correct)::int AS correct
-        FROM quiz_responses WHERE run_id=%s
-        GROUP BY user_id, uname
-        ORDER BY correct DESC, user_id ASC
-        LIMIT 200
-    """, (run_id,))
-    lines=[]
-    for i,r in enumerate(rows,1):
-        base = f"{i:>2}. {html.escape(r['uname'])} — {r['correct']}/{total_q}"
-        if grade_enabled==1:
-            lvl = quiz_level_from_score(int(r['correct']), int(total_q))
-            base += f" — {lvl}"
-        lines.append(base)
-
-    run_row = q_one("""SELECT r.published_at, r.chat_id, q.title AS qtitle
-                       FROM quiz_runs r JOIN quizzes q ON q.id=r.quiz_id WHERE r.id=%s""",(run_id,))
-    head = ""
-    if run_row:
-        chat_label = await get_chat_label(int(run_row["chat_id"]))
-        dt = fmt_berlin(run_row["published_at"])
-        head = f"👥 المجموعة: <b>{html.escape(chat_label)}</b>\n🕒 النشر (برلين): <b>{dt}</b>\n📦 الاختبار: <b>{html.escape(run_row['qtitle'])}</b>\n\n"
-
-    text = head + "🏁 <b>نتائج الجلسة</b>\n" + ("\n".join(lines) if lines else "لا يوجد مشاركات بعد.")
-    await cb.message.answer(text, reply_markup=owner_kb())
-    await state.clear()
-    await cb.answer()
-
-@dp.message(F.text==BTN_BRIEF_RESULTS)
-async def brief_results_entry(msg:Message, state:FSMContext):
-    if not await ensure_owner(msg): return
-    rows = q_all("""SELECT origin_chat_id AS chat_id, MAX(opened_at) AS last_open, COUNT(*)::int AS windows
-                    FROM brief_windows GROUP BY origin_chat_id ORDER BY last_open DESC""")
-    if not rows:
-        return await msg.answer("لا توجد نوافذ بريف محفوظة.", reply_markup=owner_kb())
-    kb = InlineKeyboardBuilder()
-    for r in rows[:50]:
-        title = await get_chat_label(int(r["chat_id"]))
-        kb.button(text=f"👥 {title} — {r['windows']} نافذة", callback_data=f"brres:grp:{r['chat_id']}")
-    kb.adjust(1)
-    await state.set_state(BriefResultStates.pick_group)
-    await msg.answer("اختر المجموعة:", reply_markup=kb.as_markup())
-
-@dp.callback_query(BriefResultStates.pick_group, F.data.startswith("brres:grp:"))
-async def brief_results_pick_group(cb:CallbackQuery, state:FSMContext):
-    chat_id = int(cb.data.split(":")[2])
-    await state.update_data(brief_group_chat_id=chat_id)
-    rows = q_all("""SELECT id, opened_at, closes_at, prompt_text, is_open
-                    FROM brief_windows WHERE origin_chat_id=%s
-                    ORDER BY id DESC LIMIT 50""", (chat_id,))
-    if not rows:
-        await cb.message.answer("لا توجد نوافذ بريف لهذه المجموعة.", reply_markup=owner_kb()); return await cb.answer()
-    kb = InlineKeyboardBuilder()
-    for w in rows:
-        opened = fmt_berlin(w["opened_at"])
-        status = "مفتوحة" if int(w.get("is_open",0))==1 else "مغلقة"
-        preview = (w.get("prompt_text") or "").strip().replace("\n"," ")
-        if len(preview)>28: preview = preview[:28] + "…"
-        kb.button(text=f"🗂️ {opened} — {status} — «{preview}»", callback_data=f"brres:win:{w['id']}")
-    kb.adjust(1)
-    await state.set_state(BriefResultStates.pick_window)
-    await cb.message.answer("اختر نافذة البريف:", reply_markup=kb.as_markup())
-    await cb.answer()
-
-@dp.callback_query(BriefResultStates.pick_window, F.data.startswith("brres:win:"))
-async def brief_results_show_window(cb:CallbackQuery, state:FSMContext):
-    win_id = int(cb.data.split(":")[2])
-    w = q_one("""SELECT origin_chat_id, opened_at, closes_at, is_open, prompt_text
-                 FROM brief_windows WHERE id=%s""", (win_id,))
-    if not w:
-        await cb.message.answer("النافذة غير موجودة.", reply_markup=owner_kb()); return await cb.answer()
-
-    rows = q_all("""SELECT DISTINCT ON (user_id)
-                           user_id,
-                           COALESCE(NULLIF(username,''),'مجهول') AS uname,
-                           score, level, details_json, evaluated_at
-                    FROM writing_submissions
-                    WHERE origin_chat_id=%s AND window_id=%s
-                    ORDER BY user_id, evaluated_at DESC""", (w["origin_chat_id"], win_id))
-
-    results = sorted(rows, key=lambda r: (-int(r["score"]), r["uname"]))
-    lines=[]
-    for i, r in enumerate(results, 1):
-        fb=""
-        try:
-            det=json.loads(r.get("details_json") or "{}"); fb=det.get("feedback","")
-        except Exception: pass
-        fb_short = (fb[:120] + "…") if fb and len(fb)>120 else fb
-        lines.append(f"{i:>2}. {html.escape(r['uname'])} — <b>{int(r['score'])}/20</b> — {html.escape(r['level'])}" + (f"\n    📝 {html.escape(fb_short)}" if fb_short else ""))
-
-    chat_label = await get_chat_label(int(w["origin_chat_id"]))
-    opened = fmt_berlin(w["opened_at"])
-    status = "مفتوحة" if int(w.get("is_open",0))==1 else "مغلقة"
-    header = (f"📣 <b>سؤال البريف</b> — المجموعة: <b>{html.escape(chat_label)}</b>\n"
-              f"🕒 فتح (برلين): <b>{opened}</b> — الحالة: <b>{status}</b>\n"
-              f"📝 النص: {html.escape(w.get('prompt_text') or '')}\n\n"
-              f"<b>النتائج:</b>")
-    body = "\n".join(lines) if lines else "لا توجد مشاركات."
-    await send_long(cb.message.chat.id, header + "\n" + body)
-    await state.clear()
-    await cb.answer()
-
-# ---------- تصدير/استيراد ----------
-@dp.message(F.text==BTN_EXPORT)
-async def export_entry(msg:Message):
-    if not await ensure_owner(msg): return
-    rows=q_all("SELECT id,title FROM quizzes ORDER BY id DESC")
-    if not rows: return await msg.answer("لا يوجد اختبارات للتصدير.", reply_markup=owner_kb())
-    kb=InlineKeyboardBuilder()
-    for r in rows[:50]:
-        kb.button(text=f"📤 تصدير {r['id']} — {r['title']}", callback_data=f"export:{r['id']}")
-    kb.adjust(1)
-    await msg.answer("اختر اختبارًا لتصديره كملف JSON:", reply_markup=kb.as_markup())
-
-@dp.callback_query(F.data.startswith("export:"))
-async def do_export(cb:CallbackQuery):
-    quiz_id = int(cb.data.split(":")[1])
-    qrow = q_one("SELECT id,title FROM quizzes WHERE id=%s",(quiz_id,))
-    if not qrow:
-        await cb.message.answer("❌ لم يتم العثور على الاختبار."); return await cb.answer()
-    qs = q_all("SELECT id,text FROM questions WHERE quiz_id=%s ORDER BY id",(quiz_id,))
-    payload = {"title": qrow["title"], "questions": []}
-    for q in qs:
-        opts = q_all("SELECT option_index,text,is_correct FROM options WHERE question_id=%s ORDER BY option_index",(q["id"],))
-        payload["questions"].append({
-            "text": q["text"],
-            "options": [{"text": o["text"], "is_correct": int(o["is_correct"])==1} for o in opts]
-        })
-    with tempfile.NamedTemporaryFile("w", delete=False, suffix=f"_quiz_{quiz_id}.json", encoding="utf-8") as tf:
-        json.dump(payload, tf, ensure_ascii=False, indent=2)
-        temp_path = tf.name
-    await bot.send_document(cb.message.chat.id, FSInputFile(temp_path, filename=f"quiz_{quiz_id}.json"), caption=f"📤 تم تصدير الاختبار {quiz_id}")
-    await cb.answer()
-
-@dp.message(F.text==BTN_IMPORT)
-async def import_entry(msg:Message, state:FSMContext):
-    if not await ensure_owner(msg): return
-    await state.set_state(ImportStates.waiting_json)
-    await msg.answer("📥 ارفع ملف <b>.json</b> بنفس صيغة التصدير، أو ألصق JSON كنص.")
-
-@dp.message(ImportStates.waiting_json, F.document)
-async def import_from_file(msg:Message, state:FSMContext):
-    try:
-        doc = msg.document
-        if not (doc.file_name.lower().endswith(".json") or (doc.mime_type and "json" in doc.mime_type)):
-            return await msg.reply("❌ رجاءً ارفع ملف JSON بامتداد .json")
-        with tempfile.NamedTemporaryFile("wb", delete=False, suffix=".json") as tf:
-            temp_path = tf.name
-        try:
-            await bot.download(doc, destination=temp_path)
-        except Exception:
-            f: File = await bot.get_file(doc.file_id)
-            await bot.download(f, destination=temp_path)
-        with open(temp_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        quiz_id = await _import_payload_create_quiz(data, msg.from_user.id)
-        await state.clear()
-        await msg.answer(f"✅ تم الاستيراد من الملف وإنشاء الاختبار ID {quiz_id}.", reply_markup=owner_kb())
-    except Exception as e:
-        await msg.answer(f"❌ فشل الاستيراد من الملف: <code>{html.escape(str(e))}</code>")
-
-@dp.message(ImportStates.waiting_json, F.text)
-async def import_from_text(msg:Message, state:FSMContext):
-    try:
-        data = json.loads(msg.text)
-        quiz_id = await _import_payload_create_quiz(data, msg.from_user.id)
-        await state.clear()
-        await msg.answer(f"✅ تم الاستيراد كنص وإنشاء الاختبار ID {quiz_id}.", reply_markup=owner_kb())
-    except Exception as e:
-        await msg.answer(f"❌ JSON غير صالح: <code>{html.escape(str(e))}</code>")
-
-async def _import_payload_create_quiz(data:dict, creator_id:int)->int:
-    title = str(data.get("title") or "").strip()
-    if not title: raise ValueError("title مطلوب")
-    questions = data.get("questions") or []
-    if not isinstance(questions, list) or not questions: raise ValueError("questions يجب أن تكون قائمة غير فارغة")
-
-    quiz_id = insert_returning_id("INSERT INTO quizzes(title,created_by,created_at) VALUES (%s,%s,%s)",
-                                  (title, creator_id, _now().isoformat()))
-    for q in questions:
-        qtext = str(q.get("text") or "").strip()
-        opts = q.get("options") or []
-        if not qtext or len(opts) < 2: continue
-        qid = insert_returning_id("INSERT INTO questions(quiz_id,text,created_at) VALUES (%s,%s,%s)",
-                                  (quiz_id, qtext, _now().isoformat()))
-        for i, o in enumerate(opts[:10]):
-            t = str(o.get("text") or "").strip()
-            ok = 1 if bool(o.get("is_correct")) else 0
-            if not t: continue
-            q_exec("INSERT INTO options(question_id,option_index,text,is_correct) VALUES (%s,%s,%s,%s)",
-                   (qid, i, t, ok))
-    return quiz_id
-
-# ---------- مرفقات مشتركة ----------
-@dp.message(F.text==BTN_BUNDLES)
-async def bundles_entry(msg:Message, state:FSMContext):
-    if not await ensure_owner(msg): return
-    kb=InlineKeyboardBuilder()
-    kb.button(text="➕ إضافة مرفق", callback_data="bund:add")
-    kb.button(text="📜 قائمة المرفقات", callback_data="bund:list")
-    kb.button(text="🔗 ربط بسؤال", callback_data="bund:attach")
-    kb.adjust(2,1)
-    await state.set_state(BundleStates.idle)
-    await msg.answer("📎 إدارة المرفقات المشتركة:", reply_markup=kb.as_markup())
-
-@dp.callback_query(BundleStates.idle, F.data=="bund:add")
-async def bundles_add(cb:CallbackQuery, state:FSMContext):
-    await state.set_state(BundleStates.add_wait_file)
-    await cb.message.answer("أرسل <b>صورة/صوت/فويس</b> كمرفق مشترك (ضع عنوانًا في الكابتشن اختياري).")
-    await cb.answer()
-
-@dp.message(BundleStates.add_wait_file, F.photo | F.audio | F.voice)
-async def bundles_add_file(msg:Message, state:FSMContext):
-    title = (msg.caption or "").strip()
-    if msg.photo:
-        kind="photo"; file_id = msg.photo[-1].file_id
-    elif msg.audio:
-        kind="audio"; file_id = msg.audio.file_id
-    else:
-        kind="voice"; file_id = msg.voice.file_id
-    insert_returning_id("INSERT INTO shared_attachments(kind,file_id,title,created_at) VALUES (%s,%s,%s,%s)",
-                        (kind,file_id,title,_now().isoformat()))
-    await state.set_state(BundleStates.idle)
-    await msg.answer("✅ تم حفظ المرفق المشترك.", reply_markup=owner_kb())
-
-@dp.callback_query(BundleStates.idle, F.data=="bund:list")
-async def bundles_list(cb:CallbackQuery):
-    rows = q_all("SELECT id,kind,title FROM shared_attachments ORDER BY id DESC LIMIT 100")
-    if not rows:
-        await cb.message.answer("لا توجد مرفقات مشتركة بعد.", reply_markup=owner_kb()); return await cb.answer()
-    text = "📜 <b>المرفقات المشتركة</b>:\n" + "\n".join([f"• {r['id']} — {r['kind']} — {html.escape(r['title'] or '')}" for r in rows])
-    await cb.message.answer(text, reply_markup=owner_kb())
-    await cb.answer()
-
-@dp.callback_query(BundleStates.idle, F.data=="bund:attach")
-async def bundles_attach_start(cb:CallbackQuery, state:FSMContext):
-    rows=q_all("SELECT id,title FROM quizzes ORDER BY id DESC")
-    if not rows:
-        await cb.message.answer("لا يوجد اختبارات.", reply_markup=owner_kb()); return await cb.answer()
-    kb=InlineKeyboardBuilder()
-    for r in rows[:50]:
-        kb.button(text=f"{r['id']} — {r['title']}", callback_data=f"bund:q:{r['id']}")
-    kb.adjust(1)
-    await state.set_state(BundleStates.attach_pick_quiz)
-    await cb.message.answer("اختر الاختبار:", reply_markup=kb.as_markup())
-    await cb.answer()
-
-@dp.callback_query(BundleStates.attach_pick_quiz, F.data.startswith("bund:q:"))
-async def bundles_attach_pick_quiz(cb:CallbackQuery, state:FSMContext):
-    qid=int(cb.data.split(":")[2])
-    qs=q_all("SELECT id,text FROM questions WHERE quiz_id=%s ORDER BY id",(qid,))
-    if not qs:
-        await cb.message.answer("هذا الاختبار بلا أسئلة.", reply_markup=owner_kb()); return await cb.answer()
-    kb=InlineKeyboardBuilder()
-    for q in qs[:100]:
-        preview = (q['text'][:40] + "…") if len(q['text'])>40 else q['text']
-        kb.button(text=f"{preview}", callback_data=f"bund:qq:{q['id']}")
-    kb.adjust(1)
-    await state.update_data(bundle_target_quiz=qid)
-    await state.set_state(BundleStates.attach_pick_question)
-    await cb.message.answer("اختر السؤال:", reply_markup=kb.as_markup())
-    await cb.answer()
-
-@dp.callback_query(BundleStates.attach_pick_question, F.data.startswith("bund:qq:"))
-async def bundles_attach_pick_question(cb:CallbackQuery, state:FSMContext):
-    qid=int(cb.data.split(":")[2])
-    rows = q_all("SELECT id,kind,title FROM shared_attachments ORDER BY id DESC LIMIT 100")
-    if not rows:
-        await cb.message.answer("لا يوجد مرفقات مشتركة لإرفاقها.", reply_markup=owner_kb()); return await cb.answer()
-    kb=InlineKeyboardBuilder()
-    for r in rows:
-        label = f"{r['id']} — {r['kind']} — {(r['title'] or '')[:20]}"
-        kb.button(text=label, callback_data=f"bund:pick:{qid}:{r['id']}")
-    kb.adjust(1)
-    await state.set_state(BundleStates.attach_pick_bundle)
-    await cb.message.answer("اختر المرفق:", reply_markup=kb.as_markup())
-    await cb.answer()
-
-@dp.callback_query(BundleStates.attach_pick_bundle, F.data.startswith("bund:pick:"))
-async def bundles_attach_apply(cb:CallbackQuery, state:FSMContext):
-    _,_, qid_str, bid_str = cb.data.split(":")
-    question_id = int(qid_str); bundle_id = int(bid_str)
-    b = q_one("SELECT kind,file_id FROM shared_attachments WHERE id=%s",(bundle_id,))
-    if not b:
-        await cb.message.answer("المرفق غير موجود.", reply_markup=owner_kb()); return await cb.answer()
-    pos_row = q_one("SELECT COALESCE(MAX(position),-1) AS p FROM question_attachments WHERE question_id=%s",(question_id,))
-    pos = int(pos_row["p"]) + 1
-    q_exec("INSERT INTO question_attachments(question_id,kind,file_id,position) VALUES (%s,%s,%s,%s)",
-           (question_id, b["kind"], b["file_id"], pos))
-    await state.clear()
-    await cb.message.answer("✅ تم ربط المرفق بالسؤال.", reply_markup=owner_kb())
-    await cb.answer()
-
-# ---------- حذف سؤال (عرض النص كامل + صفحات 5) ----------
-@dp.message(F.text==BTN_DELQUESTION)
-async def del_question_pick_quiz(msg: Message):
-    if not await ensure_owner(msg): return
-    kb, total, pages, page = _quizzes_page("ql_pick_delq", 0)
-    await msg.answer(_qs_page_text_header("🗑️", "حذف سؤال — اختر اختبارًا", total, page, pages), reply_markup=kb)
-
-@dp.callback_query(F.data.startswith("delpick:"))
-async def del_question_pick_page(cb: CallbackQuery):
-    _, quiz_id, page = cb.data.split(":")
-    quiz_id = int(quiz_id); page = int(page)
-    text, kb, *_ = _questions_page(quiz_id, "q_pick_delete", page)
-    try:
-        await cb.message.edit_text(text, reply_markup=kb)
-    except Exception:
-        await cb.message.answer(text, reply_markup=kb)
-    await cb.answer()
-
-@dp.callback_query(F.data.startswith("del:"))
-async def del_question_confirm(cb:CallbackQuery):
-    if cb.from_user.id != OWNER_ID:
-        return await cb.answer("غير مصرح.", show_alert=True)
-    _, quiz_id, qid = cb.data.split(":"); quiz_id=int(quiz_id); qid=int(qid)
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✅ نعم، احذف", callback_data=f"delc:{qid}")
-    kb.button(text="❌ إلغاء", callback_data=f"delpick:{quiz_id}:0")
-    kb.adjust(2)
-    await cb.message.answer("تأكيد حذف هذا السؤال؟", reply_markup=kb.as_markup())
-    await cb.answer()
-
-@dp.callback_query(F.data.startswith("delc:"))
-async def del_question_apply(cb:CallbackQuery):
-    if cb.from_user.id != OWNER_ID:
-        return await cb.answer("غير مصرح.", show_alert=True)
-    _, qid = cb.data.split(":"); qid=int(qid)
-    q_exec("DELETE FROM options WHERE question_id=%s", (qid,))
-    q_exec("DELETE FROM question_attachments WHERE question_id=%s", (qid,))
-    q_exec("DELETE FROM questions WHERE id=%s", (qid,))
-    await cb.message.answer("✅ تم حذف السؤال.", reply_markup=owner_kb())
-    await cb.answer()
-
-# ---------- دمج اختبارات ----------
-@dp.message(F.text==BTN_MERGE)
-async def merge_entry(msg:Message, state:FSMContext):
-    if not await ensure_owner(msg): return
-    rows=q_all("SELECT id,title FROM quizzes ORDER BY id DESC")
-    if not rows: return await msg.answer("لا يوجد اختبارات.", reply_markup=owner_kb())
-    kb=InlineKeyboardBuilder()
-    for r in rows[:50]:
-        kb.button(text=f"وجهة ← {r['id']} — {r['title']}", callback_data=f"merge:dest:{r['id']}")
-    kb.adjust(1)
-    await state.set_state(MergeStates.pick_dest)
-    await msg.answer("اختر <b>الاختبار الوجهة</b> الذي سيتم الدمج إليه:", reply_markup=kb.as_markup())
-
-@dp.callback_query(MergeStates.pick_dest, F.data.startswith("merge:dest:"))
-async def merge_pick_dest(cb:CallbackQuery, state:FSMContext):
-    dest=int(cb.data.split(":")[2])
-    await state.update_data(merge_dest=dest)
-    rows=q_all("SELECT id,title FROM quizzes WHERE id<>%s ORDER BY id DESC",(dest,))
-    if not rows:
-        await cb.message.answer("لا يوجد مصدر للدمج.", reply_markup=owner_kb()); return await cb.answer()
-    kb=InlineKeyboardBuilder()
-    for r in rows[:50]:
-        kb.button(text=f"مصدر → {r['id']} — {r['title']}", callback_data=f"merge:src:{r['id']}")
-    kb.adjust(1)
-    await state.set_state(MergeStates.pick_source)
-    await cb.message.answer("اختر <b>الاختبار المصدر</b> لنسخ أسئلته:", reply_markup=kb.as_markup())
-    await cb.answer()
-
-@dp.callback_query(MergeStates.pick_source, F.data.startswith("merge:src:"))
-async def merge_apply(cb:CallbackQuery, state:FSMContext):
-    src=int(cb.data.split(":")[2])
-    dest=(await state.get_data()).get("merge_dest")
-    if not dest:
-        await cb.message.answer("خطأ في اختيار الوجهة.", reply_markup=owner_kb()); return await cb.answer()
-    qs = q_all("SELECT id,text,created_at FROM questions WHERE quiz_id=%s ORDER BY id",(src,))
-    copied=0
-    for q in qs:
-        new_qid = insert_returning_id("INSERT INTO questions(quiz_id,text,created_at) VALUES (%s,%s,%s)",
-                                      (dest,q["text"],_now().isoformat()))
-        opts = q_all("SELECT option_index,text,is_correct FROM options WHERE question_id=%s ORDER BY option_index",(q["id"],))
-        for o in opts:
-            q_exec("INSERT INTO options(question_id,option_index,text,is_correct) VALUES (%s,%s,%s,%s)",
-                   (new_qid, o["option_index"], o["text"], o["is_correct"]))
-        atts = q_all("SELECT kind,file_id,position FROM question_attachments WHERE question_id=%s ORDER BY position",(q["id"],))
-        for a in atts:
-            q_exec("INSERT INTO question_attachments(question_id,kind,file_id,position) VALUES (%s,%s,%s,%s)",
-                   (new_qid, a["kind"], a["file_id"], a["position"]))
-        copied += 1
-    await state.clear()
-    await cb.message.answer(f"🔗 تم الدمج: نُسخ {copied} سؤالًا من {src} إلى {dest}.", reply_markup=owner_kb())
-    await cb.answer()
-
-# ---------- Runner ----------
-async def main():
-    holder = f"{INSTANCE_ID}:{os.getpid()}"
-    got = False
-    try:
-        got = try_acquire_lock(holder)
-    except Exception as e:
-        print(f"LOCK ACQUIRE ERROR: {e}", flush=True)
-
-    if not got:
-        print("Another instance is active (lease valid). Exiting.", flush=True)
+        await cb.message.answer("لا يوجد بريفات.")
         return
+    text = "\n".join([f"{r['username']}: {r['text']} ({r['evaluated_at']})" for r in rows])
+    await send_long(cb.message.chat.id, f"📝 بريفات المجموعة {chat_id}:\n{text}")
+    await state.clear()
 
-    asyncio.create_task(lock_renew_loop(holder))
-    asyncio.create_task(close_expired_polls_loop())
-    await dp.start_polling(bot, allowed_updates=["message","callback_query","poll_answer"])
+async def main():
+    ensure_schema()
+    # جرّب تأخذ القفل
+    if not try_acquire_lock("main"):
+        print("⚠️ لم يتم الحصول على القفل. خروج.")
+        return
+    asyncio.create_task(lock_renew_loop("main"))
+    print("✅ Bot started...")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("Bot stopped.")
