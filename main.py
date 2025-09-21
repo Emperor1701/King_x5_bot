@@ -156,7 +156,7 @@ def ensure_schema():
         )"""
     ]
 
-    # ⬇️ أضِف هذا القسم هنا (خارج القائمة وفوق الحلقة)
+    # جداول إضافية (خارج الليست لتجنب أخطاء الفواصل)
     ddls.append(
         """CREATE TABLE IF NOT EXISTS chats_cache(
             chat_id BIGINT PRIMARY KEY,
@@ -176,12 +176,8 @@ def ensure_schema():
         )"""
     )
 
-    # لا تغيّر شيئًا تحت هذا السطر
-    for ddl in ddls: 
+    for ddl in ddls:
         q_exec(ddl)
-
-    ]
-    for ddl in ddls: q_exec(ddl)
 
 def migrate_schema():
     q_exec("ALTER TABLE sent_polls ADD COLUMN IF NOT EXISTS run_id INTEGER")
