@@ -467,6 +467,36 @@ async def lock_renew_loop(holder:str):
         except Exception as e:
             print(f"LOCK RENEW ERROR: {e}", flush=True)
 
+# ---------- إغلاق تلقائي للاستطلاعات المنتهية ----------
+async def close_expired_polls_loop():
+    import asyncio
+    while True:
+        try:
+            # سكّـر أي استطلاع انتهت صلاحيته
+            rows = q_all("""
+                SELECT chat_id, message_id, id
+                FROM sent_polls
+                WHERE is_closed=0
+                  AND expires_at IS NOT NULL
+                  AND expires_at <= %s
+                ORDER BY id ASC
+                LIMIT 20
+            """, (_now().isoformat(),))
+            for r in rows:
+                try:
+                    await bot.stop_poll(chat_id=r["chat_id"], message_id=r["message_id"])
+                except Exception:
+                    pass
+                q_exec("UPDATE sent_polls SET is_closed=1 WHERE id=%s", (r["id"],))
+        except Exception as e:
+            try:
+                print(f"[close_expired_polls_loop] error: {e}", flush=True)
+            except Exception:
+                pass
+
+        await asyncio.sleep(30)
+
+
 # ---------- لوحة النتائج ----------
 @dp.message(F.text == BTN_SCORE)
 async def score_entry(msg: Message, state: FSMContext):
