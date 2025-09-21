@@ -1,74 +1,93 @@
-import os, asyncio, html, re, json, tempfile, math, uuid
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import asyncio, os, json, html, re, tempfile, math, uuid, random
 from datetime import datetime, timezone, timedelta
-from zoneinfo import ZoneInfo
+from typing import List, Dict, Tuple
 
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery
-from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.enums import ParseMode, PollType
+from aiogram.types import (
+    Message, CallbackQuery, PollAnswer,
+    ReplyKeyboardMarkup, KeyboardButton, FSInputFile, File,
+    ReactionTypeEmoji
+)
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.state import StatesGroup, State
-import psycopg
-from psycopg_pool import ConnectionPool
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
+
+# --- Europe/Berlin timezone for display ---
+try:
+    from zoneinfo import ZoneInfo
+    TZ_BERLIN = ZoneInfo("Europe/Berlin")
+except Exception:
+    TZ_BERLIN = None
 
 load_dotenv()
 
-# --- Single-instance lock config (optional envs) ---
-INSTANCE_ID = os.getenv("INSTANCE_ID", "").strip() or f"inst-{uuid.uuid4().hex[:8]}"
-LOCK_TTL_SECONDS = int(os.getenv("LOCK_TTL_SECONDS", "40"))
-LOCK_RENEW_EVERY = int(os.getenv("LOCK_RENEW_EVERY", "15"))
-
 # --- Flood control delays ---
-POLL_BASE_DELAY = float(os.getenv("POLL_BASE_DELAY", "0.9"))
-POLL_JITTER = float(os.getenv("POLL_JITTER", "0.6"))
-ATTACH_BASE_DELAY = float(os.getenv("ATTACH_BASE_DELAY", "1.2"))
-ATTACH_JITTER = float(os.getenv("ATTACH_JITTER", "0.8"))
+POLL_BASE_DELAY = float(os.getenv('POLL_BASE_DELAY', '0.9'))
+POLL_JITTER = float(os.getenv('POLL_JITTER', '0.6'))
+ATTACH_BASE_DELAY = float(os.getenv('ATTACH_BASE_DELAY', '1.2'))
+ATTACH_JITTER = float(os.getenv('ATTACH_JITTER', '0.8'))
 
-async def sleep_jitter(kind: str = "poll"):
-    import random
-    if kind == "attach":
-        await asyncio.sleep(ATTACH_BASE_DELAY + random.random() * ATTACH_JITTER)
+async def sleep_jitter(kind: str = 'poll'):
+    if kind == 'attach':
+        await asyncio.sleep(ATTACH_BASE_DELAY + random.random()*ATTACH_JITTER)
     else:
-        await asyncio.sleep(POLL_BASE_DELAY + random.random() * POLL_JITTER)
+        await asyncio.sleep(POLL_BASE_DELAY + random.random()*POLL_JITTER)
 
-# --- Core ENV (required) ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 if not BOT_TOKEN or not OWNER_ID or not DATABASE_URL:
     raise SystemExit("Set BOT_TOKEN, OWNER_ID, DATABASE_URL")
 
-# توقيت برلين
-BERLIN_TZ = ZoneInfo("Europe/Berlin")
+# --- Single-instance lease lock config (NEW) ---
+INSTANCE_ID = os.getenv("INSTANCE_ID", "").strip() or f"inst-{uuid.uuid4().hex[:8]}"
+LOCK_TTL_SECONDS = int(os.getenv("LOCK_TTL_SECONDS", "40"))
+LOCK_RENEW_EVERY = int(os.getenv("LOCK_RENEW_EVERY", "15"))
 
-# --- إنشاء البوت والديزباشر ---
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 
-# --- PostgreSQL pool ---
-pool = ConnectionPool(conninfo=DATABASE_URL, open=True)
+# ---------- Postgres ----------
+import psycopg
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
+pool = ConnectionPool(conninfo=DATABASE_URL, kwargs={"row_factory": dict_row})
 
-# --- DB Helpers ---
-def q_exec(sql: str, params: tuple = ()):
+def q_exec(sql:str, params:tuple|list|None=None):
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, params)
+            cur.execute(sql, params or ())
         conn.commit()
 
-def q_one(sql: str, params: tuple = ()):
+def q_one(sql:str, params:tuple|list|None=None):
     with pool.connection() as conn:
-        with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
-            cur.execute(sql, params)
+        with conn.cursor() as cur:
+            cur.execute(sql, params or ())
             return cur.fetchone()
 
-def q_all(sql: str, params: tuple = ()):
+def q_all(sql:str, params:tuple|list|None=None)->List[dict]:
     with pool.connection() as conn:
-        with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
-            cur.execute(sql, params)
+        with conn.cursor() as cur:
+            cur.execute(sql, params or ())
             return cur.fetchall()
 
-# --- DB Schema ---
+def insert_returning_id(sql:str, params:tuple|list|None=None)->int:
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql + " RETURNING id", params or ())
+            row = cur.fetchone()
+        conn.commit()
+    return int(row["id"] if isinstance(row, dict) else row[0])
+
+# ---------- Schema + Migrations ----------
 def ensure_schema():
     ddls = [
         """CREATE TABLE IF NOT EXISTS quizzes(
@@ -140,276 +159,443 @@ def ensure_schema():
             quiz_id INTEGER NOT NULL,
             published_at TEXT NOT NULL,
             grade_enabled INTEGER NOT NULL DEFAULT 0
-        )"""
-    ]
-
-    # إضافات جديدة
-    ddls.append(
+        )""",
+        # NEW: cache chat titles to list groups nicely
         """CREATE TABLE IF NOT EXISTS chats_cache(
             chat_id BIGINT PRIMARY KEY,
             title TEXT,
             type TEXT,
             updated_at TEXT NOT NULL
-        )"""
-    )
-
-    ddls.append(
+        )""",
+        # NEW: lease lock to prevent multiple instances
         """CREATE TABLE IF NOT EXISTS bot_lock(
             id INTEGER PRIMARY KEY GENERATED BY DEFAULT AS IDENTITY,
             instance_id TEXT NOT NULL,
             holder TEXT NOT NULL,
-            lease_until TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+            lease_until TIMESTAMPTZ NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL
         )"""
+    ]
+    for ddl in ddls: q_exec(ddl)
+
+def migrate_schema():
+    q_exec("ALTER TABLE sent_polls ADD COLUMN IF NOT EXISTS run_id INTEGER")
+    q_exec("ALTER TABLE quiz_responses ADD COLUMN IF NOT EXISTS run_id INTEGER")
+    q_exec("ALTER TABLE brief_windows ADD COLUMN IF NOT EXISTS prompt_text TEXT")
+    q_exec("ALTER TABLE brief_windows ADD COLUMN IF NOT EXISTS ann_message_id BIGINT")
+    q_exec("ALTER TABLE writing_submissions ADD COLUMN IF NOT EXISTS username TEXT")
+    q_exec("ALTER TABLE writing_submissions ADD COLUMN IF NOT EXISTS window_id INTEGER")
+    q_exec("ALTER TABLE quiz_runs ADD COLUMN IF NOT EXISTS grade_enabled INTEGER NOT NULL DEFAULT 0")
+
+ensure_schema()
+migrate_schema()
+
+# ---------- UI ----------
+BTN_NEWQUIZ="🆕 إنشاء اختبار"; BTN_ADDQ="➕ إضافة سؤال"; BTN_LISTQUIZ="📚 عرض الاختبارات"
+BTN_EDITQUIZ="🛠️ تعديل اختبار"; BTN_DELQUIZ="🗑️ حذف اختبار"
+BTN_BUNDLES="📎 مرفقات مشتركة"; BTN_MERGE="🔗 دمج الاختبارات"
+BTN_EXPORT="📤 تصدير اختبار"; BTN_IMPORT="📥 استيراد دفعة"
+BTN_PUBLISH="🚀 نشر اختبار"; BTN_WIPE_ALL="🧹 حذف كل الاختبارات"
+BTN_SCORE="🏆 لوحة النتائج"; BTN_BACK_HOME="↩️ العودة للبداية"; BTN_BACK_STEP="⬅️ رجوع للخلف"
+BTN_BRIEF="✉️ زر إرسال البريف"
+BTN_LISTQUESTIONS="📝 عرض الأسئلة"
+BTN_EDITQUESTION="✏️ تعديل سؤال"
+BTN_DELQUESTION="🗑️ حذف سؤال"
+# NEW button (لا حذف لأي زر قديم)
+BTN_BRIEF_RESULTS = "📊 نتائج البريف"
+
+def owner_kb()->ReplyKeyboardMarkup:
+    rows=[
+        [KeyboardButton(text=BTN_BACK_HOME), KeyboardButton(text=BTN_BACK_STEP)],
+        [KeyboardButton(text=BTN_NEWQUIZ), KeyboardButton(text=BTN_ADDQ)],
+        [KeyboardButton(text=BTN_LISTQUIZ), KeyboardButton(text=BTN_EDITQUIZ)],
+        [KeyboardButton(text=BTN_LISTQUESTIONS), KeyboardButton(text=BTN_EDITQUESTION)],
+        [KeyboardButton(text=BTN_DELQUESTION)],
+        [KeyboardButton(text=BTN_DELQUIZ), KeyboardButton(text=BTN_BRIEF)],
+        [KeyboardButton(text=BTN_PUBLISH), KeyboardButton(text=BTN_SCORE)],
+        [KeyboardButton(text=BTN_EXPORT), KeyboardButton(text=BTN_IMPORT)],
+        [KeyboardButton(text=BTN_BUNDLES), KeyboardButton(text=BTN_MERGE)],
+        [KeyboardButton(text=BTN_BRIEF_RESULTS)],  # NEW: صف إضافي للزر الجديد
+        [KeyboardButton(text=BTN_WIPE_ALL)],
+    ]
+    return ReplyKeyboardMarkup(
+        keyboard=rows, resize_keyboard=True, one_time_keyboard=True,
+        is_persistent=False, input_field_placeholder="اختر أمرًا من الأزرار 👇"
     )
 
-    for ddl in ddls:
-        q_exec(ddl)
+ALL_BTN_TEXTS = {
+    BTN_BACK_HOME, BTN_BACK_STEP, BTN_NEWQUIZ, BTN_ADDQ, BTN_LISTQUIZ, BTN_EDITQUIZ,
+    BTN_DELQUIZ, BTN_BRIEF, BTN_WIPE_ALL, BTN_SCORE, BTN_PUBLISH, BTN_BUNDLES,
+    BTN_MERGE, BTN_EXPORT, BTN_IMPORT, BTN_LISTQUESTIONS, BTN_EDITQUESTION, BTN_DELQUESTION,
+    BTN_BRIEF_RESULTS  # NEW
+}
+
+def done_button_kb(tag: str):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✔️ تم", callback_data=f"done:{tag}")
+    kb.button(text="❌ بدون مرفقات", callback_data=f"skip:{tag}")
+    kb.adjust(2); return kb.as_markup()
+
+def inline_confirm_kb(tag:str):
+    kb=InlineKeyboardBuilder()
+    kb.button(text="✅ تأكيد", callback_data=f"{tag}:yes")
+    kb.button(text="❌ إلغاء", callback_data=f"{tag}:no")
+    kb.adjust(2); return kb.as_markup()
+
+def attach_choice_kb():
+    kb=InlineKeyboardBuilder()
+    kb.button(text="📎 مرفقات خاصة", callback_data="att:upload")
+    kb.button(text="📎 من المشتركة", callback_data="att:shared")
+    kb.button(text="❌ بدون مرفقات", callback_data="att:none")
+    kb.adjust(2,1); return kb.as_markup()
+
+def shared_list_kb(question_id:int):
+    rows = q_all("SELECT id,kind,title FROM shared_attachments ORDER BY id DESC LIMIT 100")
+    kb=InlineKeyboardBuilder()
+    for r in rows:
+        label=f"{r['id']} — {r['kind']} — {(r['title'] or '')[:20]}"
+        kb.button(text=label, callback_data=f"attadd:{question_id}:{r['id']}")
+    kb.button(text="✔️ تم", callback_data=f"attdone:{question_id}")
+    kb.adjust(1)
+    return kb.as_markup()
+
+def publish_hours_kb(quiz_id:int):
+    kb=InlineKeyboardBuilder()
+    for h in (1,2,4,8,24):
+        kb.button(text=f"⏳ {h} ساعة", callback_data=f"pubdur:{quiz_id}:{h}")
+    kb.button(text="⌨️ رقم مخصص", callback_data=f"pubdur:{quiz_id}:custom")
+    kb.button(text="♾️ بدون مؤقّت", callback_data=f"pubdur:{quiz_id}:0")
+    kb.adjust(2,2,1)
+    return kb.as_markup()
+
+def publish_eval_kb(quiz_id:int, hours:int):
+    kb=InlineKeyboardBuilder()
+    kb.button(text="✅ فعّل التقييم", callback_data=f"pubeval:{quiz_id}:{hours}:1")
+    kb.button(text="❌ بدون تقييم", callback_data=f"pubeval:{quiz_id}:{hours}:0")
+    kb.adjust(2)
+    return kb.as_markup()
 
 # ---------- Helpers ----------
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
+def _now()->datetime: return datetime.now(timezone.utc)
+def _utcnow()->datetime: return datetime.now(timezone.utc)
+def is_owner(uid:int)->bool: return uid==OWNER_ID
 
-def fmt_berlin(iso_str_or_dt) -> str:
-    """
-    يحوّل ISO أو datetime إلى وقت برلين: YYYY-MM-DD HH:MM:SS
-    """
-    if isinstance(iso_str_or_dt, datetime):
-        dt = iso_str_or_dt
-    else:
-        try:
-            dt = datetime.fromisoformat(str(iso_str_or_dt))
-        except Exception:
-            return str(iso_str_or_dt)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(BERLIN_TZ).strftime("%Y-%m-%d %H:%M:%S")
-
-def is_owner(uid: int) -> bool:
-    return uid == OWNER_ID
-
-async def ensure_owner(msg: Message) -> bool:
+async def ensure_owner(msg:Message)->bool:
     if not is_owner(msg.from_user.id):
-        await msg.reply("🚫 هذا الزر/الأمر خاص بالمالك.", reply_markup=owner_kb())
-        return False
+        await msg.reply("🚫 هذا الزر/الأمر خاص بالمالك.", reply_markup=owner_kb()); return False
     return True
 
-def hname(u) -> str:
-    nm = " ".join([x for x in [getattr(u, "first_name", None), getattr(u, "last_name", None)] if x]).strip()
-    if not nm and getattr(u, "username", None):
-        nm = f"@{u.username}"
+def hname(u)->str:
+    nm=" ".join([x for x in [getattr(u,"first_name",None),getattr(u,"last_name",None)] if x]).strip()
+    if not nm and getattr(u,"username",None): nm=f"@{u.username}"
     return nm or f"UID {u.id}"
 
-def mention_html(user_id: int, name: str) -> str:
+def mention_html(user_id:int, name:str)->str:
     safe = html.escape(name or "مستخدم")
     return f'<a href="tg://user?id={user_id}">{safe}</a>'
 
-# كاش أسماء المجموعات
-async def get_chat_label(chat_id: int) -> str:
+async def send_long(chat_id:int, text:str):
+    MAX=3800
+    buf=""
+    for para in text.split("\n\n"):
+        if len(buf)+len(para)+2>MAX and buf:
+            await bot.send_message(chat_id, buf)
+            buf=""
+        buf += (("\n\n" if buf else "") + para)
+    if buf:
+        await bot.send_message(chat_id, buf)
+
+# NEW: format ISO (UTC) to Europe/Berlin string for display
+def fmt_berlin(iso_str:str)->str:
+    if not iso_str:
+        return "-"
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z","+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        if TZ_BERLIN:
+            dt = dt.astimezone(TZ_BERLIN)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return iso_str
+
+# ---------- FSM States ----------
+class NewQuizStates(StatesGroup):
+    waiting_title          = State()
+    waiting_question_text  = State()
+    waiting_options        = State()
+    waiting_corrects       = State()
+    waiting_more_q         = State()
+
+class AttachStates(StatesGroup):
+    waiting_pick_quiz      = State()
+    waiting_pick_question  = State()
+    waiting_attach         = State()
+
+class ScoreStates(StatesGroup):
+    pick_quiz              = State()
+    pick_run               = State()
+
+class ScoreByGroupStates(StatesGroup):
+    pick_group             = State()
+    pick_quiz              = State()
+    pick_run               = State()
+
+# NEW: FSM لنتائج البريف
+class BriefResultStates(StatesGroup):
+    pick_group             = State()
+    pick_window            = State()
+
+# ---------- Start / Back ----------
+@dp.message(Command("start"))
+async def cmd_start(msg: Message, state: FSMContext):
+    if not await ensure_owner(msg): return
+    await state.clear()
+    await msg.answer("👋 أهلاً بك في لوحة تحكم البوت", reply_markup=owner_kb())
+
+@dp.message(F.text == BTN_BACK_HOME)
+async def back_home(msg: Message, state: FSMContext):
+    if not await ensure_owner(msg): return
+    await state.clear()
+    await msg.answer("🏠 رجعناك للصفحة الرئيسية", reply_markup=owner_kb())
+
+@dp.message(F.text == BTN_BACK_STEP)
+async def back_step(msg: Message, state: FSMContext):
+    if not await ensure_owner(msg): return
+    await state.clear()
+    await msg.answer("⬅️ رجعناك خطوة للخلف", reply_markup=owner_kb())
+
+# ---------- Cache chat labels ----------
+async def get_chat_label(chat_id:int)->str:
     row = q_one("SELECT title FROM chats_cache WHERE chat_id=%s", (chat_id,))
     if row and row.get("title"):
         return row["title"]
     try:
         ch = await bot.get_chat(chat_id)
-        title = getattr(ch, "title", None) or getattr(ch, "full_name", None) or str(chat_id)
-        q_exec(
-            """INSERT INTO chats_cache(chat_id,title,type,updated_at)
-               VALUES (%s,%s,%s,%s)
-               ON CONFLICT (chat_id) DO UPDATE
-               SET title=EXCLUDED.title, type=EXCLUDED.type, updated_at=EXCLUDED.updated_at""",
-            (chat_id, title, getattr(ch, "type", ""), _now().isoformat()),
-        )
+        title = ch.title or (getattr(ch,"full_name",None) or str(chat_id))
+        q_exec("""INSERT INTO chats_cache(chat_id,title,type,updated_at)
+                  VALUES (%s,%s,%s,%s)
+                  ON CONFLICT (chat_id) DO UPDATE SET title=EXCLUDED.title, type=EXCLUDED.type, updated_at=EXCLUDED.updated_at""",
+               (chat_id, title, getattr(ch,"type",""), _now().isoformat()))
         return title
     except Exception:
         return str(chat_id)
 
-# --- Single-Instance Lease helpers ---
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+# ---------- Single-instance lock helpers ----------
+def _lease_until(): return _utcnow() + timedelta(seconds=LOCK_TTL_SECONDS)
 
-def _lease_until_iso() -> str:
-    return (_utcnow() + timedelta(seconds=LOCK_TTL_SECONDS)).isoformat()
-
-def try_acquire_lock(holder: str) -> bool:
-    now = _utcnow().isoformat()
-    until = _lease_until_iso()
+def try_acquire_lock(holder:str)->bool:
+    now=_utcnow(); until=_lease_until()
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE bot_lock
-                   SET instance_id=%s, holder=%s, lease_until=%s, updated_at=%s
-                 WHERE (lease_until <= %s) OR (holder=%s)
-                RETURNING id
-                """,
-                (INSTANCE_ID, holder, until, now, now, holder),
-            )
+            cur.execute("""UPDATE bot_lock
+                           SET instance_id=%s, holder=%s, lease_until=%s, updated_at=%s
+                           WHERE (lease_until <= %s) OR (holder=%s)
+                           RETURNING id""",
+                        (INSTANCE_ID, holder, until, now, now, holder))
             row = cur.fetchone()
             if not row:
-                cur.execute("SELECT COUNT(*) FROM bot_lock WHERE lease_until > %s", (now,))
-                active = (cur.fetchone() or (0,))[0]
-                if int(active) == 0:
-                    cur.execute(
-                        """
-                        INSERT INTO bot_lock(instance_id, holder, lease_until, updated_at)
-                        VALUES (%s, %s, %s, %s)
-                        RETURNING id
-                        """,
-                        (INSTANCE_ID, holder, until, now),
-                    )
-                    row = cur.fetchone()
+                cur.execute("SELECT COUNT(*) FROM bot_lock WHERE lease_until > %s",(now,))
+                active=cur.fetchone()[0]
+                if active==0:
+                    cur.execute("""INSERT INTO bot_lock(instance_id,holder,lease_until,updated_at)
+                                   VALUES (%s,%s,%s,%s) RETURNING id""",
+                                (INSTANCE_ID, holder, until, now))
+                    row=cur.fetchone()
         conn.commit()
     return bool(row)
 
-def renew_lock(holder: str) -> bool:
-    now = _utcnow().isoformat()
-    until = _lease_until_iso()
+def renew_lock(holder:str)->bool:
+    now=_utcnow(); until=_lease_until()
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE bot_lock
-                   SET lease_until=%s, updated_at=%s
-                 WHERE holder=%s AND lease_until > %s
-                RETURNING id
-                """,
-                (until, now, holder, now),
-            )
-            ok = cur.fetchone()
+            cur.execute("""UPDATE bot_lock SET lease_until=%s, updated_at=%s
+                           WHERE holder=%s AND lease_until > %s RETURNING id""",
+                        (until, now, holder, now))
+            ok=cur.fetchone()
         conn.commit()
     return bool(ok)
 
-async def lock_renew_loop(holder: str):
+async def lock_renew_loop(holder:str):
     while True:
         await asyncio.sleep(LOCK_RENEW_EVERY)
         try:
             if not renew_lock(holder):
-                try:
-                    await bot.close()
-                except Exception:
-                    pass
+                try: await bot.close()
+                except Exception: pass
                 print("LOCK LOST — another instance took the lease. Exiting.", flush=True)
                 os._exit(0)
         except Exception as e:
             print(f"LOCK RENEW ERROR: {e}", flush=True)
-# --- end Single-Instance Lease helpers ---
 
-async def send_long(chat_id: int, text: str):
-    MAX = 3800
-    buf = ""
-    for para in text.split("\n\n"):
-        if len(buf) + len(para) + 2 > MAX and buf:
-            await bot.send_message(chat_id, buf)
-            buf = ""
-        buf += (("\n\n" if buf else "") + para)
-    if buf:
-        await bot.send_message(chat_id, buf)
-
-async def attach_file_to_question(question_id: int, kind: str, file_id: str):
-    pos_row = q_one("SELECT COALESCE(MAX(position),-1) AS p FROM question_attachments WHERE question_id=%s", (question_id,))
-    pos = int(pos_row["p"]) + 1
-    q_exec(
-        "INSERT INTO question_attachments(question_id,kind,file_id,position) VALUES (%s,%s,%s,%s)",
-        (question_id, kind, file_id, pos),
-    )
-
-# --- FSM States ---
-class QuizStates(StatesGroup):
-    waiting_title = State()
-    waiting_question = State()
-    waiting_option = State()
-
-class BriefStates(StatesGroup):
-    waiting_brief = State()
-
-class ScoreByGroupStates(StatesGroup):
-    pick_group = State()
-
-class BriefScoreStates(StatesGroup):
-    pick_group = State()
-
-# --- منع ضغط الأزرار لغير المالك ---
-@dp.callback_query()
-async def admin_cb_guard(cb: CallbackQuery):
-    if cb.from_user.id != OWNER_ID and re.match(r"^(addq|editq|delq|...)", cb.data or ""):
-        await cb.answer("🚫 هذا الزر خاص بالكنغ فقط.", show_alert=True)
-
-# --- أوامر أساسية ---
-@dp.message(F.text == "/start")
-async def cmd_start(msg: Message):
-    await msg.answer("👋 أهلا بك! هذا البوت جاهز للاختبارات والتمارين.")
-
-@dp.message(F.text == "/newquiz")
-async def cmd_newquiz(msg: Message, state):
+# ---------- لوحة النتائج ----------
+@dp.message(F.text == BTN_SCORE)
+async def score_entry(msg: Message, state: FSMContext):
     if not await ensure_owner(msg): return
-    await msg.answer("أدخل عنوان الاختبار:")
-    await state.set_state(QuizStates.waiting_title)
-
-@dp.message(QuizStates.waiting_title)
-async def quiz_title(msg: Message, state):
-    title = msg.text.strip()
-    q_exec("INSERT INTO quizzes(title, created_by, created_at) VALUES (%s,%s,%s)",
-           (title, msg.from_user.id, _now().isoformat()))
-    await msg.answer(f"✅ تم إنشاء اختبار: {title}")
-    await state.clear()
-
-@dp.message(F.text == "/quizzes")
-async def cmd_quizzes(msg: Message):
-    rows = q_all("SELECT * FROM quizzes WHERE is_archived=0")
+    # استخرج المجموعات اللي فيها نشر
+    rows = q_all("SELECT DISTINCT chat_id FROM quiz_runs ORDER BY chat_id")
     if not rows:
-        await msg.answer("لا يوجد اختبارات حاليا.")
+        await msg.answer("🚫 لا توجد أي نتائج بعد.")
         return
-    text = "\n".join([f"{r['id']}: {r['title']}" for r in rows])
-    await send_long(msg.chat.id, f"📋 قائمة الاختبارات:\n{text}")
+    kb = InlineKeyboardBuilder()
+    for r in rows:
+        label = await get_chat_label(r["chat_id"])
+        kb.button(text=label, callback_data=f"score_group:{r['chat_id']}")
+    kb.adjust(1)
+    await state.set_state(ScoreByGroupStates.pick_group)
+    await msg.answer("📊 اختر المجموعة لعرض النتائج:", reply_markup=kb.as_markup())
 
-@dp.message(F.text == "/brief")
-async def cmd_brief(msg: Message, state):
-    await msg.answer("✍️ أرسل لي البريف الآن:")
-    await state.set_state(BriefStates.waiting_brief)
-
-@dp.message(BriefStates.waiting_brief)
-async def handle_brief(msg: Message, state):
-    q_exec(
-        "INSERT INTO writing_submissions(origin_chat_id,user_id,username,text,score,level,evaluated_at) VALUES (%s,%s,%s,%s,%s,%s,%s)",
-        (msg.chat.id, msg.from_user.id, msg.from_user.username, msg.text, 0, "غير مصحح", _now().isoformat()),
-    )
-    await msg.answer("✅ تم استلام البريف.")
-    await state.clear()
-
-@dp.message(F.text == "/briefscores")
-async def cmd_briefs(msg: Message, state):
-    chats = q_all("SELECT DISTINCT origin_chat_id FROM writing_submissions ORDER BY origin_chat_id")
-    if not chats:
-        await msg.answer("لا يوجد بريفات مستلمة.")
-        return
-    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-    markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"مجموعة {c['origin_chat_id']}", callback_data=f"briefgrp:{c['origin_chat_id']}")] for c in chats])
-    await msg.answer("اختر المجموعة لعرض نتائج البريف:", reply_markup=markup)
-    await state.set_state(BriefScoreStates.pick_group)
-
-@dp.callback_query(BriefScoreStates.pick_group, F.data.startswith("briefgrp:"))
-async def cb_briefs(cb: CallbackQuery, state):
+@dp.callback_query(ScoreByGroupStates.pick_group, F.data.startswith("score_group:"))
+async def score_pick_group(cb: CallbackQuery, state: FSMContext):
     chat_id = int(cb.data.split(":")[1])
-    rows = q_all("SELECT * FROM writing_submissions WHERE origin_chat_id=%s", (chat_id,))
+    await state.update_data(chat_id=chat_id)
+    # جلب الاختبارات من هذا الشات
+    rows = q_all("SELECT DISTINCT quiz_id FROM quiz_runs WHERE chat_id=%s ORDER BY quiz_id",(chat_id,))
     if not rows:
-        await cb.message.answer("لا يوجد بريفات.")
+        await cb.message.edit_text("🚫 لا يوجد اختبارات منشورة في هذه المجموعة.")
         return
-    text = "\n".join([f"{r['username']}: {r['text']} ({r['evaluated_at']})" for r in rows])
-    await send_long(cb.message.chat.id, f"📝 بريفات المجموعة {chat_id}:\n{text}")
-    await state.clear()
+    kb=InlineKeyboardBuilder()
+    for r in rows:
+        qz = q_one("SELECT title FROM quizzes WHERE id=%s",(r["quiz_id"],))
+        kb.button(text=f"{r['quiz_id']} — {qz['title']}", callback_data=f"score_quiz:{r['quiz_id']}")
+    kb.adjust(1)
+    await state.set_state(ScoreByGroupStates.pick_quiz)
+    await cb.message.edit_text("📚 اختر الاختبار:", reply_markup=kb.as_markup())
 
-async def main():
-    ensure_schema()
-    # جرّب تأخذ القفل
-    if not try_acquire_lock("main"):
-        print("⚠️ لم يتم الحصول على القفل. خروج.")
+@dp.callback_query(ScoreByGroupStates.pick_quiz, F.data.startswith("score_quiz:"))
+async def score_pick_quiz(cb: CallbackQuery, state: FSMContext):
+    quiz_id = int(cb.data.split(":")[1])
+    data = await state.get_data()
+    chat_id = data["chat_id"]
+    await state.update_data(quiz_id=quiz_id)
+    # جلب جلسات النشر
+    rows = q_all("SELECT id,published_at FROM quiz_runs WHERE chat_id=%s AND quiz_id=%s ORDER BY id",(chat_id,quiz_id))
+    if not rows:
+        await cb.message.edit_text("🚫 لا توجد جلسات نشر لهذا الاختبار.")
         return
-    asyncio.create_task(lock_renew_loop("main"))
-    print("✅ Bot started...")
-    await dp.start_polling(bot)
+    kb=InlineKeyboardBuilder()
+    for r in rows:
+        ts = fmt_berlin(r["published_at"])
+        kb.button(text=f"جلسة {r['id']} — {ts}", callback_data=f"score_run:{r['id']}")
+    kb.adjust(1)
+    await state.set_state(ScoreByGroupStates.pick_run)
+    await cb.message.edit_text("⏳ اختر جلسة النشر:", reply_markup=kb.as_markup())
+
+@dp.callback_query(ScoreByGroupStates.pick_run, F.data.startswith("score_run:"))
+async def score_pick_run(cb: CallbackQuery, state: FSMContext):
+    run_id = int(cb.data.split(":")[1])
+    data = await state.get_data()
+    chat_id, quiz_id = data["chat_id"], data["quiz_id"]
+
+    # جلب النتائج
+    rows = q_all("""SELECT user_id, username, SUM(is_correct)::int AS corrects, COUNT(*) AS total
+                    FROM quiz_responses
+                    WHERE chat_id=%s AND quiz_id=%s AND run_id=%s
+                    GROUP BY user_id, username
+                    ORDER BY corrects DESC""",
+                 (chat_id, quiz_id, run_id))
+    if not rows:
+        await cb.message.edit_text("🚫 لا توجد إجابات في هذه الجلسة.")
+        return
+
+    lines=[]
+    rank=1
+    for r in rows:
+        nm = r["username"] or f"UID {r['user_id']}"
+        lines.append(f"{rank}. {nm} — {r['corrects']}/{r['total']}")
+        rank+=1
+    text="🏆 <b>لوحة النتائج</b>\n" + "\n".join(lines)
+    await cb.message.edit_text(text)
+
+# ---------- نتائج البريف ----------
+@dp.message(F.text == BTN_BRIEF_RESULTS)
+async def brief_results_entry(msg: Message, state: FSMContext):
+    if not await ensure_owner(msg): return
+    rows = q_all("SELECT DISTINCT origin_chat_id FROM brief_windows ORDER BY origin_chat_id")
+    if not rows:
+        await msg.answer("🚫 لا توجد أي نوافذ بريف.")
+        return
+    kb = InlineKeyboardBuilder()
+    for r in rows:
+        label = await get_chat_label(r["origin_chat_id"])
+        kb.button(text=label, callback_data=f"brief_group:{r['origin_chat_id']}")
+    kb.adjust(1)
+    await state.set_state(BriefResultStates.pick_group)
+    await msg.answer("✉️ اختر المجموعة:", reply_markup=kb.as_markup())
+
+@dp.callback_query(BriefResultStates.pick_group, F.data.startswith("brief_group:"))
+async def brief_pick_group(cb: CallbackQuery, state: FSMContext):
+    chat_id = int(cb.data.split(":")[1])
+    await state.update_data(chat_id=chat_id)
+    rows = q_all("""SELECT id,opened_at,closes_at,prompt_text
+                    FROM brief_windows
+                    WHERE origin_chat_id=%s
+                    ORDER BY id DESC""",(chat_id,))
+    if not rows:
+        await cb.message.edit_text("🚫 لا توجد نوافذ بريف لهذه المجموعة.")
+        return
+    kb=InlineKeyboardBuilder()
+    for r in rows:
+        ts = fmt_berlin(r["opened_at"])
+        kb.button(text=f"نافذة {r['id']} — {ts}", callback_data=f"brief_window:{r['id']}")
+    kb.adjust(1)
+    await state.set_state(BriefResultStates.pick_window)
+    await cb.message.edit_text("📋 اختر نافذة البريف:", reply_markup=kb.as_markup())
+
+@dp.callback_query(BriefResultStates.pick_window, F.data.startswith("brief_window:"))
+async def brief_pick_window(cb: CallbackQuery, state: FSMContext):
+    window_id = int(cb.data.split(":")[1])
+    win = q_one("SELECT * FROM brief_windows WHERE id=%s",(window_id,))
+    if not win:
+        await cb.message.edit_text("🚫 نافذة غير موجودة.")
+        return
+
+    # جلب البريفات
+    rows = q_all("""SELECT user_id, username, text, evaluated_at, score, level
+                    FROM writing_submissions
+                    WHERE window_id=%s
+                    ORDER BY evaluated_at""",(window_id,))
+    if not rows:
+        await cb.message.edit_text("🚫 لا توجد بريفات مرسلة.")
+        return
+
+    lines=[]
+    for r in rows:
+        nm = r["username"] or f"UID {r['user_id']}"
+        t = fmt_berlin(r["evaluated_at"])
+        lines.append(f"👤 {nm}\n🕒 {t}\n📄 {r['text']}\n✅ {r['score']} — {r['level']}\n---")
+
+    text=(f"📊 <b>نتائج البريف</b>\n"
+          f"من المجموعة: {await get_chat_label(win['origin_chat_id'])}\n"
+          f"النص: {win.get('prompt_text') or '-'}\n"
+          f"من {fmt_berlin(win['opened_at'])} حتى {fmt_berlin(win['closes_at'])}\n\n" +
+          "\n".join(lines))
+    await cb.message.edit_text(text)
+
+# ---------- Main ----------
+async def main():
+    holder = f"{INSTANCE_ID}:{os.getpid()}"
+    got = False
+    try:
+        got = try_acquire_lock(holder)
+    except Exception as e:
+        print(f"LOCK ACQUIRE ERROR: {e}", flush=True)
+
+    if not got:
+        print("Another instance is active. Exiting.", flush=True)
+        return
+
+    # جدولة تجديد القفل
+    asyncio.create_task(lock_renew_loop(holder))
+
+    # ✅ مهم: أبقي على حلقة إغلاق الاستطلاعات المنتهية كما في كودك الأصلي
+    asyncio.create_task(close_expired_polls_loop())
+
+    # ابدأ البوت
+    await dp.start_polling(bot, allowed_updates=["message","callback_query","poll_answer"])
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        print("Bot stopped.")
+        pass
