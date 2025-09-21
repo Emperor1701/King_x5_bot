@@ -20,6 +20,12 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 
+from dotenv import load_dotenv
+from zoneinfo import ZoneInfo   # للتوقيت (برلين)
+import uuid                     # لتوليد INSTANCE_ID
+import os
+import asyncio
+
 load_dotenv()
 
 # --- Single-instance lock config (optional envs) ---
@@ -28,24 +34,29 @@ LOCK_TTL_SECONDS = int(os.getenv("LOCK_TTL_SECONDS", "40"))
 LOCK_RENEW_EVERY = int(os.getenv("LOCK_RENEW_EVERY", "15"))
 
 # --- Flood control delays ---
-POLL_BASE_DELAY = float(os.getenv('POLL_BASE_DELAY', '0.9'))
-POLL_JITTER = float(os.getenv('POLL_JITTER', '0.6'))
-ATTACH_BASE_DELAY = float(os.getenv('ATTACH_BASE_DELAY', '1.2'))
-ATTACH_JITTER = float(os.getenv('ATTACH_JITTER', '0.8'))
+POLL_BASE_DELAY = float(os.getenv("POLL_BASE_DELAY", "0.9"))
+POLL_JITTER = float(os.getenv("POLL_JITTER", "0.6"))
+ATTACH_BASE_DELAY = float(os.getenv("ATTACH_BASE_DELAY", "1.2"))
+ATTACH_JITTER = float(os.getenv("ATTACH_JITTER", "0.8"))
 
-async def sleep_jitter(kind: str = 'poll'):
+async def sleep_jitter(kind: str = "poll"):
     import random
-    if kind == 'attach':
-        await asyncio.sleep(ATTACH_BASE_DELAY + random.random()*ATTACH_JITTER)
+    if kind == "attach":
+        await asyncio.sleep(ATTACH_BASE_DELAY + random.random() * ATTACH_JITTER)
     else:
-        await asyncio.sleep(POLL_BASE_DELAY + random.random()*POLL_JITTER)
+        await asyncio.sleep(POLL_BASE_DELAY + random.random() * POLL_JITTER)
 
+# --- Core ENV (required) ---
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 if not BOT_TOKEN or not OWNER_ID or not DATABASE_URL:
     raise SystemExit("Set BOT_TOKEN, OWNER_ID, DATABASE_URL")
 
+# توقيت برلين (يُستخدم لاحقًا في fmt_berlin)
+BERLIN_TZ = ZoneInfo("Europe/Berlin")
+
+# --- إنشاء البوت والديزباشر ---
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 
