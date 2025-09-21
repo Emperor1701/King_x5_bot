@@ -278,13 +278,42 @@ async def attach_file_to_question(question_id:int, kind:str, file_id:str):
     q_exec("INSERT INTO question_attachments(question_id,kind,file_id,position) VALUES (%s,%s,%s,%s)",
            (question_id, kind, file_id, pos))
 
+# ===== Chat title cache (اسم المجموعة) =====
+def ensure_chats_cache_table():
+    q_exec("""CREATE TABLE IF NOT EXISTS chats_cache(
+        chat_id   BIGINT PRIMARY KEY,
+        title     TEXT,
+        type      TEXT,
+        updated_at TIMESTAMPTZ NOT NULL
+    )""")
+
+ensure_chats_cache_table()
+
+async def cache_chat_title(chat_id:int):
+    """يجلب اسم/نوع الشات من تيليجرام ويخزّنه محليًا."""
+    try:
+        ch = await bot.get_chat(chat_id)
+        title = getattr(ch, "title", None) or getattr(ch, "full_name", "") or ""
+        ctype = getattr(ch, "type", "") or ""
+        q_exec("""INSERT INTO chats_cache(chat_id, title, type, updated_at)
+                  VALUES (%s,%s,%s, NOW())
+                  ON CONFLICT (chat_id) DO UPDATE
+                  SET title=EXCLUDED.title, type=EXCLUDED.type, updated_at=EXCLUDED.updated_at""",
+               (chat_id, title, ctype))
+    except Exception:
+        pass
+
+def chat_title_cached(chat_id:int)->str:
+    r = q_one("SELECT title FROM chats_cache WHERE chat_id=%s",(chat_id,))
+    return (r and r.get("title")) or f"Chat {chat_id}"
+
 # --- منع ضغط الأزرار لغير المالك ---
 @dp.callback_query(
     F.from_user.id != OWNER_ID,
     F.data.regexp(r"^(addq|editq|delq|delqconfirm|briefstop|done:|skip:|wipe:|listq:|pgql:|pgqs:|delpick:|del:|delc:|editqs:|pickqs:|qview:|pub:|pubdur:|pubeval:|scorepick:|scorerun:|export:|bund:|merge:|att:|attadd:|attdone:|editm:)")
 )
 async def admin_cb_guard(cb: CallbackQuery):
-    await cb.answer("🚫 هذا الزر خاص بالمالك.", show_alert=True)
+    await cb.answer("🚫 هذا الزر خاص بالكنغ.", show_alert=True)
 
 # ---------- States ----------
 class BuildStates(StatesGroup):
@@ -333,8 +362,10 @@ class PublishStates(StatesGroup):
     waiting_hours_custom=State()
 
 class ScoreStates(StatesGroup):
-    pick_quiz=State()
-    pick_run=State()
+    pick_chat = State()   # NEW: اختيار المجموعة
+    pick_quiz = State()
+    pick_run = State()
+
 
 # ---------- Parsers ----------
 _option_line_re = re.compile(
@@ -358,7 +389,7 @@ def parse_q_block(text:str)->Tuple[str, List[Tuple[str,bool]]]:
         if not t: continue
         is_correct=bool(m.group("mark"))
         opts.append((t,is_correct))
-    if len(opts)<2 or len(opts)>10:
+    if len(opts)<2 or len(opts)>12:
         raise ValueError("الرجاء إدخال 2 إلى 10 خيارات ضمن الرسالة.")
     return qline, opts
 
@@ -372,8 +403,8 @@ def parse_options_only(text:str)->List[Tuple[str,bool]]:
         if not t: continue
         is_correct=bool(m.group("mark"))
         opts.append((t,is_correct))
-    if len(opts)<2 or len(opts)>10:
-        raise ValueError("أدخل 2 إلى 10 خيارات.")
+    if len(opts)<2 or len(opts)>12:
+        raise ValueError("أدخل 2 إلى 12 خيارات.")
     return opts
 
 # ---------- /start & back ----------
@@ -488,6 +519,24 @@ def _questions_page(quiz_id: int, mode: str, page: int = 0):
         kb.button(text="التالي ➡️", callback_data=f"pgqs:{mode}:{quiz_id}:{page+1}")
     kb.adjust(1)
     return text, kb.as_markup(), total, pages, page
+
+    # ===== لائحة المجموعات التي فيها جلسات نشر =====
+def score_chats_page(page:int=0, per_page:int=5):
+    rows = q_all("""SELECT DISTINCT chat_id
+                    FROM quiz_runs
+                    ORDER BY MAX(id) OVER (PARTITION BY chat_id) DESC""")
+    chunk, page, pages, total = _paginate(rows, page, per_page)
+    kb = InlineKeyboardBuilder()
+    for r in chunk:
+        cid = int(r["chat_id"])
+        title = chat_title_cached(cid)
+        kb.button(text=f"👥 {title}", callback_data=f"scorechat:{cid}:0")
+    if page>0:
+        kb.button(text="⬅️ السابق", callback_data=f"pgch:{page-1}")
+    if page<pages-1:
+        kb.button(text="التالي ➡️", callback_data=f"pgch:{page+1}")
+    kb.adjust(1)
+    return kb.as_markup(), total, pages, page
 # =========================================================
 
 # ================== عرض الاختبارات ==================
@@ -1273,62 +1322,127 @@ async def on_poll_answer(pa: PollAnswer):
 @dp.message(F.text==BTN_SCORE)
 async def score_entry(msg:Message, state:FSMContext):
     if not await ensure_owner(msg): return
-    await state.set_state(ScoreStates.pick_quiz)
+    await state.clear()
+    await state.set_state(ScoreStates.pick_chat)
+    kb, total, pages, page = score_chats_page(0)
+    if total == 0:
+        return await msg.answer("لا توجد مجموعات فيها جلسات نشر بعد.", reply_markup=owner_kb())
+    await msg.answer(_qs_page_text_header("🏁", "نتائج — اختر المجموعة", total, page, pages), reply_markup=kb)
+
+@dp.callback_query(ScoreStates.pick_chat, F.data.startswith("pgch:"))
+async def score_chats_nav(cb:CallbackQuery, state:FSMContext):
+    page = int(cb.data.split(":")[1])
+    kb, total, pages, page = score_chats_page(page)
+    try:
+        await cb.message.edit_text(_qs_page_text_header("🏁", "نتائج — اختر المجموعة", total, page, pages), reply_markup=kb)
+    except Exception:
+        await cb.message.answer(_qs_page_text_header("🏁", "نتائج — اختر المجموعة", total, page, pages), reply_markup=kb)
+    await cb.answer()
+
+@dp.callback_query(ScoreStates.pick_chat, F.data.startswith("scorechat:"))
+async def score_pick_chat(cb:CallbackQuery, state:FSMContext):
+    _, chat_id, _ = cb.data.split(":")
+    chat_id = int(chat_id)
+
+    # تأكد من تخزين اسم المجموعة
+    try:
+        await cache_chat_title(chat_id)
+    except Exception:
+        pass
+
+    await state.update_data(score_chat_id=chat_id)
+    # الآن اختَر الاختبار داخل هذه المجموعة
     kb, total, pages, page = _quizzes_page("ql_pick_score", 0)
-    await msg.answer(_qs_page_text_header("🏁", "نتائج — اختر اختبارًا", total, page, pages), reply_markup=kb)
+    title = chat_title_cached(chat_id)
+    await state.set_state(ScoreStates.pick_quiz)
+    await cb.message.answer(_qs_page_text_header("🧪", f"نتائج — اختر اختبارًا — {title}", total, page, pages), reply_markup=kb)
+    await cb.answer()
+
 
 @dp.callback_query(ScoreStates.pick_quiz, F.data.startswith("scorepick:"))
 async def score_pick_quiz(cb:CallbackQuery, state:FSMContext):
+    data = await state.get_data()
+    chat_id = int(data.get("score_chat_id"))
     _, quiz_id, page = cb.data.split(":")
-    quiz_id=int(quiz_id)
+    quiz_id = int(quiz_id)
+
     await state.update_data(score_quiz_id=quiz_id)
 
-    runs = q_all("""SELECT r.id, r.published_at, r.grade_enabled, COUNT(sp.id)::int AS qcount
-                    FROM quiz_runs r
-                    LEFT JOIN sent_polls sp ON sp.run_id=r.id
-                    WHERE r.chat_id=%s AND r.quiz_id=%s
-                    GROUP BY r.id, r.published_at, r.grade_enabled
-                    ORDER BY r.id DESC""", (cb.message.chat.id, quiz_id))
-    if not runs:
-        await cb.message.answer("لا توجد جلسات نشر لهذا الاختبار هنا.", reply_markup=owner_kb()); return await cb.answer()
+    runs = q_all("""
+        SELECT r.id, r.published_at, r.grade_enabled, COUNT(sp.id)::int AS qcount
+        FROM quiz_runs r
+        LEFT JOIN sent_polls sp ON sp.run_id=r.id
+        WHERE r.chat_id=%s AND r.quiz_id=%s
+        GROUP BY r.id, r.published_at, r.grade_enabled
+        ORDER BY r.id DESC
+    """, (chat_id, quiz_id))
 
-    kb=InlineKeyboardBuilder()
+    title = chat_title_cached(chat_id)
+    if not runs:
+        await cb.message.answer(f"لا توجد جلسات نشر لهذا الاختبار في «{html.escape(title)}».", reply_markup=owner_kb())
+        return await cb.answer()
+
+    kb = InlineKeyboardBuilder()
     for r in runs[:50]:
         dt = r["published_at"].replace("T"," ").split(".")[0].replace("+00:00","")
         tag = "✅ تقييم" if int(r["grade_enabled"])==1 else "❌ بدون تقييم"
         kb.button(text=f"🕒 {dt} — {r['qcount']} س. — {tag}", callback_data=f"scorerun:{r['id']}")
     kb.adjust(1)
     await state.set_state(ScoreStates.pick_run)
-    await cb.message.answer("اختر جلسة النشر لعرض النتائج:", reply_markup=kb.as_markup())
+    await cb.message.answer(f"اختر جلسة النشر — «{html.escape(title)}»:", reply_markup=kb.as_markup())
     await cb.answer()
+
 
 @dp.callback_query(ScoreStates.pick_run, F.data.startswith("scorerun:"))
 async def score_show_run(cb:CallbackQuery, state:FSMContext):
-    run_id=int(cb.data.split(":")[1])
+    run_id = int(cb.data.split(":")[1])
+    data = await state.get_data()
+    chat_id = int(data.get("score_chat_id"))
+    quiz_id = int(data.get("score_quiz_id"))
 
+    # احضر اسم المجموعة
+    title = chat_title_cached(chat_id)
+
+    # عدد الأسئلة
     total_q = q_one("SELECT COUNT(*) AS c FROM sent_polls WHERE run_id=%s",(run_id,))["c"]
-    if total_q == 0:
-        await cb.message.answer("لا توجد أسئلة في هذه الجلسة.", reply_markup=owner_kb()); return await cb.answer()
+    if int(total_q) == 0:
+        await cb.message.answer(f"«{html.escape(title)}» — لا توجد أسئلة في هذه الجلسة.", reply_markup=owner_kb())
+        await state.clear()
+        return await cb.answer()
 
     grade_enabled = int(q_one("SELECT grade_enabled FROM quiz_runs WHERE id=%s",(run_id,))["grade_enabled"])
+    pub_iso = q_one("SELECT published_at FROM quiz_runs WHERE id=%s",(run_id,))["published_at"]
+    pub_txt = (pub_iso or "").replace("T"," ").split(".")[0].replace("+00:00","")
 
     rows = q_all("""
-        SELECT user_id, COALESCE(NULLIF(username,''),'مجهول') AS uname, SUM(is_correct)::int AS correct
+        SELECT user_id,
+               COALESCE(NULLIF(username,''),'مجهول') AS uname,
+               SUM(is_correct)::int AS correct
         FROM quiz_responses
         WHERE run_id=%s
         GROUP BY user_id, uname
         ORDER BY correct DESC, user_id ASC
-        LIMIT 100
+        LIMIT 200
     """, (run_id,))
+
     lines=[]
     for i,r in enumerate(rows,1):
-        base = f"{i:>2}. {html.escape(r['uname'])} — {r['correct']}/{total_q}"
+        # نعرض "اسم المستخدم" المخزَّن (uname)، بدون أي IDs
+        base = f"{i:>2}. {html.escape(r['uname'])} — {int(r['correct'])}/{int(total_q)}"
         if grade_enabled==1:
             lvl = quiz_level_from_score(int(r['correct']), int(total_q))
             base += f" — {lvl}"
         lines.append(base)
-    text = "🏁 <b>نتائج الجلسة</b>\n" + ("\n".join(lines) if lines else "لا يوجد مشاركات بعد.")
-    await cb.message.answer(text, reply_markup=owner_kb())
+
+    header = (
+        f"🏁 <b>نتائج الجلسة — {html.escape(title)}</b>\n"
+        f"🧪 Quiz ID: <code>{quiz_id}</code>\n"
+        f"🆔 Run: <code>{run_id}</code>\n"
+        f"🕒 نشر: <code>{pub_txt}</code>\n"
+        f"🔢 الأسئلة: <b>{int(total_q)}</b>\n"
+        f"🧮 التقييم: {'مُفعّل ✅' if grade_enabled==1 else 'غير مُفعّل ❌'}\n\n"
+    )
+    await cb.message.answer(header + ("\n".join(lines) if lines else "لا يوجد مشاركات بعد."), reply_markup=owner_kb())
     await state.clear()
     await cb.answer()
 
