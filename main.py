@@ -1,5 +1,5 @@
 
-code = r'''#!/usr/bin/env python3
+#code = r'''#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 import asyncio, os, json, html, re, tempfile, math
