@@ -1176,51 +1176,105 @@ def brief_level(score: int) -> str:
     ~F.text.startswith("/"),
     F.from_user.as_('u')
 )
-async def collect_briefs(msg:Message, u):
+async def collect_briefs(msg: Message, u):
+    # تجاهل رسائل البوتات
     if getattr(u, "is_bot", False):
         return
-    row = q_one("SELECT id,closes_at FROM brief_windows WHERE origin_chat_id=%s AND is_open=1 ORDER BY id DESC LIMIT 1",(msg.chat.id,))
+
+    # هل هناك نافذة بريف مفتوحة في هذا الشات؟
+    row = q_one(
+        "SELECT id, closes_at FROM brief_windows "
+        "WHERE origin_chat_id=%s AND is_open=1 "
+        "ORDER BY id DESC LIMIT 1",
+        (msg.chat.id,)
+    )
     if not row:
         return
+
+    # أغلق إن كانت منتهية
     if row["closes_at"] <= _now().isoformat():
-        q_exec("UPDATE brief_windows SET is_open=0 WHERE id=%s",(row["id"],))
+        q_exec("UPDATE brief_windows SET is_open=0 WHERE id=%s", (row["id"],))
         return
-    text=msg.text.strip()
+
+    # النص
+    text = msg.text.strip()
+
+    # تقييم مبسّط
     score, details = free_b1_grade(text)
     lvl = brief_level(score)
-    q_exec("""INSERT INTO writing_submissions(origin_chat_id,quiz_id,user_id,username,text,score,level,evaluated_at,details_json,window_id)
-              VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-           (msg.chat.id,0,msg.from_user.id,(msg.from_user.username or ""),text,score,lvl,_now().isoformat(),json.dumps(details,ensure_ascii=False),row["id"]))
 
-@dp.callback_query(F.data=="briefstop")
-async def brief_stop(cb:CallbackQuery):
+    # 🔹 الاسم العَرْضي (display name) للطالب
+    display_name = hname(msg.from_user)
+
+    # تخزين المشاركة — نخزّن display name في عمود username
+    q_exec("""
+        INSERT INTO writing_submissions(
+            origin_chat_id, quiz_id, user_id, username, text,
+            score, level, evaluated_at, details_json, window_id
+        )
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    """, (
+        msg.chat.id,
+        0,
+        msg.from_user.id,
+        display_name,  # ← الاسم العَرْضي بدل اليوزرنيم
+        text,
+        score,
+        lvl,
+        _now().isoformat(),
+        json.dumps(details, ensure_ascii=False),
+        row["id"]
+    ))
+
+
+@dp.callback_query(F.data == "briefstop")
+async def brief_stop(cb: CallbackQuery):
     if cb.from_user.id != OWNER_ID:
         return await cb.answer("للمالك فقط", show_alert=True)
-    w = q_one("SELECT id,prompt_text FROM brief_windows WHERE origin_chat_id=%s AND is_open=1 ORDER BY id DESC LIMIT 1",(cb.message.chat.id,))
+
+    w = q_one(
+        "SELECT id, prompt_text FROM brief_windows "
+        "WHERE origin_chat_id=%s AND is_open=1 "
+        "ORDER BY id DESC LIMIT 1",
+        (cb.message.chat.id,)
+    )
     if not w:
         return await cb.message.answer("لا توجد نافذة استقبال مفتوحة.", reply_markup=owner_kb())
+
+    # أغلق النافذة
     close_window(cb.message.chat.id)
-    rows = q_all("""SELECT user_id, COALESCE(NULLIF(username,''),'مجهول') AS uname, score, level, details_json, evaluated_at
-                    FROM writing_submissions
-                    WHERE origin_chat_id=%s AND window_id=%s
-                    ORDER BY evaluated_at ASC""", (cb.message.chat.id, w["id"]))
-    by_user: Dict[int, dict] = {}
-    for r in rows:
-        by_user[r["user_id"]] = r
-    if not by_user:
+
+    # نجمع حسب user_id (مش الاسم) ونأخذ أعلى سكور لكل طالب، ونطبع الاسم العَرْضي المخزون
+    rows = q_all("""
+        SELECT
+            user_id,
+            COALESCE(NULLIF(username,''),'مجهول') AS uname,
+            MAX(score)::int AS score,
+            MAX(level) AS level
+        FROM writing_submissions
+        WHERE origin_chat_id=%s AND window_id=%s
+        GROUP BY user_id, uname
+        ORDER BY score DESC, uname ASC
+        LIMIT 1000
+    """, (cb.message.chat.id, w["id"]))
+
+    if not rows:
         return await cb.message.answer("⛔ تم الإيقاف — لم تصل أي مشاركات.", reply_markup=owner_kb())
-    results = sorted(by_user.values(), key=lambda x: (-int(x["score"]), x["uname"]))
+
+    # نبني اللائحة
     lines = []
-    for i, r in enumerate(results, 1):
-        fb = ""
-        try:
-            det = json.loads(r["details_json"] or "{}"); fb = det.get("feedback","")
-        except Exception:
-            pass
-        fb_short = (fb[:120] + "…") if len(fb) > 120 else fb
-        lines.append(f"{i:>2}. {html.escape(r['uname'])} — <b>{int(r['score'])}/20</b> — {html.escape(r['level'])}" + (f"\n    📝 {fb_short}" if fb_short else ""))
-    header = f"⛔ <b>تم إيقاف الاستقبال</b>\n📣 <b>سؤال البريف:</b> {html.escape(w.get('prompt_text') or '')}\n\n<b>النتائج:</b>"
+    for i, r in enumerate(rows, 1):
+        lines.append(
+            f"{i:>2}. {html.escape(r['uname'])} — <b>{int(r['score'])}/20</b> — {html.escape(r.get('level') or '-')}"
+        )
+
+    header = (
+        "⛔ <b>تم إيقاف الاستقبال</b>\n"
+        f"📣 <b>سؤال البريف:</b> {html.escape(w.get('prompt_text') or '')}\n\n"
+        "<b>النتائج:</b>"
+    )
     await send_long(cb.message.chat.id, header + "\n" + "\n".join(lines))
+
 
 # ---------- إرسال مرفقات السؤال ----------
 async def send_question_attachments(chat_id:int, question_id:int):
@@ -1389,40 +1443,79 @@ async def on_poll_answer(pa: PollAnswer):
     poll_id = pa.poll_id
     chosen = pa.option_ids[0] if pa.option_ids else -1
     u = pa.user
-    sp = q_one("SELECT chat_id, quiz_id, question_id, message_id, expires_at, is_closed, run_id FROM sent_polls WHERE poll_id=%s",(poll_id,))
-    if not sp: return
-    if sp["is_closed"]: return
-    if sp["expires_at"] and sp["expires_at"] <= _now().isoformat(): return
 
-    chat_id = sp["chat_id"]; quiz_id=sp["quiz_id"]; qid=sp["question_id"]; message_id=sp["message_id"]; run_id=sp.get("run_id")
+    sp = q_one(
+        "SELECT chat_id, quiz_id, question_id, message_id, expires_at, is_closed, run_id "
+        "FROM sent_polls WHERE poll_id=%s",
+        (poll_id,)
+    )
+    if not sp:
+        return
+    if sp["is_closed"]:
+        return
+    if sp["expires_at"] and sp["expires_at"] <= _now().isoformat():
+        return
 
-    opt = q_one("SELECT is_correct FROM options WHERE question_id=%s AND option_index=%s",(qid,chosen))
+    chat_id = sp["chat_id"]
+    quiz_id = sp["quiz_id"]
+    qid = sp["question_id"]
+    message_id = sp["message_id"]
+    run_id = sp.get("run_id")
+
+    opt = q_one(
+        "SELECT is_correct FROM options WHERE question_id=%s AND option_index=%s",
+        (qid, chosen)
+    )
     is_ok = int(opt["is_correct"]) if opt else 0
 
-    q_exec("""INSERT INTO quiz_responses(chat_id,quiz_id,question_id,user_id,username,option_index,is_correct,answered_at,run_id)
-              VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-           (chat_id,quiz_id,qid,u.id, u.username or (u.full_name or ""), chosen, is_ok, _now().isoformat(), run_id))
+    # 🔹 الاسم العَرْضي (display name) للطالب
+    display_name = hname(u)
 
+    # خزن الإجابة مع الاسم العَرْضي في عمود username
+    q_exec("""
+        INSERT INTO quiz_responses(
+            chat_id, quiz_id, question_id, user_id, username,
+            option_index, is_correct, answered_at, run_id
+        )
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    """, (
+        chat_id, quiz_id, qid, u.id, display_name,
+        chosen, is_ok, _now().isoformat(), run_id
+    ))
+
+    # ردة فعل على الرسالة الأصلية (اختياري)
     try:
         emoji = "🎉" if is_ok else "❌"
-        await bot.set_message_reaction(chat_id=chat_id, message_id=message_id, reaction=[ReactionTypeEmoji(emoji=emoji)], is_big=True)
+        await bot.set_message_reaction(
+            chat_id=chat_id,
+            message_id=message_id,
+            reaction=[ReactionTypeEmoji(emoji=emoji)],
+            is_big=True
+        )
     except Exception:
         pass
 
-    # عند إكمال جميع أسئلة الجلسة أعلن النتيجة (مع المستوى إذا التقييم مُفعّل)
+    # عند إكمال كل أسئلة الجلسة — أعلن النتيجة (ومستوى إن فعّلته)
     try:
-        total_polls = q_one("SELECT COUNT(*) AS c FROM sent_polls WHERE run_id=%s",(run_id,))["c"]
-        answered = q_one("SELECT COUNT(DISTINCT question_id) AS c FROM quiz_responses WHERE run_id=%s AND user_id=%s",(run_id,u.id))["c"]
+        total_polls = q_one("SELECT COUNT(*) AS c FROM sent_polls WHERE run_id=%s", (run_id,))["c"]
+        answered = q_one(
+            "SELECT COUNT(DISTINCT question_id) AS c FROM quiz_responses WHERE run_id=%s AND user_id=%s",
+            (run_id, u.id)
+        )["c"]
         if answered == total_polls and total_polls > 0:
-            correct = q_one("SELECT COALESCE(SUM(is_correct),0) AS s FROM quiz_responses WHERE run_id=%s AND user_id=%s",(run_id,u.id))["s"]
-            run = q_one("SELECT grade_enabled FROM quiz_runs WHERE id=%s",(run_id,))
-            msg = f"📊 نتيجة {mention_html(u.id, u.full_name or u.username or 'طالب')}: <b>{int(correct)}/{int(total_polls)}</b>"
-            if run and int(run["grade_enabled"])==1:
+            correct = q_one(
+                "SELECT COALESCE(SUM(is_correct),0) AS s FROM quiz_responses WHERE run_id=%s AND user_id=%s",
+                (run_id, u.id)
+            )["s"]
+            run = q_one("SELECT grade_enabled FROM quiz_runs WHERE id=%s", (run_id,))
+            msg = f"📊 نتيجة {mention_html(u.id, display_name)}: <b>{int(correct)}/{int(total_polls)}</b>"
+            if run and int(run["grade_enabled"]) == 1:
                 lvl = quiz_level_from_score(int(correct), int(total_polls))
                 msg += f"\n🎯 المستوى: <b>{lvl}</b>"
             await bot.send_message(chat_id, msg, parse_mode=ParseMode.HTML)
     except Exception:
         pass
+
 
         # ================== لوحة النتائج مع اختيار جلسة النشر ==================
 class ScoreStates(StatesGroup):
