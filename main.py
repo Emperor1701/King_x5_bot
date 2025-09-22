@@ -624,12 +624,12 @@ async def render_brief_window_results(chat_id:int, window_id:int):
 
 # ===== لائحة المجموعات التي فيها جلسات نشر =====
 def score_chats_page(page:int=0, per_page:int=5):
-    # FIX: تجنّب SELECT DISTINCT + ORDER BY تعبير غير موجود
+    # نختار كل مجموعة ظهر فيها نشر، مرتّبة بآخر run
     rows = q_all("""
-        SELECT chat_id, MAX(id) AS last_id
+        SELECT chat_id, MAX(id) AS last_run
         FROM quiz_runs
         GROUP BY chat_id
-        ORDER BY last_id DESC
+        ORDER BY last_run DESC
     """)
     chunk, page, pages, total = _paginate(rows, page, per_page)
     kb = InlineKeyboardBuilder()
@@ -1637,6 +1637,104 @@ async def brief_show_window(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 # ================== نهاية نتائج البريف ==================
+# ----- حالات نتائج البريف -----
+class BriefScoreStates(StatesGroup):
+    pick_chat = State()
+
+# لائحة المجموعات التي وصل فيها بريف (مرتب حسب آخر نافذة بريف)
+def brief_chats_page(page:int=0, per_page:int=5):
+    rows = q_all("""
+        SELECT origin_chat_id AS chat_id, MAX(id) AS last_win
+        FROM brief_windows
+        GROUP BY origin_chat_id
+        ORDER BY last_win DESC
+    """)
+    chunk, page, pages, total = _paginate(rows, page, per_page)
+    kb = InlineKeyboardBuilder()
+    for r in chunk:
+        cid = int(r["chat_id"])
+        title = chat_title_cached(cid)
+        kb.button(text=f"👥 {title}", callback_data=f"bscorechat:{cid}")
+    if page>0:
+        kb.button(text="⬅️ السابق", callback_data=f"pgbch:{page-1}")
+    if page<pages-1:
+        kb.button(text="التالي ➡️", callback_data=f"pgbch:{page+1}")
+    kb.adjust(1)
+    return kb.as_markup(), total, pages, page
+
+# دخول لوحة نتائج البريف
+@dp.message(F.text==BTN_BRIEF_SCORES)
+async def brief_scores_entry(msg: Message, state: FSMContext):
+    if not await ensure_owner(msg): return
+    await state.clear()
+    await state.set_state(BriefScoreStates.pick_chat)
+    kb, total, pages, page = brief_chats_page(0)
+    if total == 0:
+        return await msg.answer("لا توجد مجموعات فيها نوافذ بريف بعد.", reply_markup=owner_kb())
+    await msg.answer(_qs_page_text_header("🏅", "نتائج البريف — اختر المجموعة", total, page, pages), reply_markup=kb)
+
+# تنقّل صفحات المجموعات
+@dp.callback_query(BriefScoreStates.pick_chat, F.data.startswith("pgbch:"))
+async def brief_chats_nav(cb: CallbackQuery, state: FSMContext):
+    page = int(cb.data.split(":")[1])
+    kb, total, pages, page = brief_chats_page(page)
+    txt = _qs_page_text_header("🏅", "نتائج البريف — اختر المجموعة", total, page, pages)
+    try:
+        await cb.message.edit_text(txt, reply_markup=kb)
+    except Exception:
+        await cb.message.answer(txt, reply_markup=kb)
+    await cb.answer()
+
+# اختيار مجموعة ثم عرض آخر نافذة بريف ونتائجها
+@dp.callback_query(BriefScoreStates.pick_chat, F.data.startswith("bscorechat:"))
+async def brief_show_scores_for_chat(cb: CallbackQuery, state: FSMContext):
+    chat_id = int(cb.data.split(":")[1])
+
+    # خزّن/حدّث اسم المجموعة بالكاش (غير حرج لو فشل)
+    try:
+        await cache_chat_title(chat_id)
+    except Exception:
+        pass
+    title = chat_title_cached(chat_id)
+
+    # آخر نافذة بريف بهالمجموعة
+    win = q_one("""
+        SELECT id, prompt_text, opened_at, closes_at, is_open
+        FROM brief_windows
+        WHERE origin_chat_id=%s
+        ORDER BY id DESC
+        LIMIT 1
+    """, (chat_id,))
+    if not win:
+        await cb.message.answer(f"«{html.escape(title)}» — لا يوجد أي نافذة بريف بعد.", reply_markup=owner_kb())
+        await state.clear(); return await cb.answer()
+
+    # تجميع النتائج: اسم مستخدم (username إن وُجد) + أفضل/أعلى سكور لنفس الشخص
+    rows = q_all("""
+        SELECT user_id,
+               COALESCE(NULLIF(username,''),'مجهول') AS uname,
+               MAX(score)::int AS best_score,
+               MAX(level) AS level
+        FROM writing_submissions
+        WHERE origin_chat_id=%s AND window_id=%s
+        GROUP BY user_id, uname
+        ORDER BY best_score DESC, uname ASC
+        LIMIT 200
+    """, (chat_id, win["id"]))
+
+    lines=[]
+    for i,r in enumerate(rows,1):
+        lines.append(f"{i:>2}. {html.escape(r['uname'])} — <b>{int(r['best_score'])}/20</b> — {html.escape(r['level'] or '-')}")
+    prompt = (win.get("prompt_text") or "").strip()
+    head = (
+        f"🏅 <b>نتائج البريف — {html.escape(title)}</b>\n"
+        f"🪧 السؤال: {html.escape(prompt)}\n"
+        f"🪫 الحالة: {'مفتوحة' if int(win.get('is_open',0))==1 else 'مغلقة'}\n"
+        f"👥 المشاركون: <b>{len(rows)}</b>\n\n"
+    )
+    await cb.message.answer(head + ("\n".join(lines) if lines else "لا توجد مشاركات."), reply_markup=owner_kb())
+    await state.clear()
+    await cb.answer()
 
 # ================== تصدير/استيراد ==================
 @dp.message(F.text==BTN_EXPORT)
