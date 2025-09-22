@@ -178,6 +178,7 @@ BTN_LISTQUESTIONS="📝 عرض الأسئلة"
 BTN_EDITQUESTION="✏️ تعديل سؤال"
 BTN_DELQUESTION="🗑️ حذف سؤال"
 BTN_BRIEF_RESULTS = "📄 نتائج البريف"  # NEW
+BTN_STOP_RUN = "⛔ إيقاف الاختبار"
 
 def owner_kb()->ReplyKeyboardMarkup:
     rows=[
@@ -191,7 +192,10 @@ def owner_kb()->ReplyKeyboardMarkup:
         [KeyboardButton(text=BTN_BRIEF_RESULTS)],  # NEW
         [KeyboardButton(text=BTN_EXPORT), KeyboardButton(text=BTN_IMPORT)],
         [KeyboardButton(text=BTN_BUNDLES), KeyboardButton(text=BTN_MERGE)],
-        [KeyboardButton(text=BTN_WIPE_ALL)],
+        [KeyboardButton(text=BTN_WIPE_ALL)], 
+        [KeyboardButton(text=BTN_PUBLISH), KeyboardButton(text=BTN_SCORE)],
+        [KeyboardButton(text=BTN_STOP_RUN)],  # NEW
+
     ]
     return ReplyKeyboardMarkup(
         keyboard=rows, resize_keyboard=True, one_time_keyboard=True,
@@ -202,7 +206,8 @@ ALL_BTN_TEXTS = {
     BTN_BACK_HOME, BTN_BACK_STEP, BTN_NEWQUIZ, BTN_ADDQ, BTN_LISTQUIZ, BTN_EDITQUIZ,
     BTN_DELQUIZ, BTN_BRIEF, BTN_WIPE_ALL, BTN_SCORE, BTN_PUBLISH, BTN_BUNDLES,
     BTN_MERGE, BTN_EXPORT, BTN_IMPORT, BTN_LISTQUESTIONS, BTN_EDITQUESTION, BTN_DELQUESTION,
-    BTN_BRIEF_RESULTS  # NEW
+    BTN_BRIEF_RESULTS, BTN_STOP_RUN,
+
 }
 
 def done_button_kb(tag: str):
@@ -1579,6 +1584,55 @@ async def on_poll_answer(pa: PollAnswer):
     except Exception:
         pass
 
+@dp.message(F.text == BTN_STOP_RUN)
+async def stop_latest_run_now(msg: Message):
+    # للمالك فقط
+    if not await ensure_owner(msg):
+        return
+
+    chat_id = msg.chat.id
+
+    # نجيب آخر جلسة فيها أسئلة وفيها استطلاعات مفتوحة (is_closed=0) ولم تُعلن نتائجها بعد
+    run = q_one(
+        """
+        SELECT r.id
+        FROM quiz_runs r
+        WHERE r.chat_id=%s
+          AND EXISTS (SELECT 1 FROM sent_polls sp WHERE sp.run_id=r.id)
+          AND (r.results_announced=0)
+        ORDER BY r.id DESC
+        LIMIT 1
+        """,
+        (chat_id,)
+    )
+
+    if not run:
+        return await msg.reply("لا توجد جلسة نشطة لإيقافها في هذه المجموعة.", reply_markup=owner_kb())
+
+    run_id = int(run["id"])
+
+    # أغلق كل الاستطلاعات المفتوحة لهذه الجلسة
+    polls = q_all(
+        "SELECT id, chat_id, message_id FROM sent_polls WHERE run_id=%s AND is_closed=0 ORDER BY id ASC",
+        (run_id,)
+    )
+    closed = 0
+    for p in polls:
+        try:
+            await bot.stop_poll(chat_id=p["chat_id"], message_id=p["message_id"])
+        except Exception:
+            pass
+        q_exec("UPDATE sent_polls SET is_closed=1 WHERE id=%s", (p["id"],))
+        closed += 1
+
+    # إعلان النتائج النهائية فورًا (تعتمد على الاسم المعروض المخزّن في responses)
+    try:
+        await announce_run_results(run_id)
+    except Exception:
+        # حتى لو فشل الإعلان، نعلّم أن النتائج أُعلنت لمنع التكرار
+        q_exec("UPDATE quiz_runs SET results_announced=1 WHERE id=%s", (run_id,))
+
+    await msg.reply(f"⛔ تم إيقاف الجلسة وإغلاق {closed} من الاستطلاعات، وتم نشر النتائج.", reply_markup=owner_kb())
 
 
         # ================== لوحة النتائج مع اختيار جلسة النشر ==================
