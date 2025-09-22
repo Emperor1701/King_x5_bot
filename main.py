@@ -1472,46 +1472,64 @@ async def on_poll_answer(pa: PollAnswer):
     )
     is_ok = int(opt["is_correct"]) if opt else 0
 
-    # 🔹 الاسم العَرْضي (display name) للطالب
-    display_name = hname(u)
+    # <-- لاحظ التبويب ثابت والسطر متعدد الأسطر داخل أقواس الاستدعاء
+    q_exec(
+        """INSERT INTO quiz_responses
+           (chat_id,quiz_id,question_id,user_id,username,option_index,is_correct,answered_at,run_id)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+        (
+            chat_id,
+            quiz_id,
+            qid,
+            u.id,
+            display_name_from_user(u),  # الاسم المعروض بدلاً من اليوزرنيم
+            chosen,
+            is_ok,
+            _now().isoformat(),
+            run_id,
+        ),
+    )
 
-    # خزن الإجابة مع الاسم العَرْضي في عمود username
-   q_exec("""INSERT INTO quiz_responses(chat_id,quiz_id,question_id,user_id,username,option_index,is_correct,answered_at,run_id)
-          VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-       (chat_id,quiz_id,qid,u.id, display_name_from_user(u), chosen, is_ok, _now().isoformat(), run_id))
-
-    # ردة فعل على الرسالة الأصلية (اختياري)
+    # تفاعل إيموجي على الرسالة
     try:
         emoji = "🎉" if is_ok else "❌"
         await bot.set_message_reaction(
             chat_id=chat_id,
             message_id=message_id,
             reaction=[ReactionTypeEmoji(emoji=emoji)],
-            is_big=True
+            is_big=True,
         )
     except Exception:
         pass
 
-    # عند إكمال كل أسئلة الجلسة — أعلن النتيجة (ومستوى إن فعّلته)
+    # عند إكمال كل أسئلة الجلسة: أعلن النتيجة + المستوى إذا مفعّل
     try:
-        total_polls = q_one("SELECT COUNT(*) AS c FROM sent_polls WHERE run_id=%s", (run_id,))["c"]
+        total_polls = q_one(
+            "SELECT COUNT(*) AS c FROM sent_polls WHERE run_id=%s",
+            (run_id,)
+        )["c"]
         answered = q_one(
             "SELECT COUNT(DISTINCT question_id) AS c FROM quiz_responses WHERE run_id=%s AND user_id=%s",
             (run_id, u.id)
         )["c"]
+
         if answered == total_polls and total_polls > 0:
             correct = q_one(
                 "SELECT COALESCE(SUM(is_correct),0) AS s FROM quiz_responses WHERE run_id=%s AND user_id=%s",
                 (run_id, u.id)
             )["s"]
             run = q_one("SELECT grade_enabled FROM quiz_runs WHERE id=%s", (run_id,))
-            msg = f"📊 نتيجة {mention_html(u.id, display_name)}: <b>{int(correct)}/{int(total_polls)}</b>"
+            msg = (
+                f"📊 نتيجة {mention_html(u.id, display_name_from_user(u))}: "
+                f"<b>{int(correct)}/{int(total_polls)}</b>"
+            )
             if run and int(run["grade_enabled"]) == 1:
                 lvl = quiz_level_from_score(int(correct), int(total_polls))
                 msg += f"\n🎯 المستوى: <b>{lvl}</b>"
             await bot.send_message(chat_id, msg, parse_mode=ParseMode.HTML)
     except Exception:
         pass
+
 
 
         # ================== لوحة النتائج مع اختيار جلسة النشر ==================
