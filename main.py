@@ -20,6 +20,18 @@ from aiogram.filters import Command, StateFilter
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
+# --- Callback quick-ack helper (يردّ فورًا على ضغط الزر) ---
+from aiogram.exceptions import TelegramBadRequest
+
+async def _ack(cb, text: str | None = None, show_alert: bool = False):
+    """أجب على الكولباك فورًا حتى لا يصبح قديماً."""
+    try:
+        await cb.answer(text=text, show_alert=show_alert, cache_time=1)
+    except TelegramBadRequest:
+        # يحصل إذا كان الكويري قديم جداً — تجاهله
+        pass
+    except Exception:
+        pass
 
 load_dotenv()
 
