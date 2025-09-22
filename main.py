@@ -1637,104 +1637,145 @@ async def brief_show_window(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 # ================== نهاية نتائج البريف ==================
-# ----- حالات نتائج البريف -----
+# ===== حالات نتائج البريف =====
 class BriefScoreStates(StatesGroup):
     pick_chat = State()
+    pick_window = State()
 
-# لائحة المجموعات التي وصل فيها بريف (مرتب حسب آخر نافذة بريف)
-def brief_chats_page(page:int=0, per_page:int=5):
+
+# ===== صفحات مجموعات البريف (مع SQL مصحّحة) =====
+def brief_chats_page(page: int = 0, per_page: int = 5):
+    """
+    يعرض المجموعات التي تم فيها فتح نافذة بريف سابقًا، مرتّبة بآخر نافذة.
+    (لا تستخدم SELECT DISTINCT مع ORDER BY WINDOW FUNCTION حتى لا يظهر خطأ InvalidColumnReference)
+    """
     rows = q_all("""
-        SELECT origin_chat_id AS chat_id, MAX(id) AS last_win
+        SELECT origin_chat_id AS chat_id, MAX(id) AS last_id
         FROM brief_windows
         GROUP BY origin_chat_id
-        ORDER BY last_win DESC
+        ORDER BY last_id DESC
     """)
     chunk, page, pages, total = _paginate(rows, page, per_page)
+
     kb = InlineKeyboardBuilder()
     for r in chunk:
         cid = int(r["chat_id"])
         title = chat_title_cached(cid)
-        kb.button(text=f"👥 {title}", callback_data=f"bscorechat:{cid}")
-    if page>0:
+        kb.button(text=f"👥 {title}", callback_data=f"bchat:{cid}:0")
+    if page > 0:
         kb.button(text="⬅️ السابق", callback_data=f"pgbch:{page-1}")
-    if page<pages-1:
+    if page < pages-1:
         kb.button(text="التالي ➡️", callback_data=f"pgbch:{page+1}")
     kb.adjust(1)
     return kb.as_markup(), total, pages, page
 
-# دخول لوحة نتائج البريف
-@dp.message(F.text==BTN_BRIEF_SCORES)
+
+def brief_windows_kb(chat_id: int):
+    """قائمة أحدث نوافذ البريف ضمن مجموعة معيّنة."""
+    rows = q_all("""
+        SELECT id, opened_at, closes_at, is_open
+        FROM brief_windows
+        WHERE origin_chat_id=%s
+        ORDER BY id DESC
+        LIMIT 20
+    """, (chat_id,))
+    kb = InlineKeyboardBuilder()
+    for r in rows:
+        opened = str(r["opened_at"]).replace("T", " ").split(".")[0].replace("+00:00", "")
+        status = "🟢 مفتوحة" if int(r["is_open"]) == 1 else "⛔ مغلقة"
+        kb.button(text=f"🕒 {opened} — {status}", callback_data=f"bwin:{r['id']}")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+# ===== نقطة الدخول من الزر =====
+@dp.message(F.text == BTN_BRIEF_RESULTS)
 async def brief_scores_entry(msg: Message, state: FSMContext):
-    if not await ensure_owner(msg): return
+    if not await ensure_owner(msg):
+        return
     await state.clear()
     await state.set_state(BriefScoreStates.pick_chat)
     kb, total, pages, page = brief_chats_page(0)
     if total == 0:
-        return await msg.answer("لا توجد مجموعات فيها نوافذ بريف بعد.", reply_markup=owner_kb())
-    await msg.answer(_qs_page_text_header("🏅", "نتائج البريف — اختر المجموعة", total, page, pages), reply_markup=kb)
+        return await msg.answer("لا توجد أي نوافذ بريف سابقة في المجموعات.", reply_markup=owner_kb())
+    await msg.answer(_qs_page_text_header("📊", "نتائج البريف — اختر المجموعة", total, page, pages), reply_markup=kb)
 
-# تنقّل صفحات المجموعات
+
+# ===== تنقّل صفحات المجموعات =====
 @dp.callback_query(BriefScoreStates.pick_chat, F.data.startswith("pgbch:"))
-async def brief_chats_nav(cb: CallbackQuery, state: FSMContext):
+async def brief_scores_nav(cb: CallbackQuery, state: FSMContext):
     page = int(cb.data.split(":")[1])
     kb, total, pages, page = brief_chats_page(page)
-    txt = _qs_page_text_header("🏅", "نتائج البريف — اختر المجموعة", total, page, pages)
     try:
-        await cb.message.edit_text(txt, reply_markup=kb)
+        await cb.message.edit_text(_qs_page_text_header("📊", "نتائج البريف — اختر المجموعة", total, page, pages), reply_markup=kb)
     except Exception:
-        await cb.message.answer(txt, reply_markup=kb)
+        await cb.message.answer(_qs_page_text_header("📊", "نتائج البريف — اختر المجموعة", total, page, pages), reply_markup=kb)
     await cb.answer()
 
-# اختيار مجموعة ثم عرض آخر نافذة بريف ونتائجها
-@dp.callback_query(BriefScoreStates.pick_chat, F.data.startswith("bscorechat:"))
-async def brief_show_scores_for_chat(cb: CallbackQuery, state: FSMContext):
-    chat_id = int(cb.data.split(":")[1])
 
-    # خزّن/حدّث اسم المجموعة بالكاش (غير حرج لو فشل)
+# ===== اختيار المجموعة ثم إظهار نوافذها =====
+@dp.callback_query(BriefScoreStates.pick_chat, F.data.startswith("bchat:"))
+async def brief_chat_pick(cb: CallbackQuery, state: FSMContext):
+    _, chat_id, _ = cb.data.split(":")
+    chat_id = int(chat_id)
     try:
         await cache_chat_title(chat_id)
     except Exception:
         pass
+    await state.update_data(brief_chat_id=chat_id)
+    title = chat_title_cached(chat_id)
+    await state.set_state(BriefScoreStates.pick_window)
+    await cb.message.answer(f"نتائج البريف — اختر النافذة في «{html.escape(title)}»:", reply_markup=brief_windows_kb(chat_id))
+    await cb.answer()
+
+
+# ===== عرض نتائج نافذة معيّنة =====
+@dp.callback_query(BriefScoreStates.pick_window, F.data.startswith("bwin:"))
+async def brief_window_pick(cb: CallbackQuery, state: FSMContext):
+    win_id = int(cb.data.split(":")[1])
+    data = await state.get_data()
+    chat_id = int(data.get("brief_chat_id"))
     title = chat_title_cached(chat_id)
 
-    # آخر نافذة بريف بهالمجموعة
-    win = q_one("""
-        SELECT id, prompt_text, opened_at, closes_at, is_open
-        FROM brief_windows
-        WHERE origin_chat_id=%s
-        ORDER BY id DESC
-        LIMIT 1
-    """, (chat_id,))
-    if not win:
-        await cb.message.answer(f"«{html.escape(title)}» — لا يوجد أي نافذة بريف بعد.", reply_markup=owner_kb())
-        await state.clear(); return await cb.answer()
+    w = q_one("SELECT prompt_text, opened_at, closes_at, is_open FROM brief_windows WHERE id=%s", (win_id,))
+    if not w:
+        await cb.message.answer("⚠️ النافذة غير موجودة.", reply_markup=owner_kb())
+        await state.clear()
+        return await cb.answer()
 
-    # تجميع النتائج: اسم مستخدم (username إن وُجد) + أفضل/أعلى سكور لنفس الشخص
+    # نحسب النتائج بحسب username المخزَّن (بدون أي IDs)
     rows = q_all("""
-        SELECT user_id,
-               COALESCE(NULLIF(username,''),'مجهول') AS uname,
-               MAX(score)::int AS best_score,
+        SELECT COALESCE(NULLIF(username,''),'مجهول') AS uname,
+               MAX(score)::int AS score,
                MAX(level) AS level
         FROM writing_submissions
-        WHERE origin_chat_id=%s AND window_id=%s
-        GROUP BY user_id, uname
-        ORDER BY best_score DESC, uname ASC
+        WHERE window_id=%s
+        GROUP BY uname
+        ORDER BY score DESC, uname ASC
         LIMIT 200
-    """, (chat_id, win["id"]))
+    """, (win_id,))
 
-    lines=[]
-    for i,r in enumerate(rows,1):
-        lines.append(f"{i:>2}. {html.escape(r['uname'])} — <b>{int(r['best_score'])}/20</b> — {html.escape(r['level'] or '-')}")
-    prompt = (win.get("prompt_text") or "").strip()
-    head = (
-        f"🏅 <b>نتائج البريف — {html.escape(title)}</b>\n"
-        f"🪧 السؤال: {html.escape(prompt)}\n"
-        f"🪫 الحالة: {'مفتوحة' if int(win.get('is_open',0))==1 else 'مغلقة'}\n"
-        f"👥 المشاركون: <b>{len(rows)}</b>\n\n"
+    opened = (w["opened_at"] or "").replace("T", " ").split(".")[0].replace("+00:00", "")
+    closes = (w["closes_at"] or "").replace("T", " ").split(".")[0].replace("+00:00", "")
+    status = "🟢 مفتوحة" if int(w["is_open"]) == 1 else "⛔ مغلقة"
+
+    lines = []
+    for i, r in enumerate(rows, 1):
+        lines.append(f"{i:>2}. {html.escape(r['uname'])} — <b>{int(r['score'])}/20</b> — {html.escape(r.get('level') or '-')}")
+    header = (
+        f"📊 <b>نتائج البريف — {html.escape(title)}</b>\n"
+        f"🪪 Window ID: <code>{win_id}</code>\n"
+        f"🕒 فتح: <code>{opened}</code>\n"
+        f"⏳ إغلاق: <code>{closes}</code>\n"
+        f"📌 الحالة: {status}\n"
+        f"📣 السؤال:\n<code>{html.escape(w.get('prompt_text') or '')}</code>\n\n"
+        f"<b>النتائج:</b>\n"
     )
-    await cb.message.answer(head + ("\n".join(lines) if lines else "لا توجد مشاركات."), reply_markup=owner_kb())
+
+    await send_long(cb.message.chat.id, header + ("\n".join(lines) if lines else "لا يوجد مشاركات."))
     await state.clear()
     await cb.answer()
+
 
 # ================== تصدير/استيراد ==================
 @dp.message(F.text==BTN_EXPORT)
