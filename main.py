@@ -319,6 +319,15 @@ def chat_title_cached(chat_id:int)->str:
 async def admin_cb_guard(cb: CallbackQuery):
     await cb.answer("🚫 هذا الزر خاص بالكنغ.", show_alert=True)
 
+def display_name_from_user(u) -> str:
+    # يفضّل first+last، وإذا فاضي جرّب full_name، وإذا فاضي رجّع "مجهول"
+    first = getattr(u, "first_name", None) or ""
+    last  = getattr(u, "last_name",  None) or ""
+    name = (first + " " + last).strip()
+    if not name:
+        name = (getattr(u, "full_name", None) or "").strip()
+    return name or "مجهول"
+
 # ---------- States ----------
 class BuildStates(StatesGroup):
     waiting_title=State()
@@ -1207,24 +1216,10 @@ async def collect_briefs(msg: Message, u):
     display_name = hname(msg.from_user)
 
     # تخزين المشاركة — نخزّن display name في عمود username
-    q_exec("""
-        INSERT INTO writing_submissions(
-            origin_chat_id, quiz_id, user_id, username, text,
-            score, level, evaluated_at, details_json, window_id
-        )
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-    """, (
-        msg.chat.id,
-        0,
-        msg.from_user.id,
-        display_name,  # ← الاسم العَرْضي بدل اليوزرنيم
-        text,
-        score,
-        lvl,
-        _now().isoformat(),
-        json.dumps(details, ensure_ascii=False),
-        row["id"]
-    ))
+   q_exec("""INSERT INTO writing_submissions(origin_chat_id,quiz_id,user_id,username,text,score,level,evaluated_at,details_json,window_id)
+          VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+       (msg.chat.id,0,msg.from_user.id,display_name_from_user(msg.from_user),text,score,lvl,_now().isoformat(),json.dumps(details,ensure_ascii=False),row["id"]))
+
 
 
 @dp.callback_query(F.data == "briefstop")
@@ -1472,16 +1467,9 @@ async def on_poll_answer(pa: PollAnswer):
     display_name = hname(u)
 
     # خزن الإجابة مع الاسم العَرْضي في عمود username
-    q_exec("""
-        INSERT INTO quiz_responses(
-            chat_id, quiz_id, question_id, user_id, username,
-            option_index, is_correct, answered_at, run_id
-        )
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-    """, (
-        chat_id, quiz_id, qid, u.id, display_name,
-        chosen, is_ok, _now().isoformat(), run_id
-    ))
+   q_exec("""INSERT INTO quiz_responses(chat_id,quiz_id,question_id,user_id,username,option_index,is_correct,answered_at,run_id)
+          VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+       (chat_id,quiz_id,qid,u.id, display_name_from_user(u), chosen, is_ok, _now().isoformat(), run_id))
 
     # ردة فعل على الرسالة الأصلية (اختياري)
     try:
@@ -2153,6 +2141,41 @@ async def merge_apply(cb:CallbackQuery, state:FSMContext):
     await state.clear()
     await cb.message.answer(f"🔗 تم الدمج: نُسخ {copied} سؤالًا من {src} إلى {dest}.", reply_markup=owner_kb())
     await cb.answer()
+
+from aiogram.filters import Command
+
+@dp.message(Command("fix_names"))
+async def fix_names(msg: Message):
+    if not await ensure_owner(msg):
+        return
+    chat_id = msg.chat.id
+    await msg.answer("⏳ جاري تحديث الأسماء المعروضة للمشاركين في هذه الدردشة…")
+
+    # كل المشاركين اللي إلن سجلات بهالمجموعة (كويز + بريف)
+    rows = q_all("""
+        SELECT DISTINCT user_id FROM quiz_responses WHERE chat_id=%s
+        UNION
+        SELECT DISTINCT user_id FROM writing_submissions WHERE origin_chat_id=%s
+    """, (chat_id, chat_id))
+
+    updated = 0
+    for r in rows:
+        uid = int(r["user_id"])
+        try:
+            member = await bot.get_chat_member(chat_id, uid)
+            disp = display_name_from_user(member.user)
+            # حدّث الاسم بكل السجلات بهالدردشة
+            q_exec("UPDATE quiz_responses SET username=%s WHERE chat_id=%s AND user_id=%s",
+                   (disp, chat_id, uid))
+            q_exec("UPDATE writing_submissions SET username=%s WHERE origin_chat_id=%s AND user_id=%s",
+                   (disp, chat_id, uid))
+            updated += 1
+            await asyncio.sleep(0.05)  # تهدئة بسيطة
+        except Exception:
+            # ممكن ما يكون بالمجموعة حالياً أو ما نقدر نجيبه — نتجاوز
+            continue
+
+    await msg.answer(f"✅ تم تحديث أسماء {updated} مشارك/ـة في هذه الدردشة.")
 
 # ---------- Runner ----------
 async def main():
