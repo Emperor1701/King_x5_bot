@@ -1190,7 +1190,7 @@ async def collect_briefs(msg: Message, u):
     if getattr(u, "is_bot", False):
         return
 
-    # هل هناك نافذة بريف مفتوحة في هذا الشات؟
+    # نافذة بريف مفتوحة؟
     row = q_one(
         "SELECT id, closes_at FROM brief_windows "
         "WHERE origin_chat_id=%s AND is_open=1 "
@@ -1200,25 +1200,34 @@ async def collect_briefs(msg: Message, u):
     if not row:
         return
 
-    # أغلق إن كانت منتهية
+    # إنتهت النافذة؟ أغلقها وتوقف
     if row["closes_at"] <= _now().isoformat():
         q_exec("UPDATE brief_windows SET is_open=0 WHERE id=%s", (row["id"],))
         return
 
-    # النص
+    # قيّم النص واحفظه بالاسم المعروض وليس اليوزرنيم
     text = msg.text.strip()
-
-    # تقييم مبسّط
     score, details = free_b1_grade(text)
     lvl = brief_level(score)
 
-    # 🔹 الاسم العَرْضي (display name) للطالب
-    display_name = hname(msg.from_user)
+    q_exec(
+        """INSERT INTO writing_submissions
+           (origin_chat_id, quiz_id, user_id, username, text, score, level, evaluated_at, details_json, window_id)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+        (
+            msg.chat.id,
+            0,
+            msg.from_user.id,
+            display_name_from_user(msg.from_user),  # <-- الاسم المعروض
+            text,
+            score,
+            lvl,
+            _now().isoformat(),
+            json.dumps(details, ensure_ascii=False),
+            row["id"],
+        ),
+    )
 
-    # تخزين المشاركة — نخزّن display name في عمود username
-   q_exec("""INSERT INTO writing_submissions(origin_chat_id,quiz_id,user_id,username,text,score,level,evaluated_at,details_json,window_id)
-          VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-       (msg.chat.id,0,msg.from_user.id,display_name_from_user(msg.from_user),text,score,lvl,_now().isoformat(),json.dumps(details,ensure_ascii=False),row["id"]))
 
 
 
