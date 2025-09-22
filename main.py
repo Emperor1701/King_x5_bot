@@ -161,6 +161,7 @@ def migrate_schema():
     q_exec("ALTER TABLE writing_submissions ADD COLUMN IF NOT EXISTS username TEXT")
     q_exec("ALTER TABLE writing_submissions ADD COLUMN IF NOT EXISTS window_id INTEGER")
     q_exec("ALTER TABLE quiz_runs ADD COLUMN IF NOT EXISTS grade_enabled INTEGER NOT NULL DEFAULT 0")
+    q_exec("ALTER TABLE quiz_runs ADD COLUMN IF NOT EXISTS results_announced INTEGER NOT NULL DEFAULT 0")
 
 ensure_schema()
 migrate_schema()
@@ -1413,24 +1414,100 @@ async def _publish_quiz_now(cb_or_dummy, quiz_id:int, hours:int, grade_enabled:b
     )
 
 # ---------- إغلاق تلقائي للاستطلاعات المنتهية ----------
+
+# ← الصق هنا:
+async def announce_run_results(run_id: int):
+    run = q_one("SELECT chat_id, quiz_id, grade_enabled, published_at FROM quiz_runs WHERE id=%s", (run_id,))
+    if not run:
+        return
+    chat_id = int(run["chat_id"])
+    quiz_id = int(run["quiz_id"])
+    grade_enabled = int(run["grade_enabled"])
+    pub_txt = (run.get("published_at") or "").replace("T"," ").split(".")[0].replace("+00:00","")
+
+    total_q = q_one("SELECT COUNT(*) AS c FROM sent_polls WHERE run_id=%s",(run_id,))["c"]
+    if int(total_q) == 0:
+        q_exec("UPDATE quiz_runs SET results_announced=1 WHERE id=%s",(run_id,))
+        return
+
+    rows = q_all(
+        """SELECT user_id,
+                  COALESCE(NULLIF(username,''),'مجهول') AS uname,
+                  SUM(is_correct)::int AS correct
+           FROM quiz_responses
+           WHERE run_id=%s
+           GROUP BY user_id, uname
+           ORDER BY correct DESC, user_id ASC
+           LIMIT 1000""",
+        (run_id,)
+    )
+
+    title = chat_title_cached(chat_id)
+    header = (
+        f"🏁 <b>لوحة نتائج الجلسة — {html.escape(title)}</b>\n"
+        f"🧪 Quiz ID: <code>{quiz_id}</code>\n"
+        f"🕒 نشر: <code>{pub_txt}</code>\n"
+        f"🔢 عدد الأسئلة: <b>{int(total_q)}</b>\n"
+        f"🧮 التقييم: {'مُفعّل ✅' if grade_enabled==1 else 'غير مُفعّل ❌'}\n\n"
+    )
+
+    lines = []
+    for i, r in enumerate(rows, 1):
+        base = f"{i:>2}. {html.escape(r['uname'])} — {int(r['correct'])}/{int(total_q)}"
+        if grade_enabled == 1:
+            lvl = quiz_level_from_score(int(r['correct']), int(total_q))
+            base += f" — {lvl}"
+        lines.append(base)
+
+    text = header + ("\n".join(lines) if lines else "لا يوجد مشاركات.")
+    await send_long(chat_id, text)
+
+    q_exec("UPDATE quiz_runs SET results_announced=1 WHERE id=%s",(run_id,))
+
 async def close_expired_polls_loop():
     while True:
         try:
-            rows = q_all("""
+            # 1) إغلاق الاستطلاعات المنتهية
+            rows = q_all(
+                """
                 SELECT chat_id, message_id, id
                 FROM sent_polls
-                WHERE is_closed=0 AND expires_at IS NOT NULL AND expires_at <= %s
+                WHERE is_closed=0
+                  AND expires_at IS NOT NULL
+                  AND expires_at <= %s
                 ORDER BY id ASC
-                LIMIT 20
-            """, (_now().isoformat(),))
+                LIMIT 50
+                """,
+                (_now().isoformat(),)
+            )
             for r in rows:
                 try:
                     await bot.stop_poll(chat_id=r["chat_id"], message_id=r["message_id"])
                 except Exception:
                     pass
-                q_exec("UPDATE sent_polls SET is_closed=1 WHERE id=%s",(r["id"],))
+                q_exec("UPDATE sent_polls SET is_closed=1 WHERE id=%s", (r["id"],))
+
+            # 2) أي جلسة كل أسئلتها مغلقة ولم تُعلن نتائجها بعد؟
+            runs_ready = q_all(
+                """
+                SELECT r.id
+                FROM quiz_runs r
+                WHERE r.results_announced=0
+                  AND EXISTS (SELECT 1 FROM sent_polls sp WHERE sp.run_id=r.id) -- فيها أسئلة
+                  AND NOT EXISTS (SELECT 1 FROM sent_polls sp WHERE sp.run_id=r.id AND sp.is_closed=0)
+                ORDER BY r.id ASC
+                LIMIT 20
+                """
+            )
+            for rr in runs_ready:
+                try:
+                    await announce_run_results(int(rr["id"]))
+                except Exception:
+                    pass
+
         except Exception:
             pass
+
         await asyncio.sleep(30)
 
 # ---------- تفاعل مع Poll + إعلان نتيجة الطالب عند إكمال كل الأسئلة ----------
@@ -1472,7 +1549,7 @@ async def on_poll_answer(pa: PollAnswer):
     )
     is_ok = int(opt["is_correct"]) if opt else 0
 
-    # <-- لاحظ التبويب ثابت والسطر متعدد الأسطر داخل أقواس الاستدعاء
+    # نسجّل الإجابة باسم الطالب المعروض (وليس اليوزر)
     q_exec(
         """INSERT INTO quiz_responses
            (chat_id,quiz_id,question_id,user_id,username,option_index,is_correct,answered_at,run_id)
@@ -1482,7 +1559,7 @@ async def on_poll_answer(pa: PollAnswer):
             quiz_id,
             qid,
             u.id,
-            display_name_from_user(u),  # الاسم المعروض بدلاً من اليوزرنيم
+            display_name_from_user(u),
             chosen,
             is_ok,
             _now().isoformat(),
@@ -1490,7 +1567,7 @@ async def on_poll_answer(pa: PollAnswer):
         ),
     )
 
-    # تفاعل إيموجي على الرسالة
+    # ردة فعل إيموجي على الرسالة فقط
     try:
         emoji = "🎉" if is_ok else "❌"
         await bot.set_message_reaction(
@@ -1499,34 +1576,6 @@ async def on_poll_answer(pa: PollAnswer):
             reaction=[ReactionTypeEmoji(emoji=emoji)],
             is_big=True,
         )
-    except Exception:
-        pass
-
-    # عند إكمال كل أسئلة الجلسة: أعلن النتيجة + المستوى إذا مفعّل
-    try:
-        total_polls = q_one(
-            "SELECT COUNT(*) AS c FROM sent_polls WHERE run_id=%s",
-            (run_id,)
-        )["c"]
-        answered = q_one(
-            "SELECT COUNT(DISTINCT question_id) AS c FROM quiz_responses WHERE run_id=%s AND user_id=%s",
-            (run_id, u.id)
-        )["c"]
-
-        if answered == total_polls and total_polls > 0:
-            correct = q_one(
-                "SELECT COALESCE(SUM(is_correct),0) AS s FROM quiz_responses WHERE run_id=%s AND user_id=%s",
-                (run_id, u.id)
-            )["s"]
-            run = q_one("SELECT grade_enabled FROM quiz_runs WHERE id=%s", (run_id,))
-            msg = (
-                f"📊 نتيجة {mention_html(u.id, display_name_from_user(u))}: "
-                f"<b>{int(correct)}/{int(total_polls)}</b>"
-            )
-            if run and int(run["grade_enabled"]) == 1:
-                lvl = quiz_level_from_score(int(correct), int(total_polls))
-                msg += f"\n🎯 المستوى: <b>{lvl}</b>"
-            await bot.send_message(chat_id, msg, parse_mode=ParseMode.HTML)
     except Exception:
         pass
 
