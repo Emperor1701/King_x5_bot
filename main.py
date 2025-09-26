@@ -1528,13 +1528,27 @@ async def close_expired_polls_loop():
         await asyncio.sleep(30)
 
 # ---------- تفاعل مع Poll + إعلان نتيجة الطالب عند إكمال كل الأسئلة ----------
-def quiz_level_from_score(correct:int, total:int) -> str:
-    # تحويل العلامة إلى مقياس من 45 ثم تصنيف
-    if total <= 0: return "-"
-    scaled = int(round((correct / total) * 45))
-    if scaled <= 19: return "Unter A2"
-    if scaled <= 32: return "A2"
+def quiz_level_from_score(correct: int, total: int) -> str:
+    """
+    تصنيف المستوى وفق سكور ثابت على مجال 45 سؤال،
+    بغضّ النظر عن عدد أسئلة الجلسة الفعلي.
+    Unter A2: <= 19
+    A2      : 20..32
+    B1      : 33..45
+    """
+    MAX_QUESTIONS = 45
+    c = int(correct)
+    if c < 0:
+        c = 0
+    elif c > MAX_QUESTIONS:
+        c = MAX_QUESTIONS
+
+    if c <= 19:
+        return "Unter A2"
+    if c <= 32:
+        return "A2"
     return "B1"
+
 
 @dp.poll_answer()
 async def on_poll_answer(pa: PollAnswer):
