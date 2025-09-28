@@ -1372,12 +1372,22 @@ async def publish_eval_choice(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     await cb.answer()
 
-async def _publish_quiz_now(cb_or_dummy, quiz_id:int, hours:int, grade_enabled:bool):
+async def _publish_quiz_now(cb_or_dummy, quiz_id: int, hours: int, grade_enabled: bool):
     chat_id = cb_or_dummy.message.chat.id
     expiry_iso = None
     if hours and hours > 0:
         expiry = _now() + timedelta(hours=hours)
         expiry_iso = expiry.isoformat()
+
+    # نوع الشات لتخفيض السرعة بالمجموعات
+    try:
+        ch = await bot.get_chat(chat_id)
+        ctype = getattr(ch, "type", "") or ""
+    except Exception:
+        ctype = ""
+    is_group = ctype in ("group", "supergroup")
+    # مهلة أبطأ بالمجموعات لتجنّب 429
+    delay_between_polls = 2.4 if is_group else 1.1
 
     # أنشئ جلسة نشر (run)
     run_id = insert_returning_id(
@@ -1385,47 +1395,86 @@ async def _publish_quiz_now(cb_or_dummy, quiz_id:int, hours:int, grade_enabled:b
         (chat_id, quiz_id, _now().isoformat(), 1 if grade_enabled else 0)
     )
 
-    questions = q_all("SELECT id, text FROM questions WHERE quiz_id=%s ORDER BY id",(quiz_id,))
+    questions = q_all("SELECT id, text FROM questions WHERE quiz_id=%s ORDER BY id", (quiz_id,))
     sent = 0
+
     for q in questions:
+        # أرسل المرفقات (قد ترفع الحمل، بس منخليها)
         try:
             await send_question_attachments(chat_id, q["id"])
         except Exception:
-            try: await cb_or_dummy.message.answer(f"⚠️ تعذّر إرسال مرفقات للسؤال {q['id']}.")
-            except Exception: pass
+            try:
+                await cb_or_dummy.message.answer(f"⚠️ تعذّر إرسال مرفقات للسؤال {q['id']}.")
+            except Exception:
+                pass
 
-        opts = q_all("SELECT option_index,text,is_correct FROM options WHERE question_id=%s ORDER BY option_index",(q["id"],))
-        if len(opts) < 2: continue
-        correct = next((o for o in opts if int(o.get("is_correct",0))==1), None) or opts[0]
-        selected = list(opts[:10]) if len(opts) <= 10 else [correct] + [o for o in opts if int(o.get("is_correct",0))!=1][:9]
-        question_text = str(q["text"])[:295]
+        opts = q_all(
+            "SELECT option_index,text,is_correct FROM options WHERE question_id=%s ORDER BY option_index",
+            (q["id"],)
+        )
+        if len(opts) < 2:
+            continue
+
+        # تأكد دومًا إن الصحيح ضمن الخيارات المرسلة (حد 10)
+        correct = next((o for o in opts if int(o.get("is_correct", 0)) == 1), None) or opts[0]
+        selected = list(opts[:10]) if len(opts) <= 10 else [correct] + [o for o in opts if int(o.get("is_correct", 0)) != 1][:9]
+
+        question_text = str(q["text"])[:295]  # حد تيليجرام 300
         options_text = [str(o["text"])[:100] for o in selected]
         correct_index = selected.index(correct)
 
-        try:
-            m = await bot.send_poll(
-                chat_id=chat_id, question=question_text, options=options_text,
-                type=PollType.QUIZ, correct_option_id=correct_index, is_anonymous=False,
-            )
-            q_exec(
-                "INSERT INTO sent_polls (chat_id,quiz_id,question_id,poll_id,message_id,expires_at,is_closed,run_id) VALUES (%s,%s,%s,%s,%s,%s,0,%s)",
-                (chat_id, quiz_id, q["id"], m.poll.id, m.message_id, expiry_iso, run_id)
-            )
-            sent += 1
-            try: await sleep_jitter("poll")
-            except Exception: await asyncio.sleep(0.8)
-        except Exception as e:
-            try: await cb_or_dummy.message.answer(f"⚠️ تعذّر نشر سؤال ID {q['id']}: {e}")
-            except Exception: pass
+        # إرسال باستراتيجية إعادة محاولات ذكية
+        max_attempts = 4
+        attempt = 0
+        while attempt < max_attempts:
+            attempt += 1
             try:
+                m = await bot.send_poll(
+                    chat_id=chat_id,
+                    question=question_text,
+                    options=options_text,
+                    type=PollType.QUIZ,
+                    correct_option_id=correct_index,
+                    is_anonymous=False,
+                )
+                q_exec(
+                    "INSERT INTO sent_polls (chat_id,quiz_id,question_id,poll_id,message_id,expires_at,is_closed,run_id) VALUES (%s,%s,%s,%s,%s,%s,0,%s)",
+                    (chat_id, quiz_id, q["id"], m.poll.id, m.message_id, expiry_iso, run_id)
+                )
+                sent += 1
+
+                # مهلة بين الاستطلاعات (أكبر بالمجموعات)
+                try:
+                    await asyncio.sleep(delay_between_polls)
+                except Exception:
+                    pass
+                break  # خرجنا لأن الإرسال نجح
+
+            except Exception as e:
+                # استخرج retry_after إن وجد، وإلا backoff تصاعدي
                 ra = getattr(e, "retry_after", None) or getattr(e, "timeout", None)
-                await asyncio.sleep(float(ra)+1 if ra else 2.0)
-            except Exception: pass
-            continue
+                wait_s = float(ra) + 0.5 if ra else min(2.0 * attempt, 8.0)
+
+                if attempt >= max_attempts:
+                    # بعد آخر محاولة، بلّغ واستمرّ للسؤال اللي بعده
+                    try:
+                        await cb_or_dummy.message.answer(
+                            f"⚠️ تعذّر نشر سؤال ID {q['id']} بعد {attempt} محاولات: {e}"
+                        )
+                    except Exception:
+                        pass
+                    break  # ننتقل للسؤال التالي
+                else:
+                    # نام ثم جرّب مرة ثانية
+                    try:
+                        await asyncio.sleep(wait_s)
+                    except Exception:
+                        pass
+                    continue  # أعد المحاولة
 
     await cb_or_dummy.message.answer(
         f"🚀 تم نشر {sent} سؤالًا من الاختبار {quiz_id}"
-        + (f" — المؤقّت: {hours} ساعة" if hours and hours>0 else " — بدون مؤقّت")
+        + (f" — المؤقّت: {hours} ساعة" if hours and hours > 0 else " — بدون مؤقّت")
         + (", التقييم مُفعّل ✅" if grade_enabled else ", بدون تقييم ❌"),
         reply_markup=owner_kb()
     )
