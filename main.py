@@ -1299,20 +1299,82 @@ async def brief_stop(cb: CallbackQuery):
 
 
 # ---------- إرسال مرفقات السؤال ----------
-async def send_question_attachments(chat_id:int, question_id:int):
-    atts = q_all("SELECT kind,file_id FROM question_attachments WHERE question_id=%s ORDER BY position",(question_id,))
+async def send_question_attachments(chat_id: int, question_id: int):
+    """
+    إرسال مرفقات السؤال مع إعادة محاولات وحدود سرعة أبطأ بالمجموعات لتفادي 429.
+    الأنواع المدعومة: photo / voice / audio.
+    """
+    import os, random, asyncio
+
+    # استرجاع إعدادات الانتظار الموجودة عندك
+    base = float(os.getenv('ATTACH_BASE_DELAY', '1.2'))
+    jitter = float(os.getenv('ATTACH_JITTER', '0.8'))
+
+    # عامل إبطاء إضافي بالمجموعات (قابل للتعديل من .env)
+    group_factor = float(os.getenv('ATTACH_GROUP_FACTOR', '1.6'))
+
+    # تمييز نوع الشات (خاص vs مجموعة) لتعديل المهلة
+    try:
+        ch = await bot.get_chat(chat_id)
+        ctype = getattr(ch, "type", "") or ""
+    except Exception:
+        ctype = ""
+    is_group = ctype in ("group", "supergroup")
+
+    def next_delay():
+        d = base + random.random() * jitter
+        return d * (group_factor if is_group else 1.0)
+
+    atts = q_all(
+        "SELECT kind, file_id FROM question_attachments WHERE question_id=%s ORDER BY position",
+        (question_id,)
+    )
+
     for a in atts:
-        kind=a["kind"]; fid=a["file_id"]
-        try:
-            if kind=="photo": await bot.send_photo(chat_id, fid)
-            elif kind=="voice": await bot.send_voice(chat_id, fid)
-            elif kind=="audio": await bot.send_audio(chat_id, fid)
-            try: await sleep_jitter('attach')
-            except Exception: await asyncio.sleep(0.8)
-        except Exception as e:
-            ra = getattr(e,'retry_after',None) or getattr(e,'timeout',None)
-            try: await asyncio.sleep(float(ra)+1 if ra else 2.0)
-            except Exception: pass
+        kind = a["kind"]
+        fid = a["file_id"]
+
+        max_attempts = 4
+        attempt = 0
+        while attempt < max_attempts:
+            attempt += 1
+            try:
+                if kind == "photo":
+                    await bot.send_photo(chat_id, fid)
+                elif kind == "voice":
+                    await bot.send_voice(chat_id, fid)
+                elif kind == "audio":
+                    await bot.send_audio(chat_id, fid)
+                # نجح الإرسال — مهلة قصيرة قبل التالي
+                try:
+                    await asyncio.sleep(next_delay())
+                except Exception:
+                    pass
+                break  # انتقل للمرفق التالي
+
+            except Exception as e:
+                # إذا تيليجرام عطى retry_after / timeout، استعمله
+                ra = getattr(e, "retry_after", None) or getattr(e, "timeout", None)
+                wait_s = float(ra) + 0.5 if ra else min(2.0 * attempt, 10.0)
+
+                if attempt >= max_attempts:
+                    # بعد آخر محاولة — نبلّغ ونكمل
+                    try:
+                        await bot.send_message(
+                            chat_id,
+                            f"⚠️ تعذّر إرسال مرفق ({kind}) لسؤال ID {question_id} بعد {attempt} محاولات."
+                        )
+                    except Exception:
+                        pass
+                    break  # انتقل للمرفق التالي
+                else:
+                    # نام ثم أعد المحاولة
+                    try:
+                        await asyncio.sleep(wait_s)
+                    except Exception:
+                        pass
+                    continue
+
 
 # ---------- نشر الاختبار + اختيار تفعيل التقييم ----------
 @dp.message(F.text==BTN_PUBLISH)
