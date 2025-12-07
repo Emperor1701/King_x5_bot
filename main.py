@@ -253,7 +253,7 @@ def shared_list_kb(question_id:int):
 
 def publish_hours_kb(quiz_id:int):
     kb=InlineKeyboardBuilder()
-    for h in (1,2,4,8,24):
+    for h in (1,2,4,24,48):
         kb.button(text=f"⏳ {h} ساعة", callback_data=f"pubdur:{quiz_id}:{h}")
     kb.button(text="⌨️ رقم مخصص", callback_data=f"pubdur:{quiz_id}:custom")
     kb.button(text="♾️ بدون مؤقّت", callback_data=f"pubdur:{quiz_id}:0")
