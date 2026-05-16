@@ -253,14 +253,21 @@ def shared_list_kb(question_id:int):
 
 def publish_hours_kb(quiz_id:int):
     kb=InlineKeyboardBuilder()
-    for h in (1.5,2,4,24,48):
-        kb.button(text=f"⏳ {h} ساعة", callback_data=f"pubdur:{quiz_id}:{h}")
+    choices = [
+        (1.5, "ساعة ونص"),
+        (2, "2 ساعة"),
+        (4, "4 ساعات"),
+        (24, "24 ساعة"),
+        (48, "48 ساعة"),
+    ]
+    for value, label in choices:
+        kb.button(text=f"⏳ {label}", callback_data=f"pubdur:{quiz_id}:{value}")
     kb.button(text="⌨️ رقم مخصص", callback_data=f"pubdur:{quiz_id}:custom")
     kb.button(text="♾️ بدون مؤقّت", callback_data=f"pubdur:{quiz_id}:0")
     kb.adjust(2,2,1)
     return kb.as_markup()
 
-def publish_eval_kb(quiz_id:int, hours:int):
+def publish_eval_kb(quiz_id:int, hours:float):
     kb=InlineKeyboardBuilder()
     kb.button(text="✅ فعّل التقييم", callback_data=f"pubeval:{quiz_id}:{hours}:1")
     kb.button(text="❌ بدون تقييم", callback_data=f"pubeval:{quiz_id}:{hours}:0")
@@ -1410,7 +1417,7 @@ async def publish_with_hours_decide(cb:CallbackQuery, state:FSMContext):
         await state.update_data(pub_quiz_id=quiz_id)
         await cb.message.answer("اكتب عدد الساعات (مثال: 2 أو ٢).")
         return await cb.answer()
-    hours = int(token)
+    hours = float(token)
     await state.update_data(pub_hours=hours, pub_quiz_id=quiz_id)
     await cb.message.answer("هل تريد تفعيل تقييم الطالب حسب علامته؟", reply_markup=publish_eval_kb(quiz_id, hours))
     await cb.answer()
@@ -1418,10 +1425,13 @@ async def publish_with_hours_decide(cb:CallbackQuery, state:FSMContext):
 @dp.message(PublishStates.waiting_hours_custom, F.text)
 async def publish_hours_custom(msg:Message, state:FSMContext):
     raw = normalize_arabic_digits(msg.text)
-    m = re.search(r"(\d{1,3})", raw)
-    if not m:
-        return await msg.reply("اكتب رقم الساعات فقط (1..240).")
-    hours = int(m.group(1)); hours = max(1, min(240, hours))
+    raw = normalize_arabic_digits(msg.text).replace(",", ".")
+m = re.search(r"(\d{1,3}(?:\.\d+)?)", raw)
+if not m:
+    return await msg.reply("اكتب عدد الساعات فقط، مثال: 1.5 أو 2.")
+
+hours = float(m.group(1))
+hours = max(0.1, min(240, hours))
     quiz_id = int((await state.get_data()).get("pub_quiz_id"))
     await state.update_data(pub_hours=hours, pub_quiz_id=quiz_id)
     await msg.answer("هل تريد تفعيل تقييم الطالب حسب علامته؟", reply_markup=publish_eval_kb(quiz_id, hours))
@@ -1429,12 +1439,12 @@ async def publish_hours_custom(msg:Message, state:FSMContext):
 @dp.callback_query(F.data.startswith("pubeval:"))
 async def publish_eval_choice(cb: CallbackQuery, state: FSMContext):
     _, quiz_id, hours, flag = cb.data.split(":")
-    quiz_id = int(quiz_id); hours = int(hours); grade_enabled = int(flag)==1
+    quiz_id = int(quiz_id); hours = float(hours); grade_enabled = int(flag)==1
     await _publish_quiz_now(cb, quiz_id, hours, grade_enabled)
     await state.clear()
     await cb.answer()
 
-async def _publish_quiz_now(cb_or_dummy, quiz_id: int, hours: int, grade_enabled: bool):
+async def _publish_quiz_now(cb_or_dummy, quiz_id: int, hours: float, grade_enabled: bool):
     chat_id = cb_or_dummy.message.chat.id
     expiry_iso = None
     if hours and hours > 0:
