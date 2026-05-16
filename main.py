@@ -1423,18 +1423,21 @@ async def publish_with_hours_decide(cb:CallbackQuery, state:FSMContext):
     await cb.answer()
 
 @dp.message(PublishStates.waiting_hours_custom, F.text)
-async def publish_hours_custom(msg:Message, state:FSMContext):
-    raw = normalize_arabic_digits(msg.text)
+async def publish_hours_custom(msg: Message, state: FSMContext):
     raw = normalize_arabic_digits(msg.text).replace(",", ".")
-m = re.search(r"(\d{1,3}(?:\.\d+)?)", raw)
-if not m:
-    return await msg.reply("اكتب عدد الساعات فقط، مثال: 1.5 أو 2.")
+    m = re.search(r"(\d{1,3}(?:\.\d+)?)", raw)
+    if not m:
+        return await msg.reply("اكتب عدد الساعات فقط، مثال: 1.5 أو 2.")
 
-hours = float(m.group(1))
-hours = max(0.1, min(240, hours))
+    hours = float(m.group(1))
+    hours = max(0.1, min(240, hours))
     quiz_id = int((await state.get_data()).get("pub_quiz_id"))
+
     await state.update_data(pub_hours=hours, pub_quiz_id=quiz_id)
-    await msg.answer("هل تريد تفعيل تقييم الطالب حسب علامته؟", reply_markup=publish_eval_kb(quiz_id, hours))
+    await msg.answer(
+        "هل تريد تفعيل تقييم الطالب حسب علامته؟",
+        reply_markup=publish_eval_kb(quiz_id, hours)
+    )
 
 @dp.callback_query(F.data.startswith("pubeval:"))
 async def publish_eval_choice(cb: CallbackQuery, state: FSMContext):
