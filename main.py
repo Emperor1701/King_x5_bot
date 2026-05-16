@@ -850,24 +850,76 @@ async def addq_pick(cb:CallbackQuery, state:FSMContext):
     )
     await cb.answer()
 
-@dp.message(BuildStates.waiting_q_block, F.text)
-async def got_q_block(msg:Message, state:FSMContext):
+@dp.message(BuildStates.waiting_q_block, F.text | F.photo | F.voice | F.audio)
+async def got_q_block(msg: Message, state: FSMContext):
     try:
-        sel=(await state.get_data()); quiz_id=sel["quiz_id"]
-        qtext, opts = parse_q_block(msg.text)
+        sel = await state.get_data()
+        quiz_id = sel["quiz_id"]
+
+        # إذا الرسالة نص عادي خذ msg.text
+        # إذا الرسالة صورة/فويس/أوديو خذ النص من caption
+        block_text = (msg.text or msg.caption or "").strip()
+
+        if not block_text:
+            return await msg.answer(
+                "⚠️ أرسل السؤال والخيارات كنص أو كـ Caption مع المرفق."
+            )
+
+        qtext, opts = parse_q_block(block_text)
+
         new_q = insert_returning_id(
             "INSERT INTO questions(quiz_id,text,created_at) VALUES (%s,%s,%s)",
             (quiz_id, qtext, _now().isoformat())
         )
-        correct=None
-        for i,(t,is_ok) in enumerate(opts):
-            q_exec("INSERT INTO options(question_id,option_index,text,is_correct) VALUES (%s,%s,%s,%s)",
-                   (new_q,i,t,1 if is_ok else 0))
-            if is_ok: correct=i
-        await state.update_data(question_id=new_q, opt_count=len(opts), needs_correct=(correct is None))
-        kb=attach_choice_kb()
+
+        correct = None
+        for i, (t, is_ok) in enumerate(opts):
+            q_exec(
+                "INSERT INTO options(question_id,option_index,text,is_correct) VALUES (%s,%s,%s,%s)",
+                (new_q, i, t, 1 if is_ok else 0)
+            )
+            if is_ok:
+                correct = i
+
+        # حفظ المرفق إذا جاء مع نفس رسالة السؤال
+        has_attachment = False
+
+        if msg.photo:
+            await attach_file_to_question(new_q, "photo", msg.photo[-1].file_id)
+            has_attachment = True
+        elif msg.voice:
+            await attach_file_to_question(new_q, "voice", msg.voice.file_id)
+            has_attachment = True
+        elif msg.audio:
+            await attach_file_to_question(new_q, "audio", msg.audio.file_id)
+            has_attachment = True
+
+        needs_correct = correct is None
+
+        # إذا أرسل السؤال مع مرفق: لا تسأله عن إضافة مرفق
+        if has_attachment:
+            if needs_correct:
+                await state.update_data(
+                    question_id=new_q,
+                    opt_count=len(opts),
+                    needs_correct=True
+                )
+                await state.set_state(BuildStates.waiting_correct_index)
+                await msg.answer(f"أرسل رقم الخيار الصحيح (1..{len(opts)}):")
+            else:
+                await state.clear()
+                await msg.answer("✅ تم حفظ السؤال مع المرفق.", reply_markup=owner_kb())
+            return
+
+        # إذا أرسل السؤال بدون مرفق: خليه يسأله نفس الترتيب القديم
+        await state.update_data(
+            question_id=new_q,
+            opt_count=len(opts),
+            needs_correct=needs_correct
+        )
         await state.set_state(BuildStates.waiting_attach_mode)
-        await msg.answer("اختر نوع المرفقات للسؤال:", reply_markup=kb)
+        await msg.answer("اختر نوع المرفقات للسؤال:", reply_markup=attach_choice_kb())
+
     except Exception as e:
         await msg.answer(f"⚠️ لم أفهم الرسالة: <code>{html.escape(str(e))}</code>")
 
